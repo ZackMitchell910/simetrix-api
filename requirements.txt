@@ -1,0 +1,18 @@
+fastapi
+uvicorn
+httpx
+numpy
+pandas
+scikit-learn
+statsmodels
+redis
+pydantic-settings
+pytest
+pytest-asyncio
+# --- ML / DL additions (modern stack) ---
+tensorflow==2.15.*           # ok for Python 3.11 CPU
+torch==2.2.*                 # SB3 needs torch>=1.11; 2.2 is fine
+gymnasium==0.29.1
+stable-baselines3==2.3.0
+ta==0.11.0                   # pure-Python indicators (Windows-friendly)
++ duckdb

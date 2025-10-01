@@ -1,0 +1,15 @@
+Python
+
+pycache/ *.pyc *.pyo
+
+Venv & local
+
+.venv/ .env .env.* *.log
+
+OS
+
+.DS_Store Thumbs.db
+
+Tests
+
+tests/
