@@ -1,18 +1,31 @@
-fastapi
-uvicorn
-httpx
-numpy
-pandas
-scikit-learn
-statsmodels
-redis
-pydantic-settings
-pytest
-pytest-asyncio
-# --- ML / DL additions (modern stack) ---
-tensorflow==2.15.*           # ok for Python 3.11 CPU
-torch==2.2.*                 # SB3 needs torch>=1.11; 2.2 is fine
+# API + utils
+fastapi>=0.115,<0.116
+uvicorn[standard]>=0.30,<0.33
+httpx>=0.27,<0.28
+pydantic-settings>=2.3,<3
+orjson>=3.10,<4
+
+# Numerics / data
+# numpy pinned for TF 2.15 & broad wheel support on Windows
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.2
+statsmodels==0.14.2
+duckdb==1.1.2
+redis>=5,<6
+nltk>=3.9,<4
+ta==0.11.0
+
+# Testing (optional)
+pytest>=8.2,<9
+pytest-asyncio>=0.23,<0.24
+
+# RL stack (SB3 is PyTorch-based)
 gymnasium==0.29.1
 stable-baselines3==2.3.0
-ta==0.11.0                   # pure-Python indicators (Windows-friendly)
-+ duckdb
+
+# TensorFlow (optional):
+# - On Linux/macOS: tensorflow==2.15.0 installs fine
+# - On Windows: use tensorflow-intel==2.15.0 instead
+tensorflow==2.15.0; platform_system != "Windows"
+tensorflow-intel==2.15.0; platform_system == "Windows"
