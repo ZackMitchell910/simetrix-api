@@ -1,216 +1,56 @@
 # ----------------------------
-# Standard library
-# ----------------------------
-from __future__ import annotations
-
-import asyncio
-import json
-import logging
-import math
-import os
-import pickle
-from datetime import datetime, timedelta, timezone
-import datetime as _dt
-from typing import Any, Dict, List, Optional, Tuple, Literal
-from uuid import uuid4
-
-# ----------------------------
-# Third-party
-# ----------------------------
-import httpx
-import numpy as np
-import pandas as pd
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, WebSocket, Path, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import APIKeyHeader, APIKeyQuery
-from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
-from redis.asyncio import Redis
-from statsmodels.tsa.arima.model import ARIMA
-
-# Sentiment (VADER) — lazy & safe
-try:
-    import nltk  # noqa: F401
-    from nltk.sentiment import SentimentIntensityAnalyzer
-except Exception:
-    SentimentIntensityAnalyzer = None  # type: ignore
-
-_SIA: Optional["SentimentIntensityAnalyzer"] = None  # type: ignore[name-defined]
-
-
-def _simple_sentiment(text: str) -> float:
-    global _SIA
-    try:
-        if _SIA is None and SentimentIntensityAnalyzer is not None:
-            _SIA = SentimentIntensityAnalyzer()
-        if _SIA is None:
-            return 0.0
-        return float(_SIA.polarity_scores(text or "")["compound"])
-    except Exception:
-        return 0.0
-
-
-def _rich_sentiment(text: str) -> float:
-    # placeholder alias; upgrade later if needed
-    return _simple_sentiment(text)
-
 # Optional ML libs (soft deps)
+# ----------------------------
+TF_AVAILABLE = False
+SB3_AVAILABLE = False
+
+# TensorFlow / Keras (optional)
 try:
-    from tensorflow.keras.models import load_model, Sequential  # type: ignore
-    from tensorflow.keras.layers import LSTM, GRU, Dense        # type: ignore
+    from tensorflow.keras.models import load_model as _tf_load_model
+    from tensorflow.keras.models import Sequential as _TF_Sequential
+    from tensorflow.keras.layers import LSTM as _TF_LSTM, GRU as _TF_GRU, Dense as _TF_Dense
+    TF_AVAILABLE = True
 except Exception:
-    load_model = Sequential = None  # type: ignore
-    LSTM = GRU = Dense = None       # type: ignore
+    # Stubs so references won't NameError; calling them will raise a clear ImportError.
+    def _missing_tf(*_a, **_k):
+        raise ImportError("TensorFlow is not installed on the server.")
+    _tf_load_model = _missing_tf
+    _TF_Sequential = _missing_tf
+    _TF_LSTM = _missing_tf
+    _TF_GRU = _missing_tf
+    _TF_Dense = _missing_tf
+
+# Public names used elsewhere
+load_model = _tf_load_model
+Sequential = _TF_Sequential
+LSTM = _TF_LSTM
+GRU = _TF_GRU
+Dense = _TF_Dense
+
+# RL / Gym (optional)
+try:
+    import gymnasium as gym
+except Exception:
+    gym = None
 
 try:
-    import gymnasium as gym  # type: ignore
+    from stable_baselines3 import DQN
+    SB3_AVAILABLE = True
 except Exception:
-    gym = None  # type: ignore
+    DQN = None
+    SB3_AVAILABLE = False
 
-try:
-    from stable_baselines3 import DQN  # type: ignore
-except Exception:
-    DQN = None  # type: ignore
 
-# ----------------------------
-# Local modules (package-relative)
-# ----------------------------
-from .feature_store import connect as fs_connect, insert_prediction as fs_log_prediction
-from .feature_store import connect as _fs_connect, compute_and_upsert_metrics_daily as _rollup
-from .learners import OnlineLinear as SGDOnline, ExpWeights as EW
-from .labeler import label_mature_predictions
-from . import learners as _learners_mod
-from .db.duck import (
-    init_schema,
-    insert_prediction,
-    insert_outcome,
-    matured_predictions_now,
-    recent_predictions,
-)
-
-# ----------------------------
-# Logger
-# ----------------------------
-logger = logging.getLogger(__name__)
-_json = json  # legacy alias if referenced elsewhere
-# --- Indicators: prefer TA-Lib, else pandas_ta, else ta, else no-op ---
-try:
-    import talib
-    _TA_BACKEND = "talib"
-except Exception:
-    try:
-        import pandas_ta as pta
-        _TA_BACKEND = "pandas_ta"
-    except Exception:
+def require_tf() -> None:
+    """Call this right before any code path that needs TensorFlow."""
+    if not TF_AVAILABLE:
+        # Using HTTPException is nice for endpoints; RuntimeError is fine for internal calls.
         try:
-            import ta
-            _TA_BACKEND = "ta"
+            from fastapi import HTTPException  # local import to avoid circulars at import time
+            raise HTTPException(status_code=503, detail="TensorFlow is not installed on the server.")
         except Exception:
-            _TA_BACKEND = "none"
+            raise RuntimeError("TensorFlow is not installed on the server.")
 
-# ----------------------------
-# Request/response models & core helpers
-# ----------------------------
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Tuple, Any, Literal
-from datetime import datetime, timedelta, timezone
-import os, math, json, asyncio, logging
-import numpy as np
-import pandas as pd
-import httpx
-from redis.asyncio import Redis
-
-# These come from earlier in the file (auto-selected TA backend names):
-# _TA_BACKEND, talib, pta, ta  (do not re-import here)
-
-class SimRequest(BaseModel):
-    symbol: str
-    horizon_days: int
-    n_paths: int
-    timespan: Literal["day", "hour", "minute"] = "day"
-    include_news: bool = False
-    include_options: bool = False
-    include_futures: bool = False
-    x_handles: Optional[str] = Field(default=None, description="comma-separated handles")
-
-class TrainRequest(BaseModel):
-    symbol: str
-    lookback_days: int = 3650
-
-class PredictRequest(BaseModel):
-    symbol: str
-    horizon_days: int = 1
-
-class RunState(BaseModel):
-    status: str = "queued"
-    progress: float = 0.0
-    error: str | None = None
-    artifact: dict | None = None
-
-def _today_utc_date():
-    return datetime.now(timezone.utc).date()
-
-# ---------- Technical indicators (backend-agnostic) ----------
-def ta_rsi(arr: np.ndarray, length: int = 14) -> float:
-    x = np.asarray(arr, float)
-    if _TA_BACKEND == "talib":
-        r = talib.RSI(x, timeperiod=length)
-        r = r[~np.isnan(r)]
-        return float(r[-1]) if r.size else 50.0
-    s = pd.Series(x)
-    if _TA_BACKEND == "pandas_ta":
-        r = pta.rsi(s, length=length).dropna()
-        return float(r.iloc[-1]) if not r.empty else 50.0
-    if _TA_BACKEND == "ta":
-        r = ta.momentum.RSIIndicator(s, window=length).rsi().dropna()
-        return float(r.iloc[-1]) if not r.empty else 50.0
-    return 50.0
-
-def ta_macd(arr: np.ndarray):
-    x = np.asarray(arr, float)
-    if _TA_BACKEND == "talib":
-        return talib.MACD(x)
-    s = pd.Series(x)
-    if _TA_BACKEND == "pandas_ta":
-        m = pta.macd(s)
-        if m is None or m.empty:
-            return [np.array([np.nan])]*3
-        return [m.iloc[:,0].to_numpy(), m.iloc[:,1].to_numpy(), m.iloc[:,2].to_numpy()]
-    if _TA_BACKEND == "ta":
-        ind = ta.trend.MACD(s)
-        return [ind.macd().to_numpy(), ind.macd_signal().to_numpy(), ind.macd_diff().to_numpy()]
-    return [np.array([np.nan])]*3
-
-def ta_bbands(arr: np.ndarray, length: int = 20, ndev: float = 2.0):
-    x = np.asarray(arr, float)
-    if _TA_BACKEND == "talib":
-        return talib.BBANDS(x, timeperiod=length, nbdevup=ndev, nbdevdn=ndev)
-    s = pd.Series(x)
-    if _TA_BACKEND == "pandas_ta":
-        b = pta.bbands(s, length=length, std=ndev)
-        if b is None or b.empty:
-            return x, x, x
-        return (
-            b.filter(like="BBU").iloc[:,0].to_numpy(),
-            b.filter(like="BBM").iloc[:,0].to_numpy(),
-            b.filter(like="BBL").iloc[:,0].to_numpy(),
-        )
-    if _TA_BACKEND == "ta":
-        ind = ta.volatility.BollingerBands(s, window=length, window_dev=ndev)
-        return ind.bollinger_hband().to_numpy(), ind.bollinger_mavg().to_numpy(), ind.bollinger_lband().to_numpy()
-    return x, x, x
-
-def _sigmoid(x: float) -> float:
-    # numerically stable sigmoid
-    if x >= 0:
-        z = math.exp(-x)
-        return float(1.0 / (1.0 + z))
-    else:
-        z = math.exp(x)
-        return float(z / (1.0 + z))
 
 # ---------- Keys / config helpers ----------
 MOCK_POLYGON_KEY = os.getenv("PT_POLYGON_KEY_MOCK", "c6e0a5afd54d4b36b1f67d8c927b1983").strip()
@@ -229,6 +69,7 @@ def _server_api_key() -> str:
 # ---------- Model keys ----------
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
+
 
 # ---------- Market data helpers ----------
 async def _fetch_realized_price(symbol: str, when: datetime) -> float:
@@ -270,6 +111,7 @@ async def _fetch_realized_price(symbol: str, when: datetime) -> float:
     import numpy as _np, math
     return float(_np.random.lognormal(mean=math.log(100), sigma=0.12))
 
+
 async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> List[float]:
     """
     Fetch daily closes ending today from Polygon.
@@ -278,10 +120,10 @@ async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> 
     """
     key = _poly_key()
     try:
-        from datetime import date, timedelta
+        from datetime import date, timedelta as _td
         end = date.today()
         days = int(window_days) if window_days and int(window_days) > 0 else 540
-        start = end - timedelta(days=days)
+        start = end - _td(days=days)
         s = start.strftime("%Y-%m-%d")
         e = end.strftime("%Y-%m-%d")
         async with httpx.AsyncClient(timeout=15.0) as client:
@@ -299,6 +141,7 @@ async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> 
         logging.getLogger(__name__).warning(f"_fetch_hist_prices failed ({symbol}): {e}")
     # fallback synthetic if Polygon missing/down
     return list(np.random.lognormal(mean=math.log(100.0), sigma=0.15, size=200))
+
 
 async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
     arr = np.asarray(px, dtype=float)
@@ -357,8 +200,9 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
 
     return f
 
+
 # ---------- Lightweight ensemble (linear only; non-blocking) ----------
-async def get_ensemble_prob_light(symbol: str, redis: Redis, horizon_days: int = 1) -> float:
+async def get_ensemble_prob_light(symbol: str, redis: "Redis", horizon_days: int = 1) -> float:
     """
     Async-friendly, non-blocking ensemble:
     - Uses only the linear model stored in Redis (no Keras/ARIMA/RL)
@@ -389,10 +233,8 @@ async def get_ensemble_prob_light(symbol: str, redis: Redis, horizon_days: int =
         logging.getLogger(__name__).info(f"get_ensemble_prob_light fallback (0.5) due to: {e}")
         return 0.5
 
-# ---------- API auth (Polygon key no longer doubles as app auth) ----------
-from fastapi.security import APIKeyHeader, APIKeyQuery
-from fastapi import Depends, HTTPException
 
+# ---------- API auth (Polygon key no longer doubles as app auth) ----------
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
 
@@ -409,27 +251,28 @@ async def verify_api_key(
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return supplied
 
+
 # ---------- Optional model loaders ----------
-from fastapi import HTTPException as _HTTPException
-from tensorflow.keras.models import load_model  # type: ignore
 import pickle
+from fastapi import HTTPException as _HTTPException
 
-def load_lstm_model(symbol):
-    # Prefer modern Keras format; fallback to old .h5 if present
-    try:
-        return load_model(f"models/{symbol}_lstm.keras")
-    except Exception:
+def load_lstm_model(symbol: str):
+    """Load an LSTM model if TF is available; tries .keras then .h5."""
+    require_tf()
+    for path in (f"models/{symbol}_lstm.keras", f"models/{symbol}_lstm.h5"):
         try:
-            return load_model(f"models/{symbol}_lstm.h5")
+            return load_model(path)
         except Exception:
-            raise _HTTPException(status_code=404, detail="LSTM model not found; train first")
+            pass
+    raise _HTTPException(status_code=404, detail="LSTM model not found; train first")
 
-def load_arima_model(symbol):
+def load_arima_model(symbol: str):
     try:
-        with open(f"models/{symbol}_arima.pkl", 'rb') as file:
+        with open(f"models/{symbol}_arima.pkl", "rb") as file:
             return pickle.load(file)
     except Exception:
         raise _HTTPException(status_code=404, detail="ARIMA model not found; train first")
+
 
 # ---------- Misc helpers ----------
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
@@ -442,14 +285,8 @@ def _env_list(name: str, default: List[str] | None = None) -> List[str]:
         return default or []
     return [x.strip() for x in s.split(",") if x.strip()]
 
-# ---------- App settings / init ----------
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI
-from dotenv import load_dotenv
 
-# Logging once here
+# ---------- App settings / init ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 logger.info(f"Using learners from: {_learners_mod.__file__}")  # _learners_mod is imported earlier in the file
