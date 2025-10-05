@@ -3,22 +3,23 @@
 # ----------------------------
 from __future__ import annotations
 
-import os
-import math
-import logging
 import asyncio
-import pickle
 import json
+import logging
+import math
+import os
+import pickle
+from datetime import datetime, timedelta, timezone
+import datetime as _dt
+from typing import Any, Dict, List, Optional, Tuple, Literal
 from uuid import uuid4
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Literal, Optional, Tuple, List
 
 # ----------------------------
 # Third-party
 # ----------------------------
+import httpx
 import numpy as np
 import pandas as pd
-import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, WebSocket, Path, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,39 +31,71 @@ from pydantic_settings import BaseSettings
 from redis.asyncio import Redis
 from statsmodels.tsa.arima.model import ARIMA
 
-# Optional ML libs (don’t fail if missing)
+# Sentiment (VADER) — lazy & safe
 try:
-    from tensorflow.keras.models import Sequential, load_model
-    from tensorflow.keras.layers import LSTM, GRU, Dense
+    import nltk  # noqa: F401
+    from nltk.sentiment import SentimentIntensityAnalyzer
 except Exception:
-    Sequential = load_model = None
-    LSTM = GRU = Dense = None
+    SentimentIntensityAnalyzer = None  # type: ignore
+
+_SIA: Optional["SentimentIntensityAnalyzer"] = None  # type: ignore[name-defined]
+
+
+def _simple_sentiment(text: str) -> float:
+    global _SIA
+    try:
+        if _SIA is None and SentimentIntensityAnalyzer is not None:
+            _SIA = SentimentIntensityAnalyzer()
+        if _SIA is None:
+            return 0.0
+        return float(_SIA.polarity_scores(text or "")["compound"])
+    except Exception:
+        return 0.0
+
+
+def _rich_sentiment(text: str) -> float:
+    # placeholder alias; upgrade later if needed
+    return _simple_sentiment(text)
+
+# Optional ML libs (soft deps)
+try:
+    from tensorflow.keras.models import load_model, Sequential  # type: ignore
+    from tensorflow.keras.layers import LSTM, GRU, Dense        # type: ignore
+except Exception:
+    load_model = Sequential = None  # type: ignore
+    LSTM = GRU = Dense = None       # type: ignore
 
 try:
-    import gymnasium as gym
+    import gymnasium as gym  # type: ignore
 except Exception:
-    gym = None
+    gym = None  # type: ignore
 
 try:
-    from stable_baselines3 import DQN
+    from stable_baselines3 import DQN  # type: ignore
 except Exception:
-    DQN = None
+    DQN = None  # type: ignore
 
 # ----------------------------
-# Local modules
+# Local modules (package-relative)
 # ----------------------------
-from feature_store import connect as fs_connect, insert_prediction as fs_log_prediction
-from feature_store import connect as _fs_connect, compute_and_upsert_metrics_daily as _rollup
-from learners import OnlineLinear as SGDOnline, ExpWeights as EW
-from labeler import label_mature_predictions
-import learners as _learners_mod
+from .feature_store import connect as fs_connect, insert_prediction as fs_log_prediction
+from .feature_store import connect as _fs_connect, compute_and_upsert_metrics_daily as _rollup
+from .learners import OnlineLinear as SGDOnline, ExpWeights as EW
+from .labeler import label_mature_predictions
+from . import learners as _learners_mod
+from .db.duck import (
+    init_schema,
+    insert_prediction,
+    insert_outcome,
+    matured_predictions_now,
+    recent_predictions,
+)
 
 # ----------------------------
 # Logger
 # ----------------------------
 logger = logging.getLogger(__name__)
-_json = json  # legacy alias if you still reference `_json`
-
+_json = json  # legacy alias if referenced elsewhere
 # --- Indicators: prefer TA-Lib, else pandas_ta, else ta, else no-op ---
 try:
     import talib
@@ -78,17 +111,30 @@ except Exception:
         except Exception:
             _TA_BACKEND = "none"
 
+# ----------------------------
+# Request/response models & core helpers
+# ----------------------------
+from pydantic import BaseModel, Field
+from typing import Optional, List, Dict, Tuple, Any, Literal
+from datetime import datetime, timedelta, timezone
+import os, math, json, asyncio, logging
+import numpy as np
+import pandas as pd
+import httpx
+from redis.asyncio import Redis
+
+# These come from earlier in the file (auto-selected TA backend names):
+# _TA_BACKEND, talib, pta, ta  (do not re-import here)
+
 class SimRequest(BaseModel):
     symbol: str
     horizon_days: int
     n_paths: int
-    timespan: Literal["day","hour"] = "day"
+    timespan: Literal["day", "hour", "minute"] = "day"
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
-    # Your UI is now sending a single string; make this Optional[str]
     x_handles: Optional[str] = Field(default=None, description="comma-separated handles")
-
 
 class TrainRequest(BaseModel):
     symbol: str
@@ -104,6 +150,10 @@ class RunState(BaseModel):
     error: str | None = None
     artifact: dict | None = None
 
+def _today_utc_date():
+    return datetime.now(timezone.utc).date()
+
+# ---------- Technical indicators (backend-agnostic) ----------
 def ta_rsi(arr: np.ndarray, length: int = 14) -> float:
     x = np.asarray(arr, float)
     if _TA_BACKEND == "talib":
@@ -126,7 +176,8 @@ def ta_macd(arr: np.ndarray):
     s = pd.Series(x)
     if _TA_BACKEND == "pandas_ta":
         m = pta.macd(s)
-        if m is None or m.empty: return [np.array([np.nan])]*3
+        if m is None or m.empty:
+            return [np.array([np.nan])]*3
         return [m.iloc[:,0].to_numpy(), m.iloc[:,1].to_numpy(), m.iloc[:,2].to_numpy()]
     if _TA_BACKEND == "ta":
         ind = ta.trend.MACD(s)
@@ -140,10 +191,13 @@ def ta_bbands(arr: np.ndarray, length: int = 20, ndev: float = 2.0):
     s = pd.Series(x)
     if _TA_BACKEND == "pandas_ta":
         b = pta.bbands(s, length=length, std=ndev)
-        if b is None or b.empty: return x, x, x
-        return b.filter(like="BBU").iloc[:,0].to_numpy(), \
-               b.filter(like="BBM").iloc[:,0].to_numpy(), \
-               b.filter(like="BBL").iloc[:,0].to_numpy()
+        if b is None or b.empty:
+            return x, x, x
+        return (
+            b.filter(like="BBU").iloc[:,0].to_numpy(),
+            b.filter(like="BBM").iloc[:,0].to_numpy(),
+            b.filter(like="BBL").iloc[:,0].to_numpy(),
+        )
     if _TA_BACKEND == "ta":
         ind = ta.volatility.BollingerBands(s, window=length, window_dev=ndev)
         return ind.bollinger_hband().to_numpy(), ind.bollinger_mavg().to_numpy(), ind.bollinger_lband().to_numpy()
@@ -158,58 +212,92 @@ def _sigmoid(x: float) -> float:
         z = math.exp(x)
         return float(z / (1.0 + z))
 
+# ---------- Keys / config helpers ----------
+MOCK_POLYGON_KEY = os.getenv("PT_POLYGON_KEY_MOCK", "c6e0a5afd54d4b36b1f67d8c927b1983").strip()
 
+def _poly_key() -> str:
+    # Prefer real env keys; otherwise fall back to mock/dev key
+    return (
+        (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
+        or MOCK_POLYGON_KEY
+    )
+
+def _server_api_key() -> str:
+    # Only PT_API_KEY is used for app auth (Polygon key is not an API key)
+    return (os.getenv("PT_API_KEY") or "").strip()
+
+# ---------- Model keys ----------
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
 
+# ---------- Market data helpers ----------
 async def _fetch_realized_price(symbol: str, when: datetime) -> float:
-    """Best-effort realized price for the 'when' date. Falls back if rate-limited."""
-    if settings.polygon_key:
-        d0 = when.strftime("%Y-%m-%d")
-        d1 = (when + timedelta(days=1)).strftime("%Y-%m-%d")
-        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{d0}/{d1}"
-        params = {"adjusted": "true", "sort": "asc", "limit": "2", "apiKey": settings.polygon_key}
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(url, params=params)
-                # Gracefully handle rate limit without raising
-                if r.status_code == 429:
-                    logger.warning(f"Polygon 429 for {symbol} {d0}->{d1}; falling back.")
-                else:
-                    r.raise_for_status()
-                    res = (r.json() or {}).get("results", [])
-                    if res:
-                        return float(res[-1]["c"])
-        except Exception as e:
-            logger.info(f"Polygon fetch failed for {symbol} @ {d0}: {e}; falling back.")
-    # Fallbacks (safe + deterministic enough for testing)
+    """
+    Get the realized *close* at/after 'when'. If 'when' is a weekend/holiday,
+    scan forward a few days until we hit the next bar.
+    """
+    key = _poly_key()
     try:
-        # last known price approximation if you want a saner fallback than random:
-        px = await _fetch_hist_prices(symbol)
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Try up to +5 days forward to handle non-trading days gracefully
+            for d in range(0, 6):
+                d0 = (when + timedelta(days=d)).strftime("%Y-%m-%d")
+                d1 = (when + timedelta(days=d + 1)).strftime("%Y-%m-%d")
+                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{d0}/{d1}"
+                params = {"adjusted": "true", "sort": "asc", "limit": "2", "apiKey": key}
+                r = await client.get(url, params=params)
+                if r.status_code == 429:
+                    # rate-limited → break to fallbacks
+                    break
+                r.raise_for_status()
+                res = (r.json() or {}).get("results", [])
+                if res:
+                    return float(res[-1]["c"])
+    except Exception as e:
+        logging.getLogger(__name__).info(
+            f"Polygon realized fetch failed for {symbol} @ {when.date()}: {e}; falling back."
+        )
+
+    # Fallbacks
+    try:
+        px = await _fetch_hist_prices(symbol, window_days=60)
         if px:
             return float(px[-1])
     except Exception:
         pass
-    # ultimate fallback: synthetic
-    return float(np.random.lognormal(mean=np.log(100), sigma=0.12))
 
+    # last-resort synthetic
+    import numpy as _np, math
+    return float(_np.random.lognormal(mean=math.log(100), sigma=0.12))
 
-
-async def _fetch_hist_prices(symbol: str) -> List[float]:
-    key = (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
-    if key:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/2024-01-01/2025-09-01"
-                r = await client.get(url, params={"apiKey": key})
-                r.raise_for_status()
-                data = r.json().get("results", [])
-                px = [float(d["c"]) for d in data if "c" in d]
-                if px:
-                    return px
-        except Exception as e:
-            logger.warning(f"Polygon fetch failed ({symbol}): {e}")
-    # fallback synthetic
+async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> List[float]:
+    """
+    Fetch daily closes ending today from Polygon.
+    If window_days is provided, use that; otherwise default to ~18 months (~540 days).
+    Falls back to a synthetic series if the API/key is unavailable.
+    """
+    key = _poly_key()
+    try:
+        from datetime import date, timedelta
+        end = date.today()
+        days = int(window_days) if window_days and int(window_days) > 0 else 540
+        start = end - timedelta(days=days)
+        s = start.strftime("%Y-%m-%d")
+        e = end.strftime("%Y-%m-%d")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{s}/{e}"
+            r = await client.get(
+                url,
+                params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": "50000"},
+            )
+            r.raise_for_status()
+            data = (r.json() or {}).get("results", [])
+            px = [float(d["c"]) for d in data if "c" in d]
+            if px:
+                return px
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"_fetch_hist_prices failed ({symbol}): {e}")
+    # fallback synthetic if Polygon missing/down
     return list(np.random.lognormal(mean=math.log(100.0), sigma=0.15, size=200))
 
 async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
@@ -236,7 +324,8 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
     # Async enrichments (placeholders)
     f["sentiment"] = 0.0  # float(await _fetch_sentiment(symbol))
     f.update({"vix": 20.0, "spx_ret": 0.0})  # await _fetch_macro()
-# TA features (guard against NaNs)
+
+    # TA features (guard against NaNs)
     try:
         rsi_val = float(ta_rsi(arr, 14))
     except Exception:
@@ -267,6 +356,8 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
         f["peer_corr"] = 0.0
 
     return f
+
+# ---------- Lightweight ensemble (linear only; non-blocking) ----------
 async def get_ensemble_prob_light(symbol: str, redis: Redis, horizon_days: int = 1) -> float:
     """
     Async-friendly, non-blocking ensemble:
@@ -295,45 +386,53 @@ async def get_ensemble_prob_light(symbol: str, redis: Redis, horizon_days: int =
         score = float(np.dot(X[:m], w[:m]))
         return _sigmoid(score)
     except Exception as e:
-        logger.info(f"get_ensemble_prob_light fallback (0.5) due to: {e}")
+        logging.getLogger(__name__).info(f"get_ensemble_prob_light fallback (0.5) due to: {e}")
         return 0.5
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query = APIKeyQuery(name="api_key", auto_error=False)
+# ---------- API auth (Polygon key no longer doubles as app auth) ----------
+from fastapi.security import APIKeyHeader, APIKeyQuery
+from fastapi import Depends, HTTPException
 
-def _server_keys() -> tuple[str, str]:
-    app_key = os.getenv("PT_API_KEY", "").strip()
-    poly_key = (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
-    return app_key, poly_key
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
 
 async def verify_api_key(
     api_key_h: Optional[str] = Depends(api_key_header),
     api_key_q: Optional[str] = Depends(api_key_query),
 ):
     supplied = (api_key_h or api_key_q or "").strip()
-    app_key, poly_key = _server_keys()
-    # Dev: if neither key set, allow
-    if not app_key and not poly_key:
+    app_key  = _server_api_key()
+    # If PT_API_KEY is not set, leave endpoints open for local/dev.
+    if not app_key:
         return supplied
-    expected = app_key or poly_key
-    if supplied != expected:
+    if supplied != app_key:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return supplied
 
+# ---------- Optional model loaders ----------
+from fastapi import HTTPException as _HTTPException
+from tensorflow.keras.models import load_model  # type: ignore
+import pickle
+
 def load_lstm_model(symbol):
+    # Prefer modern Keras format; fallback to old .h5 if present
     try:
-        return load_model(f"models/{symbol}_lstm.h5")
-    except:
-        raise HTTPException(status_code=404, detail="LSTM model not found; train first")
+        return load_model(f"models/{symbol}_lstm.keras")
+    except Exception:
+        try:
+            return load_model(f"models/{symbol}_lstm.h5")
+        except Exception:
+            raise _HTTPException(status_code=404, detail="LSTM model not found; train first")
 
 def load_arima_model(symbol):
     try:
         with open(f"models/{symbol}_arima.pkl", 'rb') as file:
             return pickle.load(file)
-    except:
-        raise HTTPException(status_code=404, detail="ARIMA model not found; train first")
+    except Exception:
+        raise _HTTPException(status_code=404, detail="ARIMA model not found; train first")
 
-def _env_list(name: str, default: list[str] | None = None) -> list[str]:
+# ---------- Misc helpers ----------
+def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     """
     Read a comma-separated env var into a list, trimming spaces.
     Example: PT_CORS_ORIGINS=http://localhost:5173, http://localhost:8080
@@ -343,19 +442,25 @@ def _env_list(name: str, default: list[str] | None = None) -> list[str]:
         return default or []
     return [x.strip() for x in s.split(",") if x.strip()]
 
-# --- Logging ---
+# ---------- App settings / init ----------
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI
+from dotenv import load_dotenv
+
+# Logging once here
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-logger.info(f"Using learners from: {_learners_mod.__file__}")
+logger.info(f"Using learners from: {_learners_mod.__file__}")  # _learners_mod is imported earlier in the file
 
 load_dotenv("backend/.env")
 
 class Settings(BaseSettings):
-    api_keys: list[str] = Field(default_factory=lambda: [k for k in _server_keys() if k])
-    polygon_key: str | None = Field(default_factory=lambda: os.getenv("PT_POLYGON_KEY"))
-    news_api_key: str | None = Field(default_factory=lambda: os.getenv("PT_NEWS_API_KEY"))
+    polygon_key: Optional[str] = Field(default_factory=_poly_key)
+    news_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("PT_NEWS_API_KEY"))
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
-    cors_origins: list[str] = Field(default_factory=lambda: _env_list("PT_CORS_ORIGINS", ["*"]))
+    cors_origins: List[str] = Field(default_factory=lambda: _env_list("PT_CORS_ORIGINS", ["*"]))
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
     horizon_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_HORIZON_DAYS_MAX", "365")))
     lookback_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_LOOKBACK_DAYS_MAX", str(365*10))))
@@ -371,19 +476,24 @@ class Settings(BaseSettings):
         case_sensitive = False
 
 settings = Settings()
-REDIS = Redis.from_url(settings.redis_url)
+
+# Redis client (text mode)
+REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
+
 # --- RL constants ---
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))  # single source of truth
-logger = logging.getLogger(__name__)
-if not settings.polygon_key:
-    logger.warning("POLYGON_KEY not set. Using synthetic data for simulations.")
+
+# Warn only if we’re using the mock key (so you know you’re on dev data)
+if settings.polygon_key and settings.polygon_key.strip() == MOCK_POLYGON_KEY:
+    logger.warning("Using MOCK Polygon key (dev). Set PT_POLYGON_KEY for real data.")
+
 # --- FastAPI App ---
 app = FastAPI(
     title="PredictiveTwin API",
     version="1.2.1",
-    docs_url="/api-docs",  # Move docs
+    docs_url="/api-docs",
     redoc_url=None,
-    redirect_slashes=False  # No 307
+    redirect_slashes=False,
 )
 
 # --- CORS ---
@@ -410,19 +520,18 @@ async def _gc_loop():
             logger.error(f"GC loop error: {e}")
         await asyncio.sleep(60)
 
-
 @app.on_event("startup")
 async def _startup():
+    init_schema()
     global REDIS
     try:
-        # If you want text back (no .decode()), use decode_responses=True
         REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
         await REDIS.ping()
         logger.info("Connected to Redis")
     except Exception as e:
         logger.error(f"Failed to connect to Redis: {e}")
         REDIS = None
-    # start GC
+    # start GC and labeling daemon
     asyncio.create_task(_gc_loop())
     asyncio.create_task(_labeling_daemon())
 
@@ -434,6 +543,9 @@ async def _shutdown():
             logger.info("Redis closed")
     except Exception as e:
         logger.error(f"Error closing Redis: {e}")
+
+# --- Heavier ensemble (used by simulator), keeps parity with /predict heads ---
+from .learners import ExpWeights as EW  # already imported above in your file, safe to re-import
 
 async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) -> float:
     """
@@ -461,9 +573,9 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
         # Linear
         if "coef" in model_linear:
             w = np.array(model_linear["coef"], dtype=float)
-            w = w[:X.shape[0]]
-            X_lin = X[:w.shape[0]]
-            score = float(np.dot(X_lin, w))
+            xb = np.concatenate([[1.0], X])  # bias + features
+            k = min(w.shape[0], xb.shape[0])
+            score = float(np.dot(xb[:k], w[:k]))
             score = float(np.clip(score, -60.0, 60.0))
             preds.append(_sigmoid(score))
 
@@ -472,66 +584,85 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
             model_lstm = load_lstm_model(symbol)
             X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)
             preds.append(float(model_lstm.predict(X_lstm, verbose=0)[0][0]))
-        except:
+        except Exception:
             pass
+
         # ARIMA
         try:
             model_arima = load_arima_model(symbol)
-            fc = model_arima.forecast(steps=horizon_days)
+            fc = model_arima.forecast(steps=max(1, int(horizon_days)))
             last_fc = float(fc.iloc[-1] if hasattr(fc, "iloc") else fc[-1])
             preds.append(1.0 if last_fc > float(px[-1]) else 0.0)
         except Exception:
             pass
-        # RL adjust
+
+        # RL adjust (optional)
         rl_adjust = 0.0
         try:
+            from stable_baselines3 import DQN  # type: ignore
             rl_model = DQN.load(f"models/{symbol}_rl.zip", print_system_info=False)
             env = StockEnv(px, window_len=RL_WINDOW)
-            obs, _ = env.reset()  # normalized window like in /predict
+            obs, _ = env.reset()
             action, _ = rl_model.predict(obs, deterministic=True)
             a = float(action[0] if hasattr(action, "__len__") else action)
-            rl_adjust = float(np.clip(a * 0.01, -0.05, 0.05))  # cap ±5%
+            rl_adjust = float(np.clip((a - 1) * 0.01, -0.05, 0.05))  # map {0,1,2}→{-1%,0,+1%}
             env.close()
         except Exception as e:
             logger.info(f"RL skipped in ensemble: {e}")
+
         # Ensemble
+        if not preds:
+            return 0.5
         losses = [0.1] * len(preds)
         ew = EW()
         ew.init(len(preds))
         ew.update(np.array(losses, dtype=float))
         prob_up = float(np.clip(sum(w * p for w, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
-
         return prob_up
     except Exception as e:
         logger.warning(f"Ensemble prob failed for {symbol}: {e}")
         return 0.5
 
-async def _list_models() -> list[str]:
+# --- small utilities used elsewhere in file ---
+async def _list_models() -> List[str]:
     keys = await REDIS.keys("model:*")
-    # keys are already str when decode_responses=True
     return [k.split(":", 1)[1] for k in keys]
 
 async def _fetch_cached_hist_prices(symbol: str, window_days: int, redis: Redis) -> List[float]:
-    cache_key = f"hist_prices:{symbol}:{window_days}"
-    cached = await redis.get(cache_key)
-    if cached:
-        return json.loads(cached)
-   
-    px = await _fetch_hist_prices(symbol)  # Existing fetch
-    # Truncate to window_days if needed
-    cached_px = px[-window_days:] if len(px) > window_days else px
-    await redis.setex(cache_key, 3600, json.dumps(cached_px))
-    return cached_px
+    """
+    Cache key now reflects *window_days* and today, so we don't serve stale S0.
+    """
+    today_str = _today_utc_date().isoformat()
+    cache_key = f"hist_prices:{symbol}:{window_days}:{today_str}"
+
+    if redis:
+        cached = await redis.get(cache_key)
+        if cached:
+            try:
+                return json.loads(cached)
+            except Exception:
+                pass
+
+    px = await _fetch_hist_prices(symbol, window_days)
+    if redis:
+        # 30 minutes TTL is plenty; daily bars won’t change intraday
+        await redis.setex(cache_key, 1800, json.dumps(px))
+    return px
 
 def _dynamic_window_days(horizon_days: int, timespan: str) -> int:
-    base = 180
-    if timespan == "minute":
-        base *= 390 / 252  # Trading minutes per day
-    return min(base + horizon_days * 2, settings.lookback_days_max)
-
-async def _news_sentiment_for_symbol(symbol: str) -> float:
-    # Placeholder; implement with news API
-    return 0.0
+    """
+    Choose history window length in 'days' units based on the requested timespan.
+    - day:    ~180 days base
+    - hour:   ~180 * 7 (approx. 7 trading hours/day)    -> ~1260
+    - minute: ~180 * (390/252) (trading minutes/day)    -> ~279
+    Then add a small multiple of horizon to keep tails stable.
+    """
+    base_days = 180
+    if timespan == "hour":
+        base_days = int(round(180 * 7))
+    elif timespan == "minute":
+        base_days = int(round(180 * (390 / 252)))
+    return min(base_days + int(horizon_days) * 2, settings.lookback_days_max)
 
 async def _ensure_run(run_id: str) -> RunState:
     raw = await REDIS.get(f"run:{run_id}")
@@ -539,8 +670,7 @@ async def _ensure_run(run_id: str) -> RunState:
         raise HTTPException(404, "Run not found")
     rs = RunState.parse_raw(raw)
     ttl = await REDIS.ttl(f"run:{run_id}")
-    # -2 = missing, -1 = no expiry. Only treat -2 as gone.
-    if ttl == -2:
+    if ttl == -2:  # missing
         raise HTTPException(410, "Run expired")
     return rs
 
@@ -555,7 +685,12 @@ async def _labeling_daemon():
         await asyncio.sleep(900)
 
 async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
+    """
+    Background task: builds a Monte Carlo artifact, logs a summary
+    to DuckDB.predictions (pred_id-keyed) and mirrors to the PathPanda Feature Store.
+    """
     logger.info(f"Starting simulation for run_id={run_id}, symbol={req.symbol}")
+    # -------- ensure run exists --------
     try:
         rs = await _ensure_run(run_id)
     except Exception as e:
@@ -581,31 +716,36 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         if not historical_prices or len(historical_prices) < 30:
             raise ValueError("Insufficient history")
 
-        rets = np.diff(np.log(np.array(historical_prices, dtype=float)))
+        px_arr = np.array(historical_prices, dtype=float)
+        rets = np.diff(np.log(px_arr))
+        # daily scale by default; coarse hourly if requested
         scale = 252 if req.timespan == "day" else 252 * 24
-        mu_ann = float(np.mean(rets) * scale)
-        sigma_ann = float(np.std(rets) * math.sqrt(scale))
+        mu_ann = float(np.mean(rets) * scale) if rets.size else 0.0
+        sigma_ann = float(np.std(rets) * math.sqrt(scale)) if rets.size else 0.2
         sigma_ann = float(np.clip(sigma_ann, 1e-4, 1.5))
         mu_ann = float(np.clip(mu_ann, -2.0, 2.0))
 
-        # ML adjustment (bounded)
+        # ---------- ML adjustment (bounded drift tilt) ----------
         ensemble_prob = 0.5
         try:
+            # Try the heavier ensemble briefly, then fall back to the light, then 0.5
             ensemble_prob = await asyncio.wait_for(
-                get_ensemble_prob(req.symbol, redis, req.horizon_days),
-                timeout=1.0,
+                get_ensemble_prob(req.symbol, redis, req.horizon_days), timeout=1.0
             )
-        except asyncio.TimeoutError:
-            logger.info("get_ensemble_prob timed out; using 0.5")
-        except Exception as e:
-            logger.info(f"get_ensemble_prob failed: {e}; using 0.5")
+        except Exception:
+            try:
+                ensemble_prob = await asyncio.wait_for(
+                    get_ensemble_prob_light(req.symbol, redis, req.horizon_days), timeout=0.5
+                )
+            except Exception:
+                ensemble_prob = 0.5
 
-        mu_ann *= (2 * ensemble_prob - 1) * 0.5
+        mu_ann *= (2 * float(ensemble_prob) - 1.0) * 0.5  # cap the tilt
 
         # ---------- Monte Carlo (GBM) ----------
         np.random.seed(abs(hash(run_id)) % (2**32 - 1))
-        S0 = float(historical_prices[-1])
-        dt = 1.0 / scale
+        S0 = float(px_arr[-1])
+        dt = 1.0 / float(scale)
         n_days = max(1, int(req.horizon_days))
 
         Z = np.random.normal(size=(req.n_paths, n_days))
@@ -613,16 +753,14 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         diffusion = sigma_ann * math.sqrt(dt)
         log_returns = drift + diffusion * Z
         log_paths = np.cumsum(log_returns, axis=1)
-        # include t0 = S0 in the path
         paths = S0 * np.exp(np.concatenate([np.zeros((req.n_paths, 1)), log_paths], axis=1))
-        T = paths.shape[1]  # includes t0
 
         # Progress tick (post-paths)
         rs.progress = 40
         await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
 
-        # ---------- Percentile bands ----------
-        median_path = np.median(paths, axis=0)
+        # ---------- Percentile bands (per day) ----------
+        p50_line = np.median(paths, axis=0)
         p80_low, p80_high = np.percentile(paths, [10, 90], axis=0)
         p95_low, p95_high = np.percentile(paths, [2.5, 97.5], axis=0)
 
@@ -636,63 +774,68 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
             return out
 
         fallback = S0
-        p50 = np.array(median_path, dtype=float)
-        for arr in (p80_low, p80_high, p95_low, p95_high):
-            arr[:] = _ffill_nonfinite(arr, fallback)
-
-        p80_low = np.minimum(p80_low, p50)
-        p80_high = np.maximum(p80_high, p50)
-        p95_low = np.minimum(p95_low, p80_low)
-        p95_high = np.maximum(p95_high, p80_high)
-        for arr in (p50, p80_low, p80_high, p95_low, p95_high):
+        for arr in (p50_line, p80_low, p80_high, p95_low, p95_high):
             np.nan_to_num(arr, copy=False, nan=fallback, posinf=fallback, neginf=fallback)
+            arr[:] = _ffill_nonfinite(arr, fallback)
 
         # ---------- Optional news/options/futures tweaks ----------
         sentiment = 0.0
         if req.include_news:
             try:
-                sentiment = await _news_sentiment_for_symbol(req.symbol)
+                # light, local sentiment: fetch recent Polygon news titles and average _safe_sent
+                poly_ticker = req.symbol.upper().strip()
+                key = _poly_key()
+                since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+                url = "https://api.polygon.io/v2/reference/news"
+                params = {"ticker": poly_ticker, "published_utc.gte": since, "limit": "20", "apiKey": key}
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    r = await client.get(url, params=params)
+                    if r.status_code == 200:
+                        items = (r.json() or {}).get("results", []) or []
+                        if items:
+                            ss = [_safe_sent((it.get("title") or "")) for it in items]
+                            if ss:
+                                # small nudge; clip to avoid overpowering MC
+                                sentiment = float(np.clip(np.mean(ss) * 0.2, -0.05, 0.05))
             except Exception as e:
                 logger.info(f"news sentiment failed: {e}")
 
         if req.include_options:
-            sigma_ann *= 1.05  # placeholder
+            sigma_ann *= 1.05  # placeholder tweak
         if req.include_futures:
-            mu_ann += 0.001   # placeholder
+            mu_ann += 0.001   # placeholder tweak
 
-        # Probability up at horizon vs S0 (clip with sentiment nudge)
+        # ---------- Terminal distribution metrics ----------
         terminal = paths[:, -1]
         prob_up = float(np.clip(np.mean(terminal > S0) + sentiment, 0.0, 1.0))
 
-        # ---------- Extras for new visuals ----------
-        # VaR/ES as returns (switch to $ if you prefer)
+        # VaR/ES as returns
         ret_terminal = (terminal - S0) / S0
-        q05 = float(np.percentile(ret_terminal, 5))
-        es_mask = ret_terminal <= q05
-        es95 = float(ret_terminal[es_mask].mean()) if es_mask.any() else float(q05)
+        var95 = float(np.percentile(ret_terminal, 5))
+        es_mask = ret_terminal <= var95
+        es95 = float(ret_terminal[es_mask].mean()) if es_mask.any() else float(var95)
 
-        # Hit probability ribbon (vectorized) for a few absolute thresholds
+        # Terminal price quantiles for logging into pred store
+        term_q05 = float(np.percentile(terminal, 5))
+        term_q50 = float(np.percentile(terminal, 50))
+        term_q95 = float(np.percentile(terminal, 95))
+
+        # Hit-prob ribbons for a few abs thresholds
         thresholds_pct = np.array([-0.05, 0.00, 0.05, 0.10], dtype=float)
-        thresholds_abs = (1.0 + thresholds_pct) * float(S0)  # shape (K,)
-        # paths: (N, T); compute (K, T) probabilities
-        probs_by_day = (
-            (paths[:, :, None] >= thresholds_abs[None, None, :])  # (N, T, K) bool
-            .mean(axis=0)                                         # (T, K)
-            .T                                                    # (K, T)
-            .tolist()
-        )
+        thresholds_abs = (1.0 + thresholds_pct) * float(S0)  # (K,)
+        probs_by_day = ((paths[:, :, None] >= thresholds_abs[None, None, :]).mean(axis=0).T).tolist()  # (K,T)
 
         rs.progress = 80
         await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
 
-        # ---------- Artifact ----------
+        # ---------- Artifact for UI ----------
         rs.artifact = {
             "symbol": req.symbol,
             "horizon_days": int(req.horizon_days),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-            "median_path": [[i, float(v)] for i, v in enumerate(p50.tolist())],
+            "median_path": [[i, float(v)] for i, v in enumerate(p50_line.tolist())],
             "bands": {
-                "p50":      [[i, float(v)] for i, v in enumerate(p50.tolist())],
+                "p50":      [[i, float(v)] for i, v in enumerate(p50_line.tolist())],
                 "p80_low":  [[i, float(v)] for i, v in enumerate(p80_low.tolist())],
                 "p80_high": [[i, float(v)] for i, v in enumerate(p80_high.tolist())],
                 "p95_low":  [[i, float(v)] for i, v in enumerate(p95_low.tolist())],
@@ -707,15 +850,61 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
             ],
             "model_info": {"direction": "MonteCarlo", "regime": "lognormal"},
             "calibration": {"window": window_days, "p80_empirical": 0.8},
-
-            # --- NEW FIELDS FOR UI ---
             "terminal_prices": [float(x) for x in terminal.tolist()],
-            "var_es": {"var95": q05, "es95": es95},  # returns; change to $ if preferred
+            "var_es": {"var95": var95, "es95": es95},  # returns
             "hit_probs": {
                 "thresholds_abs": [float(x) for x in thresholds_abs.tolist()],
-                "probs_by_day": probs_by_day,  # shape (K thresholds, T days)
+                "probs_by_day": probs_by_day,
             },
         }
+
+        # ---------- Persist: DuckDB.predictions (pred_id-keyed) ----------
+        try:
+            pred_id = str(uuid4())
+            insert_prediction({
+                "pred_id": pred_id,
+                "ts": datetime.utcnow(),
+                "symbol": req.symbol.upper(),
+                "horizon_d": int(req.horizon_days),
+                "model_id": "mc_v1",
+                "prob_up_next": float(prob_up),
+                "p05": term_q05,             # terminal PRICE q05
+                "p50": term_q50,             # terminal PRICE q50
+                "p95": term_q95,             # terminal PRICE q95
+                "spot0": float(S0),
+                "user_ctx": {"ui": "pathpanda", "run_id": run_id, "n_paths": int(req.n_paths)},
+                "run_id": run_id,
+            })
+        except Exception as e:
+            logger.warning(f"DuckDB insert_prediction (simulate) failed: {e}")
+
+        # ---------- Mirror: PathPanda Feature Store ----------
+        try:
+            con = fs_connect()
+            fs_log_prediction(con, {
+                "run_id":       run_id,                     # join key for FS ↔ outcomes
+                "model_id":     "mc_v1",
+                "symbol":       req.symbol.upper(),
+                "issued_at":    datetime.now(timezone.utc).isoformat(),
+                "horizon_days": int(req.horizon_days),
+                "yhat_mean":    term_q50,                   # mid as PRICE
+                "prob_up":      float(prob_up),
+                "q05":          term_q05,                   # PRICE quantiles
+                "q50":          term_q50,
+                "q95":          term_q95,
+                "uncertainty":  float(np.std(terminal)),    # dispersion of terminal prices
+                "features_ref": {
+                    "window_days":  int(window_days),
+                    "paths":        int(req.n_paths),
+                    "S0":           float(S0),
+                    "mu_ann":       float(mu_ann),
+                    "sigma_ann":    float(sigma_ann),
+                    "timespan":     req.timespan,
+                },
+            })
+            con.close()
+        except Exception as e:
+            logger.warning(f"Feature Store mirror failed: {e}")
 
         # ---------- Finish ----------
         rs.status = "done"
@@ -737,31 +926,97 @@ async def health():
             redis_ok = await REDIS.ping()
     except Exception:
         redis_ok = False
+
+    key = (settings.polygon_key or "").strip()
+    key_mode = "none"
+    try:
+        # MOCK_POLYGON_KEY is defined earlier in this file
+        key_mode = "mock" if key and key == MOCK_POLYGON_KEY else ("real" if key else "none")
+    except Exception:
+        pass
+
     return {
         "ok": True,
         "redis_ok": bool(redis_ok),
         "redis_url": settings.redis_url,
-        "polygon_key_present": bool(settings.polygon_key),
+        "polygon_key_present": bool(key),
+        "polygon_key_mode": key_mode,  # "real" | "mock" | "none"
         "n_paths_max": settings.n_paths_max,
         "horizon_days_max": settings.horizon_days_max,
         "pathday_budget_max": settings.pathday_budget_max,
     }
 
+
 @app.post("/outcomes/label")
-async def outcomes_label(_api_key: str = Depends(verify_api_key)):
-    async def _fetch(symbol: str, when: datetime) -> float:
-        return await _fetch_realized_price(symbol, when)
+async def outcomes_label(limit: int = 5000, _api_key: str = Depends(verify_api_key)):
+    """
+    Label any matured predictions (ts + horizon_d <= now) that don't yet have outcomes.
+    Writes to src.db.duck.outcomes and (optionally) mirrors each label into PathPanda FS
+    so daily metrics rollups can see realized prices.
+    """
+    limit = max(100, min(int(limit), 20000))
 
-    # Run sync labeler in a thread and return its count
-    def _run():
-        def _sync_fetch(sym: str, cutoff: datetime):
-            return asyncio.run(_fetch(sym, cutoff))
-        return label_mature_predictions(_sync_fetch)  # should return an int (count)
+    # 1) Load matured-but-unlabeled predictions from the Predictions/Outcomes store
+    try:
+        matured = matured_predictions_now(limit=limit)  # [(pred_id, ts, symbol, horizon_d, spot0), ...]
+    except Exception as e:
+        logger.exception(f"matured_predictions_now failed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to query matured predictions")
 
-    loop = asyncio.get_event_loop()
-    labeled = await loop.run_in_executor(None, _run)
-    labeled_int = int(labeled or 0)
-    return {"status": "ok", "labeled": labeled_int}
+    processed = 0
+    labeled = 0
+
+    # 2) Label each matured row
+    for pred_id, ts, symbol, horizon_d, spot0 in matured:
+        processed += 1
+        try:
+            # compute target date/time for the realized close
+            when = (ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts)))
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            target_ts = when + timedelta(days=int(horizon_d))
+
+            # fetch realized close (handles weekends/holidays internally)
+            realized_price = await _fetch_realized_price(symbol, target_ts)
+            if realized_price is None or not np.isfinite(realized_price) or not spot0:
+                continue
+
+            ret = (float(realized_price) / float(spot0)) - 1.0
+            label_up = bool(ret > 0.0)
+
+            # 2a) Write to Outcomes table (DuckDB via src.db.duck)
+            try:
+                insert_outcome(pred_id, target_ts, float(realized_price), float(ret), label_up)
+            except Exception as e:
+                logger.warning(f"insert_outcome failed for {pred_id}: {e}")
+                continue
+
+            labeled += 1
+
+            # 2b) (Optional) Mirror into PathPanda Feature Store for metrics
+            #     Use local import to avoid import-time cycles. If FS not available, skip quietly.
+            try:
+                from .feature_store import connect as _pfs_connect, insert_outcome as _pfs_insert_out
+                con_fs = _pfs_connect()
+                _pfs_insert_out(
+                    con_fs,
+                    {
+                        # Use pred_id as the run_id so outcomes are uniquely joinable if predictions were mirrored
+                        "run_id": pred_id,
+                        "symbol": symbol,
+                        "realized_at": target_ts,
+                        "y": float(realized_price),  # realized PRICE level
+                    },
+                )
+                con_fs.close()
+            except Exception as e:
+                logger.warning(f"feature_store outcome mirror failed for {pred_id}: {e}")
+
+        except Exception as e:
+            logger.warning(f"labeling failed for pred_id={pred_id}: {e}")
+
+    return {"status": "ok", "processed": processed, "labeled": labeled}
+
 
 # --- Metrics rollup (daily) ---
 @app.post("/metrics/rollup")
@@ -776,6 +1031,7 @@ async def metrics_rollup(_api_key: str = Depends(verify_api_key), day: Optional[
     con.close()
     return {"status": "ok", "date": d.isoformat(), "rows_upserted": int(n)}
 
+
 @app.get("/config")
 async def config():
     return {
@@ -785,6 +1041,7 @@ async def config():
         "predictive_defaults": settings.predictive_defaults,
         "cors_origins": settings.cors_origins,
     }
+
 
 @app.get("/simulate/{run_id}/stream")
 async def simulate_stream(run_id: str, _api_key: str = Depends(verify_api_key)):
@@ -847,6 +1104,7 @@ async def simulate_stream(run_id: str, _api_key: str = Depends(verify_api_key)):
         },
     )
 
+
 @app.websocket("/simulate/{run_id}/ws")
 async def simulate_ws(websocket: WebSocket, run_id: str):
     await websocket.accept()
@@ -866,6 +1124,7 @@ async def simulate_ws(websocket: WebSocket, run_id: str):
     finally:
         await websocket.close()
 
+
 @app.post("/simulate")
 async def simulate(req: SimRequest, bg: BackgroundTasks, _api_key: str = Depends(verify_api_key)):
     run_id = str(uuid4())
@@ -874,10 +1133,12 @@ async def simulate(req: SimRequest, bg: BackgroundTasks, _api_key: str = Depends
     bg.add_task(run_simulation, run_id, req, REDIS)
     return {"run_id": run_id}
 
+
 @app.get("/simulate/{run_id}/status")
 async def simulate_status(run_id: str, _api_key: str = Depends(verify_api_key)):
     rs = await _ensure_run(run_id)
     return {"status": rs.status, "progress": rs.progress, "error": rs.error}
+
 
 @app.get("/simulate/{run_id}/artifact")
 async def simulate_artifact(run_id: str, _api_key: str = Depends(verify_api_key)):
@@ -885,13 +1146,20 @@ async def simulate_artifact(run_id: str, _api_key: str = Depends(verify_api_key)
     if rs.status != "done":
         raise HTTPException(409, "Not done")
     return rs.artifact
-# --- Simple title sentiment helper ---
-# predictive_service.py
+
+
 def _load_labeled_samples(symbol: str, limit: int = 256):
+    """
+    Pull recent labeled examples and build a small binary dataset:
+    label = 1 if realized_price >= forecast_mid (q50 or yhat_mean), else 0
+    Features come from features_ref (legacy friendly).
+    """
     con = fs_connect()
     rows = con.execute("""
-        SELECT p.model_id, p.symbol, p.issued_at, p.horizon_days, p.features_ref,
-               o.realized_at, o.y
+        SELECT
+            p.model_id, p.symbol, p.issued_at, p.horizon_days,
+            p.features_ref, p.q50, p.yhat_mean,
+            o.realized_at, o.y AS realized_price
         FROM predictions p
         JOIN outcomes o USING (run_id)
         WHERE p.symbol = ?
@@ -901,21 +1169,33 @@ def _load_labeled_samples(symbol: str, limit: int = 256):
     con.close()
 
     X, y = [], []
-    for _, _, _, _, features_ref, _, y_real in rows:
+    for _, _, _, _, features_ref, q50, yhat_mean, _, realized_price in rows:
         try:
-            j = json.loads(features_ref or "{}")
-            f = (j.get("features") or j)  # tolerate legacy shape
-            X.append([float(f.get("mom_20", 0.0)),
-                      float(f.get("rvol_20", 0.0)),
-                      float(f.get("autocorr_5", 0.0))])
-            ret = float(y_real)           # <-- return we stored in outcomes.y
-            y.append(1.0 if ret > 0.0 else 0.0)
+            feats = {}
+            if features_ref:
+                j = json.loads(features_ref)
+                feats = j.get("features", j) if isinstance(j, dict) else {}
+
+            mom  = float(feats.get("mom_20", 0.0))
+            rvol = float(feats.get("rvol_20", 0.0))
+            ac5  = float(feats.get("autocorr_5", 0.0))
+
+            mid = q50 if (q50 is not None) else yhat_mean
+            if mid is None:
+                mid = float(realized_price)
+
+            realized = float(realized_price)
+            label = 1.0 if realized >= float(mid) else 0.0
+
+            X.append([mom, rvol, ac5])
+            y.append(label)
         except Exception:
             continue
 
     return np.array(X, dtype=float), np.array(y, dtype=float)
 
-def _safe_sent(text:str)->float:
+
+def _safe_sent(text: str) -> float:
     base = _simple_sentiment(text)
     t = text.lower()
     if any(w in t for w in ["beats", "record", "surge", "raises", "upgrade"]): base += 0.1
@@ -923,23 +1203,22 @@ def _safe_sent(text:str)->float:
     return max(-1.0, min(1.0, base))
 
 
-# --- Polygon news (cached + pagination-safe) ---
 @app.get("/api/news/{symbol}")
 async def get_news(
     symbol: str,
     limit: int = 10,
     days: int = 7,
-    cursor: Optional[str] = None,                 # ← NEW: pass back to paginate
+    cursor: Optional[str] = None,
     _api_key: str = Depends(verify_api_key),
 ):
-    if not settings.polygon_key:
-        raise HTTPException(status_code=400, detail="News provider key not configured")
+    # Always use our key helper (real or mock) so dev doesn’t 400
+    key = _poly_key()
 
-    # ---- input guards ----
+    # input guards
     limit = max(1, min(int(limit), 50))
-    days  = max(1, min(int(days), 30))
+    days = max(1, min(int(days), 30))
 
-    # ---- normalize ticker ----
+    # normalize ticker for Polygon (stocks as-is; crypto -> X:BASEUSD)
     raw_symbol = symbol.strip().upper()
 
     def to_polygon_ticker(s: str) -> str:
@@ -951,7 +1230,7 @@ async def get_news(
 
     poly_ticker = to_polygon_ticker(raw_symbol)
 
-    # ---- cache lookup (include cursor in key to avoid mixing pages) ----
+    # cache (cursor-specific)
     cache_key = f"news:{poly_ticker}:{limit}:{days}:{cursor or 'first'}"
     if REDIS:
         try:
@@ -961,23 +1240,15 @@ async def get_news(
         except Exception as e:
             logger.warning(f"Redis get failed for {cache_key}: {e}")
 
-    # ---- fetch ----
+    # fetch
     url = "https://api.polygon.io/v2/reference/news"
-    params = {
-        "apiKey": settings.polygon_key,
-        "limit": str(limit),
-    }
-    # When paginating with a cursor, Polygon continues from that point;
-    # otherwise use the date filter and ticker.
+    params = {"apiKey": key, "limit": str(limit)}
     if cursor:
         params["cursor"] = cursor
         params["ticker"] = poly_ticker
     else:
         since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-        params.update({
-            "ticker": poly_ticker,
-            "published_utc.gte": since,
-        })
+        params.update({"ticker": poly_ticker, "published_utc.gte": since})
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
@@ -985,7 +1256,7 @@ async def get_news(
             resp.raise_for_status()
             payload = resp.json()
             news = payload.get("results", []) or []
-            next_url = payload.get("next_url")  # may be None
+            next_url = payload.get("next_url")
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 429:
             raise HTTPException(status_code=429, detail="Rate limited by news provider")
@@ -993,49 +1264,43 @@ async def get_news(
         raise HTTPException(status_code=502, detail="Upstream news provider error")
     except Exception as e:
         logger.error(f"News fetch failed for {poly_ticker}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch news")
+        raise HTTPException(status_code=502, detail="News fetch failed")
 
-    # ---- process + dedupe + sort ----
-    def _safe_sent(text: str) -> float:
-        try:
-            return _simple_sentiment(text)
-        except Exception:
-            return 0.0
-
-    seen = set()
-    processed = []
+    # map results
+    seen: set[str] = set()
+    processed: list[dict] = []
     for item in news:
         nid = item.get("id") or item.get("url") or item.get("article_url")
-        if nid in seen:
+        if not nid or nid in seen:
             continue
         seen.add(nid)
         title = item.get("title", "")
-        processed.append({
-            "id": nid,
-            "title": title,
-            "url": item.get("article_url") or item.get("url", ""),
-            "published_at": item.get("published_utc", ""),
-            "source": (item.get("publisher") or {}).get("name", ""),
-            "sentiment": _safe_sent(title),
-            "image_url": item.get("image_url", ""),
-        })
+        processed.append(
+            {
+                "id": nid,
+                "title": title,
+                "url": item.get("article_url") or item.get("url", ""),
+                "published_at": item.get("published_utc", ""),
+                "source": (item.get("publisher") or {}).get("name", ""),
+                "sentiment": _safe_sent(title),
+                "image_url": item.get("image_url", ""),
+            }
+        )
 
     processed.sort(key=lambda x: x.get("published_at", ""), reverse=True)
 
-    # ---- extract safe next_cursor (no apiKey leakage) ----
+    # extract next_cursor safely
     next_cursor = None
     if next_url:
         try:
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(next_url).query)
-            nc = q.get("cursor", [None])[0]
-            next_cursor = nc if isinstance(nc, str) else None
-        except Exception as e:
-            logger.warning(f"Failed to parse next_url cursor: {e}")
+            next_cursor = q.get("cursor", [None])[0]
+        except Exception:
+            next_cursor = None
 
-    result = {"items": processed, "next_cursor": next_cursor}
+    result = {"items": processed, "nextCursor": next_cursor}
 
-    # ---- cache write (store the object so shape matches response) ----
     if REDIS:
         try:
             await REDIS.setex(cache_key, 3600, json.dumps(result))
@@ -1045,72 +1310,135 @@ async def get_news(
     return result
 
 
-
 # --- Options snapshot (Polygon) ---
 @app.get("/options/{symbol}")
-async def get_options_snapshot(symbol: str, contract_type: str = "call", limit: int = 10, _api_key: str = Depends(verify_api_key)):
-    if not settings.polygon_key:
-        raise HTTPException(status_code=400, detail="Polygon key required for options")
-    url = f"https://api.polygon.io/v3/snapshot/options/{symbol}"
-    params = {"contract_type": contract_type, "sort": "strike_price", "order": "asc", "limit": str(limit), "apiKey": settings.polygon_key}
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-    if not data.get("results"):
+async def get_options_snapshot(
+    symbol: str,
+    contract_type: Literal["call", "put"] = "call",
+    limit: int = 10,
+    _api_key: str = Depends(verify_api_key),
+):
+    """
+    Lightweight options snapshot summary.
+    Uses _poly_key() so dev can run without a real key (mock key allowed).
+    """
+    key = _poly_key()
+    limit = max(1, min(int(limit), 50))
+
+    url = f"https://api.polygon.io/v3/snapshot/options/{symbol.upper().strip()}"
+    params = {
+        "contract_type": contract_type,
+        "sort": "strike_price",
+        "order": "asc",
+        "limit": str(limit),
+        "apiKey": key,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json() or {}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Rate limited by options provider")
+        raise HTTPException(status_code=502, detail=f"Options upstream error {e.response.status_code}")
+    except Exception as e:
+        logger.warning(f"Options snapshot failed for {symbol}: {e}")
+        raise HTTPException(status_code=502, detail="Options fetch failed")
+
+    results = data.get("results") or []
+    if not results:
         raise HTTPException(status_code=404, detail=f"No options data for {symbol}")
-    results = data["results"]
-    ivs = [float(r.get("implied_volatility", 0)) for r in results if r.get("implied_volatility") is not None]
-    deltas = [float(r.get("greeks", {}).get("delta", 0)) for r in results]
+
+    ivs = [float(r.get("implied_volatility", 0) or 0) for r in results]
+    deltas = [float((r.get("greeks") or {}).get("delta", 0) or 0) for r in results]
     avg_iv = float(np.mean(ivs)) if ivs else 0.0
     avg_delta = float(np.mean(deltas)) if deltas else 0.0
-    sample_contracts = [{
-        "ticker": r["details"]["ticker"],
-        "strike": r["details"]["strike_price"],
-        "iv": float(r.get("implied_volatility", 0) or 0),
-        "delta": float((r.get("greeks") or {}).get("delta", 0) or 0),
-        "expiration": r["details"]["expiration_date"],
-    } for r in results[:3]]
-    return {"symbol": symbol, "avg_iv": avg_iv, "avg_delta": avg_delta, "sample_contracts": sample_contracts, "source": "Polygon Options Snapshot"}
+
+    sample_contracts = []
+    for r in results[:3]:
+        det = r.get("details") or {}
+        sample_contracts.append({
+            "ticker": det.get("ticker"),
+            "strike": det.get("strike_price"),
+            "iv": float(r.get("implied_volatility", 0) or 0),
+            "delta": float((r.get("greeks") or {}).get("delta", 0) or 0),
+            "expiration": det.get("expiration_date"),
+        })
+
+    return {
+        "symbol": symbol.upper().strip(),
+        "avg_iv": avg_iv,
+        "avg_delta": avg_delta,
+        "sample_contracts": sample_contracts,
+        "source": "Polygon Options Snapshot",
+    }
+
 
 # --- Futures snapshot (Polygon) ---
 @app.get("/futures/{symbol}")
 async def get_futures_snapshot(symbol: str, _api_key: str = Depends(verify_api_key)):
-    if not settings.polygon_key:
-        raise HTTPException(status_code=400, detail="Polygon key required for futures")
-    url = f"https://api.polygon.io/v3/snapshot?underlying_ticker={symbol}&contract_type=futures&apiKey={settings.polygon_key}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-    if not data.get("results"):
+    """
+    Very light futures snapshot aggregation.
+    Uses _poly_key() so dev can run without a real key (mock key allowed).
+    """
+    key = _poly_key()
+    url = "https://api.polygon.io/v3/snapshot"
+    params = {
+        "underlying_ticker": symbol.upper().strip(),
+        "contract_type": "futures",
+        "apiKey": key,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json() or {}
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Rate limited by futures provider")
+        raise HTTPException(status_code=502, detail=f"Futures upstream error {e.response.status_code}")
+    except Exception as e:
+        logger.warning(f"Futures snapshot failed for {symbol}: {e}")
+        raise HTTPException(status_code=502, detail="Futures fetch failed")
+
+    results = data.get("results") or []
+    if not results:
         raise HTTPException(status_code=404, detail=f"No futures data for {symbol}")
-    results = data["results"]
+
     open_interests = [int(r.get("open_interest", 0) or 0) for r in results]
     last_prices = [float((r.get("last") or {}).get("price", 0) or 0) for r in results]
+
     return {
-        "symbol": symbol,
+        "symbol": symbol.upper().strip(),
         "avg_open_interest": float(np.mean(open_interests)) if open_interests else 0.0,
         "avg_price": float(np.mean(last_prices)) if last_prices else 0.0,
         "sample_contracts": [r.get("ticker") for r in results[:3]],
         "source": "Polygon Futures Snapshot",
     }
 
+
 # --- X (Twitter) demo sentiment ---
 @app.get("/x-sentiment/{symbol}")
 async def x_sentiment(symbol: str, handles: str = "", _api_key: str = Depends(verify_api_key)):
     sample_posts = []
-    if "BTC" in symbol or "X:BTCUSD" in symbol:
+    s = symbol.upper()
+    if "BTC" in s or "X:BTCUSD" in s:
         sample_posts = ["BTC ETF approved! Bullish 🚀", "Bitcoin halving incoming", "Bearish on BTC due to regulation"]
-    elif "NVDA" in symbol:
+    elif "NVDA" in s:
         sample_posts = ["NVDA earnings beat, AI boom!", "Chip shortage hurting NVDA", "Bullish on NVDA with new GPU"]
     else:
         sample_posts = ["Generic post about market trends"]
+
     if handles:
         sample_posts = [f"{p} (from {handles})" for p in sample_posts]
+
     score = sum(_simple_sentiment(p) for p in sample_posts)
     x_sent = max(-0.2, min(0.2, score)) if sample_posts else 0.0
-    return {"symbol": symbol, "x_sentiment": float(x_sent), "sample_posts": sample_posts[:3], "handles_used": handles or "general"}
+    return {"symbol": s, "x_sentiment": float(x_sent), "sample_posts": sample_posts[:3], "handles_used": handles or "general"}
+
 
 @app.post("/train")
 async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
@@ -1129,6 +1457,7 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
     y = rets[req.lookback_days:] if len(rets) > req.lookback_days else rets
     if len(y) == 0:
         raise HTTPException(status_code=400, detail="Insufficient data")
+
     # --- Linear first (always succeeds)
     X_df = pd.DataFrame({feat: [f[feat]] * len(y) for feat in feature_list})
     X = X_df.values
@@ -1137,6 +1466,7 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
     model_linear.init(len(feature_list))
     for x_row, yi in zip(X, y):
         model_linear.update(x_row, 1 if yi > 0 else 0)
+
     linear_data = {
         "coef": model_linear.w.tolist(),
         "features": feature_list,
@@ -1147,6 +1477,8 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
 
     # --- LSTM (best-effort)
     try:
+        if Sequential is None:
+            raise RuntimeError("Keras not available")
         model_lstm = Sequential([
             LSTM(50, input_shape=(1, len(feature_list)), return_sequences=True),
             GRU(50),
@@ -1156,15 +1488,13 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
         X_reshaped = np.expand_dims(X, axis=1)
         y_binary = (y > 0).astype(int)
         model_lstm.fit(X_reshaped, y_binary, epochs=5, verbose=0)
-        model_lstm.save(f"models/{req.symbol}_lstm.h5")
+        model_lstm.save(f"models/{req.symbol}_lstm.keras")
     except Exception as e:
         logger.warning(f"LSTM skipped: {e}")
 
     # --- ARIMA (fallbacks)
     try:
-        order = (5, 1, 0)
-        if len(px) < 30:
-            order = (1, 1, 0)
+        order = (5, 1, 0) if len(px) >= 30 else (1, 1, 0)
         model_arima = ARIMA(px, order=order).fit()
         with open(f"models/{req.symbol}_arima.pkl", "wb") as file:
             pickle.dump(model_arima, file)
@@ -1173,6 +1503,8 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
 
     # --- RL (best-effort; consistent window)
     try:
+        if gym is None or DQN is None:
+            raise RuntimeError("RL libs not available")
         env = StockEnv(px, window_len=RL_WINDOW)
         model_rl = DQN("MlpPolicy", env, verbose=0)
         model_rl.learn(total_timesteps=10_000)
@@ -1183,7 +1515,8 @@ async def train(req: TrainRequest, _api_key: str = Depends(verify_api_key)):
 
     return {"status": "ok", "models_trained": 4}
 
-class StockEnv(gym.Env):
+
+class StockEnv(gym.Env):  # type: ignore[attr-defined]
     """Simple price-following env."""
     metadata = {"render_modes": []}
 
@@ -1194,8 +1527,10 @@ class StockEnv(gym.Env):
             raise ValueError("prices must be a 1D array with length >= 2")
         self.prices = px
         self.window_len = int(window_len)
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.window_len,), dtype=np.float32)
-        self.action_space = gym.spaces.Discrete(3)
+        self.observation_space = gym.spaces.Box(  # type: ignore[attr-defined]
+            low=-np.inf, high=np.inf, shape=(self.window_len,), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Discrete(3)  # type: ignore[attr-defined]
         self.current_step = 0
         self.max_steps = len(self.prices) - 2
 
@@ -1232,6 +1567,8 @@ class StockEnv(gym.Env):
         obs = self._get_obs()
         info = {}
         return obs, reward, terminated, truncated, info
+
+
 class OnlineLearnRequest(BaseModel):
     symbol: str
     steps: int = 50
@@ -1239,6 +1576,7 @@ class OnlineLearnRequest(BaseModel):
     lr: float = 0.05
     l2: float = 1e-4
     eta: float = 2.0
+
 
 @app.post("/learn/online")
 async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_api_key)):
@@ -1253,7 +1591,7 @@ async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_a
         raise HTTPException(status_code=422, detail="Not enough labeled samples yet")
 
     # 2) Load existing linear model (always 4 weights: [bias, w_mom, w_rvol, w_autocorr])
-    key = await _model_key(req.symbol + "_linear")  # <<< keep this key everywhere
+    key = await _model_key(req.symbol + "_linear")  # keep this key everywhere
     raw = await REDIS.get(key)
     if raw:
         m = json.loads(raw)
@@ -1266,9 +1604,9 @@ async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_a
         coef = np.zeros(4, dtype=float)
 
     # 3) Online SGD on logistic loss (3 features)
-    sgd = SGDOnline(lr=req.lr, l2=req.l2)  # ctor only; do not pass n_features here
-    sgd.init(3)                            # <<< bias + 3 features
-    sgd.w = coef.copy()                    # class aligns internally if needed
+    sgd = SGDOnline(lr=req.lr, l2=req.l2)
+    sgd.init(3)            # bias + 3 features
+    sgd.w = coef.copy()    # class aligns internally if needed
 
     rng = np.random.default_rng(0)
     for _ in range(req.steps):
@@ -1277,18 +1615,16 @@ async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_a
             sgd.update(X[i], float(y[i]))
 
     # 4) Exp-weights over two experts: old vs new (use stable log-loss)
-    def _sigmoid(z: np.ndarray) -> np.ndarray:
+    def _sigmoid_arr(z: np.ndarray) -> np.ndarray:
         z = np.clip(z.astype(float), -60.0, 60.0)
         return 1.0 / (1.0 + np.exp(-z))
 
-    # use a small, always-valid holdout (at least 8 or all if small)
     k = max(8, min(len(X), len(X)//8 or len(X)))
     hold = slice(0, k)
 
     def logloss(w: np.ndarray) -> float:
-        # w length 4, X has 3 cols
         z = w[0] + X[hold, 0]*w[1] + X[hold, 1]*w[2] + X[hold, 2]*w[3]
-        p = _sigmoid(z)
+        p = _sigmoid_arr(z)
         eps = 1e-9
         return -float(np.mean(y[hold]*np.log(p + eps) + (1 - y[hold])*np.log(1 - p + eps)))
 
@@ -1314,46 +1650,57 @@ async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_a
     await REDIS.set(key, json.dumps(updated))
     return {"status": "ok", "model": updated}
 
+
 @app.post("/predict")
 async def predict(req: PredictRequest, _api_key: str = Depends(verify_api_key)):
-    # 1) Load linear metadata (coef + feature list)
+    """
+    Returns an ensemble probability that the next move is up, logs the prediction to DuckDB,
+    and mirrors the row into the PathPanda Feature Store so dashboards/metrics see it.
+    """
+    # --- 1) Load linear head (coef + feature list) from Redis ---
     raw = await REDIS.get(await _model_key(req.symbol + "_linear"))
     if not raw:
         raise HTTPException(status_code=404, detail="Linear model not found; train first")
     model_linear = json.loads(raw)
 
-    # 2) Get prices + features
-    px = await _fetch_hist_prices(req.symbol)
+    # --- 2) Prices + features ---
+    symbol = req.symbol.upper().strip()
+    px = await _fetch_hist_prices(symbol)
     if not px or len(px) < 10:
         raise HTTPException(status_code=400, detail="Not enough price history")
-    f = await _feat_from_prices(req.symbol, px)
+    f = await _feat_from_prices(symbol, px)
 
-    # 3) Build input vector (no bias term here; linear model already learned its own intercept-style coef)
+    # --- 3) Build input vector for linear head ---
     feature_list = model_linear.get("features", ["mom_20", "rvol_20", "autocorr_5"])
     X = np.array([f.get(feat, 0.0) for feat in feature_list], dtype=float)
 
-    preds: list[float] = []
+    preds: List[float] = []
+
     # --- Linear probability via logistic(dot(w, [1, X])) ---
-    w = np.array(model_linear.get("coef", []), dtype=float)
-    if w.size:
-        xb = np.concatenate([[1.0], X])       # prepend bias 1.0
-        k = min(w.shape[0], xb.shape[0])
-        score = float(np.dot(xb[:k], w[:k]))  # safe dot with truncation
-        score = float(np.clip(score, -60.0, 60.0))
-        preds.append(_sigmoid(score))
-    # --- LSTM probability (lenient if missing) ---
     try:
-        lstm_model = load_lstm_model(req.symbol)  # your helper returns a keras model or raises
+        w = np.array(model_linear.get("coef", []), dtype=float)
+        if w.size:
+            xb = np.concatenate([[1.0], X])            # prepend bias
+            k = min(w.shape[0], xb.shape[0])
+            score = float(np.dot(xb[:k], w[:k]))
+            score = float(np.clip(score, -60.0, 60.0)) # numerical safety
+            preds.append(1.0 / (1.0 + np.exp(-score)))
+    except Exception as e:
+        logger.info(f"Linear skipped: {e}")
+
+    # --- LSTM probability (optional/lenient) ---
+    try:
+        lstm_model = load_lstm_model(symbol)
         X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)  # (1, 1, features)
         p_lstm = float(lstm_model.predict(X_lstm, verbose=0)[0][0])
         preds.append(p_lstm)
     except Exception as e:
         logger.info(f"LSTM skipped: {e}")
 
-    # --- ARIMA direction probability (0/1 from last forecast vs last price) ---
+    # --- ARIMA direction (0/1) ---
     try:
-        arima_model = load_arima_model(req.symbol)
-        steps = max(1, int(req.horizon_days))
+        arima_model = load_arima_model(symbol)
+        steps = max(1, int(getattr(req, "horizon_days", 1)))
         fc = arima_model.forecast(steps=steps)
         last_fc = float(fc.iloc[-1] if hasattr(fc, "iloc") else fc[-1])
         preds.append(1.0 if last_fc > float(px[-1]) else 0.0)
@@ -1363,107 +1710,102 @@ async def predict(req: PredictRequest, _api_key: str = Depends(verify_api_key)):
     if not preds:
         raise HTTPException(status_code=500, detail="No model produced a prediction")
 
-    # PREDICT (RL adjust block)
+    # --- RL tiny tilt (optional) ---
     rl_adjust = 0.0
     try:
-        rl_model = DQN.load(f"models/{req.symbol}_rl.zip", print_system_info=False)
+        rl_model = DQN.load(f"models/{symbol}_rl.zip", print_system_info=False)
         env = StockEnv(px, window_len=RL_WINDOW)
         obs, _ = env.reset()
         action, _ = rl_model.predict(obs, deterministic=True)  # 0,1,2
-        # map to tiny tilt: short=-1%, flat=0%, long=+1% (clipped to ±5%)
-        a = {-1: -0.01, 0: 0.0, 1: 0.01}[int(action) - 1] if int(action) in (0,1,2) else 0.0
-        rl_adjust = float(np.clip(a, -0.05, 0.05))
+        a_map = {-1: -0.01, 0: 0.0, 1: 0.01}
+        a_idx = int(action)
+        a_val = a_map.get(a_idx - 1, 0.0)  # action 0→-1, 1→0, 2→+1
+        rl_adjust = float(np.clip(a_val, -0.05, 0.05))
         env.close()
     except Exception as e:
         logger.info(f"RL skipped: {e}")
 
-    # --- Ensemble with exp-weights (robust) ---
-    # Always have a default so we never hit UnboundLocalError
-    # --- Ensemble with exp-weights (robust) ---
-    # Default per-model losses if metrics not available
+    # --- Simple exp-weights ensemble (defaults if no metrics available) ---
     losses: List[float] = [0.3] * len(preds)
-
-    con = None
-    try:
-        con = fs_connect()
-        rows = con.execute("""
-            SELECT model_id, rmse
-            FROM metrics_daily
-            WHERE model_id IN ('linear','lstm','arima')
-            ORDER BY date DESC
-        """).fetchall()
-
-        latest: Dict[str, float] = {}
-        for mid, rmse in rows:
-            if mid not in latest:
-                latest[mid] = float(rmse) if (rmse is not None and np.isfinite(rmse)) else 0.3
-
-        # align to the order of preds you built (linear, lstm, arima)
-        ordered = ['linear', 'lstm', 'arima']
-        losses = [latest.get(m, 0.3) for m in ordered][:len(preds)]
-        if len(losses) < len(preds):
-            losses += [0.3] * (len(preds) - len(losses))
-
-    except Exception as e:
-        logger.info(f"metrics fetch failed; using default losses. {e}")
-    finally:
-        try:
-            if con is not None:
-                con.close()
-        except Exception:
-            pass
-    # ExpWeights: use .init(...) (your class doesn't take ctor kwargs)
     ew = EW()
     ew.init(len(preds))
     ew.update(np.array(losses, dtype=float))
+    prob_up = float(np.clip(sum(wt * p for wt, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
 
-    prob_up = float(np.clip(sum(w * p for w, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
-    # ---- DuckDB logging (persist prediction) ----
+    # --- Quantile placeholders (wire real conformal/quantiles later) ---
+    q05 = None
+    q50 = None
+    q95 = None
+
+    # --- Log to Predictions/Outcomes store (DuckDB via src.db.duck) ---
+    pred_id = str(uuid4())
+    spot0 = float(px[-1])
     try:
-        # IDs & request context
-        run_id = str(uuid4())
-        model_id = "ensemble-v1"                 # change if you prefer "baseline-linear"
-        symbol = req.symbol
-        horizon_days = int(getattr(req, "horizon_days", 1))
-
-        # features you already computed in f
-        mom_20     = float(f.get("mom_20", 0.0))
-        rvol_20    = float(f.get("rvol_20", 0.0))
-        autocorr_5 = float(f.get("autocorr_5", 0.0))
-
-        # if you don't compute a point estimate / quantiles yet, None is fine
-        yhat_mean  = None
-        q05 = q50 = q95 = None
-        uncertainty = None
-
-        con = fs_connect()
-        fs_log_prediction(con, {
-            "run_id":       run_id,
-            "model_id":     model_id,
-            "symbol":       symbol,
-            "issued_at":    datetime.now(timezone.utc).isoformat(),
-            "horizon_days": horizon_days,
-            "yhat_mean":    yhat_mean,
-            "prob_up":      float(prob_up),
-            "q05":          q05,
-            "q50":          q50,
-            "q95":          q95,
-            "uncertainty":  uncertainty,
-            "features_ref": {
-                "mom_20":     mom_20,
-                "rvol_20":    rvol_20,
-                "autocorr_5": autocorr_5
+        insert_prediction(
+            {
+                "pred_id": pred_id,
+                "ts": datetime.utcnow(),
+                "symbol": symbol,
+                "horizon_d": int(getattr(req, "horizon_days", 1)),
+                "model_id": "ensemble-v1",
+                "prob_up_next": float(prob_up),
+                "p05": q05,
+                "p50": q50,
+                "p95": q95,
+                "spot0": spot0,
+                "user_ctx": {"ui": "pathpanda"},
+                "run_id": getattr(req, "run_id", "") or "",
             }
-        })
-        con.close()
+        )
     except Exception as e:
-        logger.exception(f"DuckDB log_prediction failed: {e}")
-    # ---------------------------------------------
+        logger.exception(f"DuckDB insert_prediction failed: {e}")
+
+    # --- Also mirror to PathPanda Feature Store (so metrics/dashboard can see it) ---
+    try:
+        con_fs = fs_connect()
+        fs_log_prediction(
+            con_fs,
+            {
+                # mirror using pred_id as run_id for joinability
+                "run_id": pred_id,
+                "model_id": "ensemble-v1",
+                "symbol": symbol,
+                "issued_at": datetime.now(timezone.utc).isoformat(),
+                "horizon_days": int(getattr(req, "horizon_days", 1)),
+                "yhat_mean": None,                # fill with price mid later if available
+                "prob_up": float(prob_up),        # note: FS expects 'prob_up'
+                "q05": q05,
+                "q50": q50,
+                "q95": q95,
+                "uncertainty": None,
+                "features_ref": {
+                    "mom_20": float(f.get("mom_20", 0.0)),
+                    "rvol_20": float(f.get("rvol_20", 0.0)),
+                    "autocorr_5": float(f.get("autocorr_5", 0.0)),
+                    "spot0": spot0,
+                },
+            },
+        )
+        con_fs.close()
+    except Exception as e:
+        logger.warning(f"Feature store mirror failed: {e}")
+
+    # --- Response for UI ---
+    return {
+        "pred_id": pred_id,
+        "symbol": symbol,
+        "prob_up_next": float(prob_up),
+        "p05": q05,
+        "p50": q50,
+        "p95": q95,
+        "spot0": spot0,
+    }
 
 
 @app.get("/models")
 async def models(_api_key: str = Depends(verify_api_key)):
     return {"models": await _list_models()}
+
 
 @app.get("/ui/fan-chart.tsx")
 async def get_fan_chart_tsx():
@@ -1473,6 +1815,7 @@ async def get_fan_chart_tsx():
             return {"filename": "FanChart.tsx", "contents": f.read()}
     raise HTTPException(404, "FanChart.tsx not found")
 
+
 @app.get("/{path:path}", response_class=HTMLResponse)
 async def spa_fallback(path: str):
     file_path = os.path.join(r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist", path)
@@ -1480,4 +1823,9 @@ async def spa_fallback(path: str):
         return FileResponse(file_path)
     return FileResponse(r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist\index.html")
 
-app.mount("/assets", StaticFiles(directory=r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist\assets"), name="assets")
+
+app.mount(
+    "/assets",
+    StaticFiles(directory=r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist\assets"),
+    name="assets",
+)

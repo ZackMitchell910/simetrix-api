@@ -2,81 +2,92 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable, Optional
 from datetime import datetime, timedelta, timezone
-from typing import Callable
 
-from feature_store import connect, insert_outcome
+import numpy as np
+
+# Use the Predictions/Outcomes store (pred_id-keyed)
+from .db.duck import matured_predictions_now, insert_outcome
+
+# Optional: mirror into PathPanda Feature Store (run_id-keyed)
+try:
+    from .feature_store import connect as _pfs_connect, insert_outcome as _pfs_insert_out
+except Exception:  # feature_store not required at import time
+    _pfs_connect = None
+    _pfs_insert_out = None
 
 logger = logging.getLogger(__name__)
 
-def _to_utc_aware(dt_obj: datetime) -> datetime:
-    """DuckDB TIMESTAMPs are tz-naive; treat them as UTC and return tz-aware."""
-    if dt_obj.tzinfo is None:
-        return dt_obj.replace(tzinfo=timezone.utc)
-    return dt_obj.astimezone(timezone.utc)
 
 def label_mature_predictions(
-    fetch_realized_fn: Callable[[str, datetime], float],
-    *,
-    max_per_pass: int = 50,
+    fetch_close_fn: Callable[[str, datetime], Optional[float]],
+    limit: int = 5000,
 ) -> int:
     """
-    Label matured predictions:
-      - A prediction is mature if (issued_at + horizon_days) <= now (UTC).
-      - Writes outcomes.y as the *return* from issue->cutoff: (p1 - p0) / p0.
-      - Skips rows on provider errors (e.g., 429) instead of crashing.
-      - Returns the number of rows labeled this pass.
+    Labels any matured predictions (ts + horizon_d <= now) that are missing outcomes.
+
+    - Reads matured rows from src.db.duck.predictions/outcomes
+    - Uses `fetch_close_fn(symbol, target_ts)` to get realized close
+    - Writes labels to src.db.duck.outcomes
+    - Optionally mirrors each label into PathPanda Feature Store (if available)
+
+    Returns:
+        int: count of outcomes labeled.
     """
-    # Read candidates
-    con = connect()
-    rows = con.execute(
-        """
-        SELECT run_id, symbol, issued_at, horizon_days
-        FROM predictions
-        WHERE run_id NOT IN (SELECT run_id FROM outcomes)
-        ORDER BY issued_at ASC
-        """
-    ).fetchall()
-    con.close()
+    try:
+        rows = matured_predictions_now(limit=limit)
+    except Exception as e:
+        logger.exception(f"matured_predictions_now failed: {e}")
+        return 0
 
-    now_utc = datetime.now(timezone.utc)
     labeled = 0
-    processed = 0
 
-    for run_id, symbol, issued_at, horizon_days in rows:
-        if processed >= max_per_pass:
-            break
-        processed += 1
-
-        issued_utc = _to_utc_aware(issued_at)
-        cutoff = issued_utc + timedelta(days=int(horizon_days or 0))
-        if cutoff > now_utc:
-            continue
-
-        # Fetch prices (best-effort; skip on failure)
+    for pred_id, ts, symbol, horizon_d, spot0 in rows:
         try:
-            p0 = float(fetch_realized_fn(symbol, issued_utc))
-            p1 = float(fetch_realized_fn(symbol, cutoff))
-            if p0 <= 0.0:
-                raise ValueError("issue price <= 0")
-            ret = (p1 - p0) / p0
+            if spot0 in (None, 0):
+                continue
+
+            # Compute target timestamp (UTC)
+            ts_utc = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
+            ts_utc = ts_utc.replace(tzinfo=timezone.utc)
+            target_ts = ts_utc + timedelta(days=int(horizon_d))
+
+            # Fetch realized close (caller handles weekends/holidays)
+            realized = fetch_close_fn(symbol, target_ts)
+            if realized is None or not np.isfinite(realized):
+                continue
+
+            realized = float(realized)
+            ret = (realized / float(spot0)) - 1.0
+            label_up = bool(ret > 0.0)
+
+            # Write to Outcomes table (DuckDB)
+            try:
+                insert_outcome(pred_id, target_ts, realized, float(ret), label_up)
+                labeled += 1
+            except Exception as e:
+                logger.warning(f"insert_outcome failed for {pred_id}: {e}")
+                continue
+
+            # Optional mirror to PathPanda FS (so metrics/rollups can see realized prices)
+            if _pfs_connect and _pfs_insert_out:
+                try:
+                    con_fs = _pfs_connect()
+                    _pfs_insert_out(
+                        con_fs,
+                        {
+                            "run_id": pred_id,          # reuse pred_id as run_id for joinability
+                            "symbol": symbol,
+                            "realized_at": target_ts,   # datetime
+                            "y": realized,              # realized PRICE level
+                        },
+                    )
+                    con_fs.close()
+                except Exception as e:
+                    logger.warning(f"feature_store outcome mirror failed for {pred_id}: {e}")
+
         except Exception as e:
-            logger.warning(f"Label skip [{symbol} {run_id}] at {cutoff.date()}: fetch failed: {e}")
-            continue
+            logger.warning(f"labeling failed for pred_id={pred_id}: {e}")
 
-        # Write outcome
-        con = connect()
-        insert_outcome(
-            con,
-            {
-                "run_id": run_id,
-                "symbol": symbol,
-                "realized_at": cutoff,  # tz-aware; DuckDB stores as naive-UTC
-                "y": float(ret),
-            },
-        )
-        con.close()
-        labeled += 1
-
-    logger.info(f"Label pass complete: processed={processed}, labeled={labeled}")
     return labeled
