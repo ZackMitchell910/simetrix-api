@@ -27,5 +27,3 @@ stable-baselines3==2.3.0
 # TensorFlow (optional):
 # - On Linux/macOS: tensorflow==2.15.0 installs fine
 # - On Windows: use tensorflow-intel==2.15.0 instead
-tensorflow==2.15.0; platform_system != "Windows"
-tensorflow-intel==2.15.0; platform_system == "Windows"
