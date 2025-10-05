@@ -7,8 +7,8 @@ orjson>=3.10,<4
 
 # Numerics / data
 # numpy pinned for TF 2.15 & broad wheel support on Windows
-numpy==1.26.4
-pandas==2.2.2
+numpy==2.1.3
+pandas==2.2.3
 scikit-learn==1.5.2
 statsmodels==0.14.2
 duckdb==1.1.2
