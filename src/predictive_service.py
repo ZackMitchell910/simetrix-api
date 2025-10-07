@@ -121,7 +121,7 @@ class Settings(BaseSettings):
     polygon_key: Optional[str] = Field(default_factory=_poly_key)
     news_api_key: Optional[str] = None
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
-    cors_origins: List[str] = Field(default_factory=lambda: _env_list("PT_CORS_ORIGINS", ["*"]))
+    cors_origins_raw: Optional[str] = None
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
     horizon_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_HORIZON_DAYS_MAX", "365")))
     lookback_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_LOOKBACK_DAYS_MAX", str(365*10))))
@@ -152,6 +152,7 @@ class Settings(BaseSettings):
         return v
 
 settings = Settings()
+CORS_ORIGINS = _parse_cors_list(settings.cors_origins_raw)
 
 # --- Redis client (text mode)
 REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -164,6 +165,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --- API key gate (once)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -270,6 +272,19 @@ if "StockEnv" not in globals():
             done = self.i >= len(self.p) - 1
             return obs.astype(np.float32), reward, done, False, {}
         def close(self): pass
+
+def _parse_cors_list(raw: Optional[str]) -> list[str]:
+    # Accept: None/"" -> ["*"], JSON array string, or comma-separated string
+    if raw is None or raw.strip() == "":
+        return ["*"]
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            arr = json.loads(s)
+            return [str(x).strip() for x in arr]
+        except Exception:
+            pass
+    return [p.strip() for p in s.split(",") if p.strip()]
 
 # If these helpers weren’t defined earlier, provide robust fallbacks now.
 if "_fetch_hist_prices" not in globals():
