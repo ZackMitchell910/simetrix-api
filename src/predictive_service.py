@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from pydantic import Field
 from redis.asyncio import Redis
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, APIKeyQuery
 from fastapi import Depends, HTTPException, BackgroundTasks, WebSocket
