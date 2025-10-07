@@ -1,5 +1,5 @@
 # --- stdlib
-import os, json, asyncio, logging, math
+import os, json, asyncio, logging, math, pickle
 from datetime import datetime, timedelta, date, timezone
 from uuid import uuid4
 from typing import List, Optional, Dict
@@ -17,12 +17,45 @@ from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
+
+# --- optional ML libs (soft deps; guard all usages)
+TF_AVAILABLE = False
+SB3_AVAILABLE = False
+try:
+    from tensorflow.keras.models import load_model as _tf_load_model
+    from tensorflow.keras.models import Sequential as _TF_Sequential
+    from tensorflow.keras.layers import LSTM as _TF_LSTM, GRU as _TF_GRU, Dense as _TF_Dense
+    TF_AVAILABLE = True
+except Exception:
+    def _missing_tf(*_a, **_k):
+        raise ImportError("TensorFlow is not installed on the server.")
+    _tf_load_model = _missing_tf; _TF_Sequential = _missing_tf
+    _TF_LSTM = _missing_tf; _TF_GRU = _missing_tf; _TF_Dense = _missing_tf
+
+# public aliases
+load_model = _tf_load_model
+Sequential = _TF_Sequential
+LSTM = _TF_LSTM
+GRU = _TF_GRU
+Dense = _TF_Dense
+
+try:
+    import gymnasium as gym  # noqa
+except Exception:
+    gym = None
+
+try:
+    from stable_baselines3 import DQN  # noqa
+    SB3_AVAILABLE = True
+except Exception:
+    DQN = None
+    SB3_AVAILABLE = False
 
 # --- local modules (feature store with back-compat)
 from .feature_store import connect as fs_connect
@@ -30,7 +63,6 @@ try:
     from .feature_store import insert_prediction as fs_log_prediction
 except ImportError:
     from .feature_store import log_prediction as fs_log_prediction  # type: ignore
-
 try:
     from .feature_store import compute_and_upsert_metrics_daily as _rollup
 except ImportError:
@@ -42,289 +74,48 @@ try:
 except ImportError:
     from .learners import SGDOnline, ExpWeights as EW  # type: ignore
 
-# DUCK utils — pick the path that exists in your repo:
-from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
-# If your file is actually at src/db/duck.py, change the above to:
-# from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
+# DUCK utils — try db.duck first, fall back to duck
+try:
+    from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
+except Exception:
+    from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome  # type: ignore
 
-# --- logging / app / CORS
+# --- logging / app (single instance)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
-logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="PredictiveTwin API")
-CORS_ORIGINS = os.getenv("PT_CORS_ORIGINS", "").split(",") if os.getenv("PT_CORS_ORIGINS") else ["*"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+app = FastAPI(
+    title="PredictiveTwin API",
+    version="1.2.1",
+    docs_url="/api-docs",
+    redoc_url=None,
+    redirect_slashes=False,
 )
 
-# API-key gate
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query = APIKeyQuery(name="api_key", auto_error=False)
-PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
-
-async def verify_api_key(
-    x_key: Optional[str] = Depends(api_key_header),
-    q_key: Optional[str] = Depends(api_key_query),
-):
-    key = x_key or q_key
-    if PT_API_KEY and key != PT_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return PT_API_KEY
-
-# Optional: Track-record router (guarded so missing file won't crash deploy)
-try:
-    from .track_record import router as track_router  # type: ignore
-    app.include_router(track_router, prefix="/track")
-    logger.info("Track-record routes enabled at /track")
-except Exception as e:
-    logger.warning(f"Track-record routes disabled: {e}")
-
-def _poly_key() -> str:
-    # Prefer real env keys; otherwise fall back to mock/dev key
-    return (
-        (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
-    )
-
-def _server_api_key() -> str:
-    # Only PT_API_KEY is used for app auth (Polygon key is not an API key)
-    return (os.getenv("PT_API_KEY") or "").strip()
-
-# ---------- Model keys ----------
-async def _model_key(symbol: str) -> str:
-    return f"model:{symbol.upper()}"
-
-
-# ---------- Market data helpers ----------
-async def _fetch_realized_price(symbol: str, when: datetime) -> float:
-    """
-    Get the realized *close* at/after 'when'. If 'when' is a weekend/holiday,
-    scan forward a few days until we hit the next bar.
-    """
-    key = _poly_key()
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            # Try up to +5 days forward to handle non-trading days gracefully
-            for d in range(0, 6):
-                d0 = (when + timedelta(days=d)).strftime("%Y-%m-%d")
-                d1 = (when + timedelta(days=d + 1)).strftime("%Y-%m-%d")
-                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{d0}/{d1}"
-                params = {"adjusted": "true", "sort": "asc", "limit": "2", "apiKey": key}
-                r = await client.get(url, params=params)
-                if r.status_code == 429:
-                    # rate-limited → break to fallbacks
-                    break
-                r.raise_for_status()
-                res = (r.json() or {}).get("results", [])
-                if res:
-                    return float(res[-1]["c"])
-    except Exception as e:
-        logging.getLogger(__name__).info(
-            f"Polygon realized fetch failed for {symbol} @ {when.date()}: {e}; falling back."
-        )
-
-    # Fallbacks
-    try:
-        px = await _fetch_hist_prices(symbol, window_days=60)
-        if px:
-            return float(px[-1])
-    except Exception:
-        pass
-
-    # last-resort synthetic
-    import numpy as _np, math
-    return float(_np.random.lognormal(mean=math.log(100), sigma=0.12))
-
-
-async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> List[float]:
-    """
-    Fetch daily closes ending today from Polygon.
-    If window_days is provided, use that; otherwise default to ~18 months (~540 days).
-    Falls back to a synthetic series if the API/key is unavailable.
-    """
-    key = _poly_key()
-    try:
-        from datetime import date, timedelta as _td
-        end = date.today()
-        days = int(window_days) if window_days and int(window_days) > 0 else 540
-        start = end - _td(days=days)
-        s = start.strftime("%Y-%m-%d")
-        e = end.strftime("%Y-%m-%d")
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{s}/{e}"
-            r = await client.get(
-                url,
-                params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": "50000"},
-            )
-            r.raise_for_status()
-            data = (r.json() or {}).get("results", [])
-            px = [float(d["c"]) for d in data if "c" in d]
-            if px:
-                return px
-    except Exception as e:
-        logging.getLogger(__name__).warning(f"_fetch_hist_prices failed ({symbol}): {e}")
-    # fallback synthetic if Polygon missing/down
-    return list(np.random.lognormal(mean=math.log(100.0), sigma=0.15, size=200))
-
-
-async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
-    arr = np.asarray(px, dtype=float)
-    if arr.ndim != 1 or arr.size < 3:
-        return {"mom_20": 0.0, "rvol_20": 0.0, "autocorr_5": 0.0}
-
-    rets = np.diff(np.log(arr))
-    mom_20 = float(np.mean(rets[-20:])) if rets.size >= 20 else float(np.mean(rets))
-    rvol_20 = float(np.std(rets[-20:])) if rets.size >= 20 else float(np.std(rets))
-
-    if rets.size >= 6:
-        try:
-            autocorr_5 = float(np.corrcoef(rets[-6:-1], rets[-5:])[0, 1])
-            if not np.isfinite(autocorr_5):
-                autocorr_5 = 0.0
-        except Exception:
-            autocorr_5 = 0.0
-    else:
-        autocorr_5 = 0.0
-
-    f = {"mom_20": mom_20, "rvol_20": rvol_20, "autocorr_5": autocorr_5}
-
-    # Async enrichments (placeholders)
-    f["sentiment"] = 0.0  # float(await _fetch_sentiment(symbol))
-    f.update({"vix": 20.0, "spx_ret": 0.0})  # await _fetch_macro()
-    # TA features (guard against NaNs)
-    close_series = pd.Series(arr)
-    try:
-        rsi_val = RSIIndicator(close_series, window=14).rsi().iloc[-1]
-        if not np.isfinite(rsi_val):
-            rsi_val = 50.0
-    except Exception:
-        rsi_val = 50.0
-    f["rsi"] = rsi_val
-
-    try:
-        macd_obj = MACD(close_series)
-        macd_line = macd_obj.macd()
-        f["macd"] = macd_line.iloc[-1] if np.isfinite(macd_line.iloc[-1]) else 0.0
-    except Exception:
-        f["macd"] = 0.0
-
-    try:
-        bb_obj = BollingerBands(close_series)
-        bb_upper = bb_obj.bollinger_hband()
-        f["bb_upper"] = bb_upper.iloc[-1] if np.isfinite(bb_upper.iloc[-1]) else float(arr[-1])
-    except Exception:
-        f["bb_upper"] = float(arr[-1])
-
-    f["iv"] = 0.2  # stub; wire to options IV if you have it
-    # Peer corr (placeholder: self-corr = 0)
-    try:
-        peer_px = arr  # TODO: replace with real peer series
-        pc = np.corrcoef(arr[-100:], peer_px[-100:])[0, 1] if arr.size >= 100 else 0.0
-        f["peer_corr"] = float(pc) if np.isfinite(pc) else 0.0
-    except Exception:
-        f["peer_corr"] = 0.0
-
-    return f
-
-
-# ---------- Lightweight ensemble (linear only; non-blocking) ----------
-async def get_ensemble_prob_light(symbol: str, redis: "Redis", horizon_days: int = 1) -> float:
-    """
-    Async-friendly, non-blocking ensemble:
-    - Uses only the linear model stored in Redis (no Keras/ARIMA/RL)
-    - Stable and fast: won't block the event loop
-    """
-    try:
-        raw = await redis.get(await _model_key(symbol + "_linear"))
-        if not raw:
-            return 0.5
-        model_linear = json.loads(raw)
-        feats = model_linear.get("features", [])
-        coef  = model_linear.get("coef", [])
-
-        px = await _fetch_hist_prices(symbol)
-        if not px or len(px) < 10:
-            return 0.5
-        f = await _feat_from_prices(symbol, px)
-
-        X = np.array([f.get(feat, 0.0) for feat in feats], dtype=float)
-        w = np.array(coef, dtype=float)
-        m = int(min(X.shape[0], w.shape[0]))
-        if m == 0:
-            return 0.5
-
-        score = float(np.dot(X[:m], w[:m]))
-        return _sigmoid(score)
-    except Exception as e:
-        logging.getLogger(__name__).info(f"get_ensemble_prob_light fallback (0.5) due to: {e}")
-        return 0.5
-
-
-# ---------- API auth (Polygon key no longer doubles as app auth) ----------
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
-
-async def verify_api_key(
-    api_key_h: Optional[str] = Depends(api_key_header),
-    api_key_q: Optional[str] = Depends(api_key_query),
-):
-    supplied = (api_key_h or api_key_q or "").strip()
-    app_key  = _server_api_key()
-    # If PT_API_KEY is not set, leave endpoints open for local/dev.
-    if not app_key:
-        return supplied
-    if supplied != app_key:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return supplied
-
-
-# ---------- Optional model loaders ----------
-import pickle
-from fastapi import HTTPException as _HTTPException
-
-def load_lstm_model(symbol: str):
-    """Load an LSTM model if TF is available; tries .keras then .h5."""
-    require_tf()
-    for path in (f"models/{symbol}_lstm.keras", f"models/{symbol}_lstm.h5"):
-        try:
-            return load_model(path)
-        except Exception:
-            pass
-    raise _HTTPException(status_code=404, detail="LSTM model not found; train first")
-
-def load_arima_model(symbol: str):
-    try:
-        with open(f"models/{symbol}_arima.pkl", "rb") as file:
-            return pickle.load(file)
-    except Exception:
-        raise _HTTPException(status_code=404, detail="ARIMA model not found; train first")
-
-
-# ---------- Misc helpers ----------
+# ----------------- helpers / config -----------------
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
-    """
-    Read a comma-separated env var into a list, trimming spaces.
-    Example: PT_CORS_ORIGINS=http://localhost:5173, http://localhost:8080
-    """
     s = os.getenv(name, "")
     if not s:
         return default or []
     return [x.strip() for x in s.split(",") if x.strip()]
 
+def _poly_key() -> str:
+    return (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
 
-# ---------- App settings / init ----------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
-logger.info(f"Using learners from: {_learners_mod.__file__}")  # _learners_mod is imported earlier in the file
+def require_tf() -> None:
+    if not TF_AVAILABLE:
+        raise HTTPException(status_code=503, detail="TensorFlow is not installed on the server.")
 
-load_dotenv("backend/.env")
+def _sigmoid(z: float) -> float:
+    z = float(np.clip(z, -60.0, 60.0))
+    return 1.0 / (1.0 + math.exp(-z))
 
+# --- Settings (pydantic-settings v2)
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="PT_", case_sensitive=False)
+
     polygon_key: Optional[str] = Field(default_factory=_poly_key)
-    news_api_key: Optional[str] = Field(default_factory=lambda: os.getenv("PT_NEWS_API_KEY"))
+    news_api_key: Optional[str] = None
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
     cors_origins: List[str] = Field(default_factory=lambda: _env_list("PT_CORS_ORIGINS", ["*"]))
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
@@ -337,27 +128,54 @@ class Settings(BaseSettings):
         "X:BTCUSD": {"horizon_days": 365, "n_paths": 10000, "lookback_preset": "3y"},
         "NVDA": {"horizon_days": 30, "n_paths": 5000, "lookback_preset": "180d"},
     }
-    class Config:
-        env_prefix = "PT_"
-        case_sensitive = False
 
 settings = Settings()
 
-# Redis client (text mode)
+# --- Redis client (text mode)
 REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
 
-# --- RL constants ---
-RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))  # single source of truth
-
-# --- FastAPI App ---
-app = FastAPI(
-    title="PredictiveTwin API",
-    version="1.2.1",
-    docs_url="/api-docs",
-    redoc_url=None,
-    redirect_slashes=False,
+# --- CORS (once)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-app.include_router(track_router)
+
+# --- API key gate (once)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
+PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
+
+async def verify_api_key(
+    api_key_h: Optional[str] = Depends(api_key_header),
+    api_key_q: Optional[str] = Depends(api_key_query),
+):
+    supplied = (api_key_h or api_key_q or "").strip()
+    if PT_API_KEY and supplied != PT_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return supplied
+
+# --- optional track-record router (guarded so missing file won't crash deploy)
+try:
+    from .track_record import router as track_router  # type: ignore
+    app.include_router(track_router, prefix="/track")
+    logger.info("Track-record routes enabled at /track")
+except Exception as e:
+    logger.warning(f"Track-record routes disabled: {e}")
+
+# --- RL constants (single source of truth)
+RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
+
+# --- Redis init + background GC ---
+async def _gc_loop():
+    while True:
+        try:
+            # example: prune expired run keys etc. (no-op placeholder)
+            await asyncio.sleep(60)
+        except Exception:
+            await asyncio.sleep(60)
 
 # --- CORS ---
 app.add_middleware(
