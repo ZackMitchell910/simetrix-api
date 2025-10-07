@@ -110,6 +110,10 @@ def _sigmoid(z: float) -> float:
     z = float(np.clip(z, -60.0, 60.0))
     return 1.0 / (1.0 + math.exp(-z))
 
+# Used by Redis model storage
+async def _model_key(symbol: str) -> str:
+    return f"model:{symbol.upper()}"
+
 # --- Settings (pydantic-settings v2)
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PT_", case_sensitive=False)
@@ -161,6 +165,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- API key gate (once)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
+PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
+
+async def verify_api_key(
+    api_key_h: Optional[str] = Depends(api_key_header),
+    api_key_q: Optional[str] = Depends(api_key_query),
+):
+    supplied = (api_key_h or api_key_q or "").strip()
+    if PT_API_KEY and supplied != PT_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return supplied
+
+# --- optional track-record router (guarded so missing file won't crash deploy)
+try:
+    from .track_record import router as track_router  # type: ignore
+    app.include_router(track_router, prefix="/track")
+    logger.info("Track-record routes enabled at /track")
+except Exception as e:
+    logger.warning(f"Track-record routes disabled: {e}")
+
 # --- RL constants (single source of truth)
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
 
@@ -180,9 +206,8 @@ async def _gc_loop():
 
 @app.on_event("startup")
 async def _on_startup():
-    asyncio.create_task(_gc_loop())
-
     init_schema()
+    # connect Redis
     global REDIS
     try:
         REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
@@ -191,7 +216,7 @@ async def _on_startup():
     except Exception as e:
         logger.error(f"Failed to connect to Redis: {e}")
         REDIS = None
-    # start GC and labeling daemon
+    # start background tasks
     asyncio.create_task(_gc_loop())
     asyncio.create_task(_labeling_daemon())
 
@@ -205,7 +230,142 @@ async def _shutdown():
         logger.error(f"Error closing Redis: {e}")
 
 # --- Heavier ensemble (used by simulator), keeps parity with /predict heads ---
-from .learners import ExpWeights as EW  # already imported above in your file, safe to re-import
+# (safe to re-import; but not required if already imported above)
+try:
+    from .learners import ExpWeights as EW  # type: ignore
+except Exception:  # pragma: no cover
+    class EW:
+        # ultra-lightweight backup so import won't crash
+        def init(self, n: int): self.w = np.ones(n) / max(n, 1)
+        def update(self, losses: np.ndarray): pass
+
+# ---- helpers that this section needs (define only if missing) ----
+if "_today_utc_date" not in globals():
+    def _today_utc_date() -> date:
+        return datetime.now(timezone.utc).date()
+
+if "_safe_sent" not in globals():
+    def _safe_sent(text: str) -> float:
+        t = (text or "").lower()
+        pos = sum(w in t for w in ("good", "great", "beat", "bullish", "surge", "strong", "record"))
+        neg = sum(w in t for w in ("bad", "miss", "bearish", "fall", "weak", "cut", "warn"))
+        denom = max(len(t.split()), 1)
+        return float((pos - neg) / denom)
+
+# Minimal RL env so RL branch won’t NameError if SB3 happens to be present.
+if "StockEnv" not in globals():
+    class StockEnv:
+        def __init__(self, prices: List[float], window_len: int = 100):
+            self.p = np.array(prices, dtype=float)
+            self.w = max(2, int(window_len))
+            self.i = self.w
+        def reset(self, *, seed: int | None = None, options: dict | None = None):
+            self.i = self.w
+            obs = self.p[self.i - self.w:self.i] / (self.p[self.i - 1] + 1e-12)
+            return obs.astype(np.float32), {}
+        def step(self, action):
+            self.i = min(self.i + 1, len(self.p) - 1)
+            obs = self.p[self.i - self.w:self.i] / (self.p[self.i - 1] + 1e-12)
+            reward = float((self.p[self.i] - self.p[self.i - 1]) / (self.p[self.i - 1] + 1e-12))
+            done = self.i >= len(self.p) - 1
+            return obs.astype(np.float32), reward, done, False, {}
+        def close(self): pass
+
+# If these helpers weren’t defined earlier, provide robust fallbacks now.
+if "_fetch_hist_prices" not in globals():
+    async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> List[float]:
+        key = (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
+        try:
+            end = _today_utc_date()
+            days = int(window_days) if (window_days and int(window_days) > 0) else 540
+            start = end - timedelta(days=days)
+            s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{s}/{e}"
+                r = await client.get(url, params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": "50000"})
+                r.raise_for_status()
+                data = (r.json() or {}).get("results", [])
+                px = [float(d["c"]) for d in data if "c" in d]
+                if px: return px
+        except Exception as e:
+            logger.warning(f"_fetch_hist_prices fallback ({symbol}): {e}")
+        # synthetic fallback
+        return list(np.random.lognormal(mean=math.log(100.0), sigma=0.15, size=200))
+
+if "_feat_from_prices" not in globals():
+    async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
+        arr = np.asarray(px, dtype=float)
+        if arr.ndim != 1 or arr.size < 3:
+            return {"mom_20": 0.0, "rvol_20": 0.0, "autocorr_5": 0.0, "rsi": 50.0, "macd": 0.0, "bb_upper": float(arr[-1] if arr.size else 0.0)}
+        rets = np.diff(np.log(arr))
+        mom_20 = float(np.mean(rets[-20:])) if rets.size >= 20 else float(np.mean(rets))
+        rvol_20 = float(np.std(rets[-20:])) if rets.size >= 20 else float(np.std(rets))
+        autocorr_5 = 0.0
+        if rets.size >= 6:
+            try:
+                autocorr_5 = float(np.corrcoef(rets[-6:-1], rets[-5:])[0, 1])
+                if not np.isfinite(autocorr_5): autocorr_5 = 0.0
+            except Exception: pass
+        f = {"mom_20": mom_20, "rvol_20": rvol_20, "autocorr_5": autocorr_5}
+        # TA enrich
+        close_series = pd.Series(arr)
+        try:
+            rsi_val = RSIIndicator(close_series, window=14).rsi().iloc[-1]
+            f["rsi"] = float(rsi_val) if np.isfinite(rsi_val) else 50.0
+        except Exception: f["rsi"] = 50.0
+        try:
+            macd_line = MACD(close_series).macd().iloc[-1]
+            f["macd"] = float(macd_line) if np.isfinite(macd_line) else 0.0
+        except Exception: f["macd"] = 0.0
+        try:
+            bb_upper = BollingerBands(close_series).bollinger_hband().iloc[-1]
+            f["bb_upper"] = float(bb_upper) if np.isfinite(bb_upper) else float(arr[-1])
+        except Exception: f["bb_upper"] = float(arr[-1])
+        # stubs for now
+        f["iv"] = 0.2
+        f["peer_corr"] = 0.0
+        return f
+
+# Optional model loaders (only if missing up top)
+if "load_lstm_model" not in globals():
+    def load_lstm_model(symbol: str):
+        require_tf()
+        for path in (f"models/{symbol}_lstm.keras", f"models/{symbol}_lstm.h5"):
+            try:
+                return load_model(path)
+            except Exception:
+                pass
+        raise HTTPException(status_code=404, detail="LSTM model not found; train first")
+
+if "load_arima_model" not in globals():
+    def load_arima_model(symbol: str):
+        try:
+            with open(f"models/{symbol}_arima.pkl", "rb") as file:
+                return pickle.load(file)
+        except Exception:
+            raise HTTPException(status_code=404, detail="ARIMA model not found; train first")
+
+# Lightweight ensemble (linear only; non-blocking) — define if needed
+if "get_ensemble_prob_light" not in globals():
+    async def get_ensemble_prob_light(symbol: str, redis: "Redis", horizon_days: int = 1) -> float:
+        try:
+            raw = await redis.get(await _model_key(symbol + "_linear"))
+            if not raw: return 0.5
+            model_linear = json.loads(raw)
+            feats = model_linear.get("features", [])
+            coef  = model_linear.get("coef", [])
+            px = await _fetch_hist_prices(symbol)
+            if not px or len(px) < 10: return 0.5
+            f = await _feat_from_prices(symbol, px)
+            X = np.array([f.get(feat, 0.0) for feat in feats], dtype=float)
+            w = np.array(coef, dtype=float)
+            m = int(min(X.shape[0], w.shape[0]))
+            if m == 0: return 0.5
+            score = float(np.dot(X[:m], w[:m]))
+            return _sigmoid(float(np.clip(score, -60.0, 60.0)))
+        except Exception as e:
+            logger.info(f"get_ensemble_prob_light fallback (0.5) due to: {e}")
+            return 0.5
 
 async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) -> float:
     """
@@ -228,7 +388,7 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
         # 3) Input vector
         X = np.array([f.get(feat, 0.0) for feat in feature_list], dtype=float)
 
-        preds = []
+        preds: List[float] = []
 
         # Linear
         if "coef" in model_linear:
@@ -239,7 +399,7 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
             score = float(np.clip(score, -60.0, 60.0))
             preds.append(_sigmoid(score))
 
-        # LSTM
+        # LSTM (optional)
         try:
             model_lstm = load_lstm_model(symbol)
             X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)
@@ -247,7 +407,7 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
         except Exception:
             pass
 
-        # ARIMA
+        # ARIMA (optional)
         try:
             model_arima = load_arima_model(symbol)
             fc = model_arima.forecast(steps=max(1, int(horizon_days)))
@@ -265,7 +425,7 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
             obs, _ = env.reset()
             action, _ = rl_model.predict(obs, deterministic=True)
             a = float(action[0] if hasattr(action, "__len__") else action)
-            rl_adjust = float(np.clip((a - 1) * 0.01, -0.05, 0.05))  # map {0,1,2}→{-1%,0,+1%}
+            rl_adjust = float(np.clip((a - 1) * 0.01, -0.05, 0.05))  # map {0,1,2}->{-1%,0,+1%}
             env.close()
         except Exception as e:
             logger.info(f"RL skipped in ensemble: {e}")
@@ -273,10 +433,9 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
         # Ensemble
         if not preds:
             return 0.5
-        losses = [0.1] * len(preds)
-        ew = EW()
-        ew.init(len(preds))
-        ew.update(np.array(losses, dtype=float))
+        ew = EW(); ew.init(len(preds))
+        # Equal weights via no-op losses; could wire real validation losses here.
+        ew.update(np.array([0.1] * len(preds), dtype=float))
         prob_up = float(np.clip(sum(w * p for w, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
         return prob_up
     except Exception as e:
@@ -285,12 +444,13 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
 
 # --- small utilities used elsewhere in file ---
 async def _list_models() -> List[str]:
+    if not REDIS: return []
     keys = await REDIS.keys("model:*")
     return [k.split(":", 1)[1] for k in keys]
 
 async def _fetch_cached_hist_prices(symbol: str, window_days: int, redis: Redis) -> List[float]:
     """
-    Cache key now reflects *window_days* and today, so we don't serve stale S0.
+    Cache key reflects *window_days* and today, so we don't serve stale S0.
     """
     today_str = _today_utc_date().isoformat()
     cache_key = f"hist_prices:{symbol}:{window_days}:{today_str}"
@@ -305,17 +465,12 @@ async def _fetch_cached_hist_prices(symbol: str, window_days: int, redis: Redis)
 
     px = await _fetch_hist_prices(symbol, window_days)
     if redis:
-        # 30 minutes TTL is plenty; daily bars won’t change intraday
-        await redis.setex(cache_key, 1800, json.dumps(px))
+        await redis.setex(cache_key, 1800, json.dumps(px))  # 30 min
     return px
 
 def _dynamic_window_days(horizon_days: int, timespan: str) -> int:
     """
-    Choose history window length in 'days' units based on the requested timespan.
-    - day:    ~180 days base
-    - hour:   ~180 * 7 (approx. 7 trading hours/day)    -> ~1260
-    - minute: ~180 * (390/252) (trading minutes/day)    -> ~279
-    Then add a small multiple of horizon to keep tails stable.
+    Choose history window length in 'days' based on the requested timespan.
     """
     base_days = 180
     if timespan == "hour":
@@ -324,7 +479,7 @@ def _dynamic_window_days(horizon_days: int, timespan: str) -> int:
         base_days = int(round(180 * (390 / 252)))
     return min(base_days + int(horizon_days) * 2, settings.lookback_days_max)
 
-async def _ensure_run(run_id: str) -> RunState:
+async def _ensure_run(run_id: str) -> "RunState":
     raw = await REDIS.get(f"run:{run_id}")
     if not raw:
         raise HTTPException(404, "Run not found")
@@ -344,17 +499,10 @@ async def _labeling_daemon():
             logger.warning(f"Labeling pass failed: {e}")
         await asyncio.sleep(900)
 
-async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
+async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
     """
-    Builds a Monte Carlo artifact, logs a summary to DuckDB.predictions (pred_id-keyed),
+    Builds a Monte Carlo artifact, logs to DuckDB.predictions (pred_id-keyed),
     and mirrors to the PathPanda Feature Store.
-
-    Updates included:
-      - News/options/futures tweaks applied BEFORE simulation.
-      - Vol-aware drift tilt: mu += k * (2p-1) * sigma_ann
-      - Deterministic seed via (symbol, horizon, model_id, UTC date) with run_id fallback.
-      - np.random.default_rng for better determinism.
-      - p50_line / eod_idx fixes, EOD estimate export.
     """
     logger.info(f"Starting simulation for run_id={run_id}, symbol={req.symbol}")
 
@@ -363,12 +511,11 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         rs = await _ensure_run(run_id)
     except Exception as e:
         logger.error(f"_ensure_run failed at start for {run_id}: {e}")
-        rs = RunState(status="error", progress=0.0, error=str(e))
+        rs = RunState(status="error", progress=0.0, error=str(e))  # type: ignore[name-defined]
         await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
         return
 
-    rs.status = "running"
-    rs.progress = 0
+    rs.status = "running"; rs.progress = 0
     await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
 
     try:
@@ -393,8 +540,6 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         mu_ann    = float(np.clip(mu_ann, -2.0,  2.0))
 
         # ---------- ML adjustment → VOL-AWARE DRIFT TILT ----------
-        # Ensemble probability p in [0,1]; compute signed confidence c = (2p-1) in [-1,1].
-        # Vol-aware tilt: mu += k * c * sigma_ann  (k ~ 0.3 keeps it modest and scale-aware)
         ensemble_prob = 0.5
         try:
             ensemble_prob = await asyncio.wait_for(get_ensemble_prob(req.symbol, redis, req.horizon_days), timeout=1.0)
@@ -404,11 +549,11 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
             except Exception:
                 ensemble_prob = 0.5
         conf = (2.0 * float(ensemble_prob) - 1.0)  # [-1,1]
-        mu_ann = float(mu_ann + (0.30 * conf * sigma_ann))  # <-- vol-aware drift tilt
+        mu_ann = float(mu_ann + (0.30 * conf * sigma_ann))  # vol-aware tilt
 
         # ---------- Optional news/options/futures tweaks (BEFORE sim) ----------
         sentiment = 0.0
-        if req.include_news:
+        if getattr(req, "include_news", False):
             try:
                 poly_ticker = req.symbol.upper().strip()
                 key = _poly_key()
@@ -426,14 +571,12 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
             except Exception as e:
                 logger.info(f"news sentiment failed: {e}")
 
-        if req.include_options:
-            # Placeholder widening until we wire the surface properly
+        if getattr(req, "include_options", False):
             sigma_ann = float(np.clip(sigma_ann * 1.05, 1e-4, 1.5))
-        if req.include_futures:
-            # Tiny carry/basis nudge
+        if getattr(req, "include_futures", False):
             mu_ann += 0.001
 
-        # fold sentiment as an additive drift tweak (after vol-aware tilt)
+        # fold sentiment after tilt
         mu_ann = float(np.clip(mu_ann + sentiment, -3.0, 3.0))
 
         # ---------- Monte Carlo (GBM) ----------
@@ -470,11 +613,9 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
 
         def _ffill_nonfinite(arr: np.ndarray, fallback: float) -> np.ndarray:
             out = np.array(arr, dtype=float)
-            if not np.isfinite(out[0]):
-                out[0] = float(fallback)
+            if not np.isfinite(out[0]): out[0] = float(fallback)
             for i in range(1, len(out)):
-                if not np.isfinite(out[i]):
-                    out[i] = out[i - 1]
+                if not np.isfinite(out[i]): out[i] = out[i - 1]
             return out
 
         fallback = S0
@@ -484,14 +625,14 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
 
         # ---------- Terminal distribution metrics ----------
         T = paths.shape[1]                # n_days + 1
-        eod_idx = min(1, T - 1)           # 0=now, 1=end-of-day (first step), capped
+        eod_idx = min(1, T - 1)           # 0=now, 1=end-of-day
         eod_mean = float(paths[:, eod_idx].mean())
         eod_med  = float(p50_line[eod_idx])
         eod_p05  = float(p95_low[eod_idx])
         eod_p95  = float(p95_high[eod_idx])
 
         terminal = paths[:, -1]
-        prob_up  = float(np.mean(terminal > S0))  # drift already contains sentiment
+        prob_up  = float(np.mean(terminal > S0))
 
         ret_terminal = (terminal - S0) / S0
         var95 = float(np.percentile(ret_terminal, 5))
@@ -562,13 +703,50 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
                 "horizon_d": int(req.horizon_days),
                 "model_id": "mc_v1",
                 "prob_up_next": float(prob_up),
-                "p05": term_q05, "p50": term_q50, "p95": term_q95,  # terminal PRICE quantiles
+                "p05": term_q05, "p50": term_q50, "p95": term_q95,
                 "spot0": float(S0),
                 "user_ctx": {"ui": "pathpanda", "run_id": run_id, "n_paths": int(req.n_paths)},
                 "run_id": run_id,
             })
         except Exception as e:
             logger.warning(f"DuckDB insert_prediction (simulate) failed: {e}")
+
+        # ---------- Mirror: PathPanda Feature Store ----------
+        try:
+            con = fs_connect()
+            fs_log_prediction(con, {
+                "run_id":       run_id,
+                "model_id":     "mc_v1",
+                "symbol":       req.symbol.upper(),
+                "issued_at":    datetime.now(timezone.utc).isoformat(),
+                "horizon_days": int(req.horizon_days),
+                "yhat_mean":    term_q50,
+                "prob_up":      float(prob_up),
+                "q05":          term_q05, "q50": term_q50, "q95": term_q95,
+                "uncertainty":  float(np.std(terminal)),
+                "features_ref": {
+                    "window_days":  int(window_days),
+                    "paths":        int(req.n_paths),
+                    "S0":           float(S0),
+                    "mu_ann":       float(mu_ann),
+                    "sigma_ann":    float(sigma_ann),
+                    "timespan":     req.timespan,
+                    "seed_hint":    int(seed),
+                },
+            })
+            con.close()
+        except Exception as e:
+            logger.warning(f"Feature Store mirror failed: {e}")
+
+        # ---------- Finish ----------
+        rs.status = "done"; rs.progress = 100
+        await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
+        logger.info(f"Completed simulation for run_id={run_id}")
+
+    except Exception as e:
+        rs.status = "error"; rs.error = str(e)  # type: ignore[attr-defined]
+        await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
+        logger.exception(f"Simulation failed for run_id={run_id}: {e}")
 
         # ---------- Mirror: PathPanda Feature Store ----------
         try:
