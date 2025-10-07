@@ -4,6 +4,8 @@
 TF_AVAILABLE = False
 SB3_AVAILABLE = False
 import os
+from .track_record import router as track_router
+
 
 # TensorFlow / Keras (optional)
 try:
@@ -326,6 +328,7 @@ app = FastAPI(
     redoc_url=None,
     redirect_slashes=False,
 )
+app.include_router(track_router)
 
 # --- CORS ---
 app.add_middleware(
