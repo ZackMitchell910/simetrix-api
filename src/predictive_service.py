@@ -16,7 +16,7 @@ from fastapi.security import APIKeyHeader, APIKeyQuery
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 
@@ -129,6 +129,24 @@ class Settings(BaseSettings):
         "NVDA": {"horizon_days": 30, "n_paths": 5000, "lookback_preset": "180d"},
     }
 
+    # Accept JSON list (["https://a","http://b"]) OR "https://a,http://b"
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def _parse_cors_origins(cls, v):
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            return ["*"]
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                import json as _json
+                try:
+                    arr = _json.loads(s)
+                    return [str(x).strip() for x in arr]
+                except Exception:
+                    pass
+            return [p.strip() for p in s.split(",") if p.strip()]
+        return v
+
 settings = Settings()
 
 # --- Redis client (text mode)
@@ -143,50 +161,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- API key gate (once)
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
-PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
-
-async def verify_api_key(
-    api_key_h: Optional[str] = Depends(api_key_header),
-    api_key_q: Optional[str] = Depends(api_key_query),
-):
-    supplied = (api_key_h or api_key_q or "").strip()
-    if PT_API_KEY and supplied != PT_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return supplied
-
-# --- optional track-record router (guarded so missing file won't crash deploy)
-try:
-    from .track_record import router as track_router  # type: ignore
-    app.include_router(track_router, prefix="/track")
-    logger.info("Track-record routes enabled at /track")
-except Exception as e:
-    logger.warning(f"Track-record routes disabled: {e}")
-
 # --- RL constants (single source of truth)
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
 
-# --- Redis init + background GC ---
-async def _gc_loop():
-    while True:
-        try:
-            # example: prune expired run keys etc. (no-op placeholder)
-            await asyncio.sleep(60)
-        except Exception:
-            await asyncio.sleep(60)
-
-# --- CORS ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- Redis init + background GC ---
+# --- Background GC (define once and schedule on startup)
 async def _gc_loop():
     while True:
         try:
@@ -194,7 +172,6 @@ async def _gc_loop():
                 keys = await REDIS.keys("run:*")
                 for key in keys:
                     ttl = await REDIS.ttl(key)
-                    # If key has no TTL (ttl < 0), clean it up to avoid leaks
                     if ttl is not None and ttl < 0:
                         await REDIS.delete(key)
         except Exception as e:
@@ -202,7 +179,9 @@ async def _gc_loop():
         await asyncio.sleep(60)
 
 @app.on_event("startup")
-async def _startup():
+async def _on_startup():
+    asyncio.create_task(_gc_loop())
+
     init_schema()
     global REDIS
     try:
