@@ -34,7 +34,11 @@ try:
 except ImportError:
     # Back-compat
     from .feature_store import rollup as _rollup  # type: ignore
-from .learners import SGDOnline, ExpWeights as EW
+# Prefer the current names; fall back if an older branch still uses SGDOnline
+try:
+    from .learners import OnlineLinear as SGDOnline, ExpWeights as EW
+except ImportError:
+    from .learners import SGDOnline, ExpWeights as EW  # back-compat
 from .models import RunState, SimRequest, PredictRequest, TrainRequest
 # ----------------------------
 # Optional ML libs (soft deps)
