@@ -18,7 +18,22 @@ from ta.trend import MACD
 from ta.volatility import BollingerBands
 # Assuming external modules; adjust if needed
 from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
-from .feature_store import connect as fs_connect, log_prediction as fs_log_prediction, rollup as _rollup
+# Feature store imports (support both new & old names)
+from .feature_store import connect as fs_connect
+
+try:
+    # Newer names
+    from .feature_store import insert_prediction as fs_log_prediction
+except ImportError:
+    # Back-compat
+    from .feature_store import log_prediction as fs_log_prediction  # type: ignore
+
+try:
+    # Newer name
+    from .feature_store import compute_and_upsert_metrics_daily as _rollup
+except ImportError:
+    # Back-compat
+    from .feature_store import rollup as _rollup  # type: ignore
 from .learners import SGDOnline, ExpWeights as EW
 from .models import RunState, SimRequest, PredictRequest, TrainRequest
 # ----------------------------
