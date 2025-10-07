@@ -39,7 +39,6 @@ try:
     from .learners import OnlineLinear as SGDOnline, ExpWeights as EW
 except ImportError:
     from .learners import SGDOnline, ExpWeights as EW  # back-compat
-from .models import RunState, SimRequest, PredictRequest, TrainRequest
 # ----------------------------
 # Optional ML libs (soft deps)
 # ----------------------------
@@ -91,6 +90,29 @@ try:
 except Exception:
     DQN = None
     SB3_AVAILABLE = False
+from pydantic import BaseModel, Field
+from typing import Optional
+
+class SimRequest(BaseModel):
+    symbol: str
+    horizon_days: int = Field(ge=1, le=365*2)
+    n_paths: int = Field(default=500, ge=50, le=20000)
+    seed: Optional[int] = None
+
+class TrainRequest(BaseModel):
+    symbol: str
+    lookback_days: int = Field(default=365, ge=30, le=3650)
+
+class PredictRequest(BaseModel):
+    symbol: str
+    horizon_days: int = Field(default=30, ge=1, le=365)
+    use_online: bool = True
+
+class RunState(BaseModel):
+    run_id: str
+    status: str
+    started_at: float
+    progress: float = 0.0
 
 
 def require_tf() -> None:
