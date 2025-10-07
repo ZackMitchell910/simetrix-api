@@ -16,7 +16,7 @@ from fastapi.security import APIKeyHeader, APIKeyQuery
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 
@@ -110,9 +110,25 @@ def _sigmoid(z: float) -> float:
     z = float(np.clip(z, -60.0, 60.0))
     return 1.0 / (1.0 + math.exp(-z))
 
+def _today_utc_date() -> date:
+    return datetime.now(timezone.utc).date()
+
 # Used by Redis model storage
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
+
+def _parse_cors_list(raw: Optional[str]) -> list[str]:
+    # Accept: None/"" -> ["*"], JSON array string, or comma-separated string
+    if raw is None or raw.strip() == "":
+        return ["*"]
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            arr = json.loads(s)
+            return [str(x).strip() for x in arr]
+        except Exception:
+            pass
+    return [p.strip() for p in s.split(",") if p.strip()]
 
 # --- Settings (pydantic-settings v2)
 class Settings(BaseSettings):
@@ -121,6 +137,7 @@ class Settings(BaseSettings):
     polygon_key: Optional[str] = Field(default_factory=_poly_key)
     news_api_key: Optional[str] = None
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
+    # note: take raw string and parse ourselves to avoid pydantic JSON decode surprises
     cors_origins_raw: Optional[str] = None
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
     horizon_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_HORIZON_DAYS_MAX", "365")))
@@ -133,24 +150,6 @@ class Settings(BaseSettings):
         "NVDA": {"horizon_days": 30, "n_paths": 5000, "lookback_preset": "180d"},
     }
 
-    # Accept JSON list (["https://a","http://b"]) OR "https://a,http://b"
-    @field_validator("cors_origins", mode="before")
-    @classmethod
-    def _parse_cors_origins(cls, v):
-        if v is None or (isinstance(v, str) and v.strip() == ""):
-            return ["*"]
-        if isinstance(v, str):
-            s = v.strip()
-            if s.startswith("["):
-                import json as _json
-                try:
-                    arr = _json.loads(s)
-                    return [str(x).strip() for x in arr]
-                except Exception:
-                    pass
-            return [p.strip() for p in s.split(",") if p.strip()]
-        return v
-
 settings = Settings()
 CORS_ORIGINS = _parse_cors_list(settings.cors_origins_raw)
 
@@ -160,12 +159,19 @@ REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
 # --- CORS (once)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Optional static frontend (cross-platform; avoids Windows path)
+# Set PT_STATIC_DIR in Render if you want to serve your built frontend.
+STATIC_DIR = os.getenv("PT_STATIC_DIR", "frontend/dist")
+if os.path.isdir(STATIC_DIR):
+    # Mount at /app so it won't swallow API routes
+    app.mount("/app", StaticFiles(directory=STATIC_DIR, html=True), name="app")
+    logger.info(f"Mounted static frontend from {STATIC_DIR} at /app")
 
 # --- API key gate (once)
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -230,116 +236,6 @@ async def _shutdown():
             logger.info("Redis closed")
     except Exception as e:
         logger.error(f"Error closing Redis: {e}")
-
-# --- Heavier ensemble (used by simulator), keeps parity with /predict heads ---
-# (safe to re-import; but not required if already imported above)
-try:
-    from .learners import ExpWeights as EW  # type: ignore
-except Exception:  # pragma: no cover
-    class EW:
-        # ultra-lightweight backup so import won't crash
-        def init(self, n: int): self.w = np.ones(n) / max(n, 1)
-        def update(self, losses: np.ndarray): pass
-
-# ---- helpers that this section needs (define only if missing) ----
-if "_today_utc_date" not in globals():
-    def _today_utc_date() -> date:
-        return datetime.now(timezone.utc).date()
-
-if "_safe_sent" not in globals():
-    def _safe_sent(text: str) -> float:
-        t = (text or "").lower()
-        pos = sum(w in t for w in ("good", "great", "beat", "bullish", "surge", "strong", "record"))
-        neg = sum(w in t for w in ("bad", "miss", "bearish", "fall", "weak", "cut", "warn"))
-        denom = max(len(t.split()), 1)
-        return float((pos - neg) / denom)
-
-# Minimal RL env so RL branch won’t NameError if SB3 happens to be present.
-if "StockEnv" not in globals():
-    class StockEnv:
-        def __init__(self, prices: List[float], window_len: int = 100):
-            self.p = np.array(prices, dtype=float)
-            self.w = max(2, int(window_len))
-            self.i = self.w
-        def reset(self, *, seed: int | None = None, options: dict | None = None):
-            self.i = self.w
-            obs = self.p[self.i - self.w:self.i] / (self.p[self.i - 1] + 1e-12)
-            return obs.astype(np.float32), {}
-        def step(self, action):
-            self.i = min(self.i + 1, len(self.p) - 1)
-            obs = self.p[self.i - self.w:self.i] / (self.p[self.i - 1] + 1e-12)
-            reward = float((self.p[self.i] - self.p[self.i - 1]) / (self.p[self.i - 1] + 1e-12))
-            done = self.i >= len(self.p) - 1
-            return obs.astype(np.float32), reward, done, False, {}
-        def close(self): pass
-
-def _parse_cors_list(raw: Optional[str]) -> list[str]:
-    # Accept: None/"" -> ["*"], JSON array string, or comma-separated string
-    if raw is None or raw.strip() == "":
-        return ["*"]
-    s = raw.strip()
-    if s.startswith("["):
-        try:
-            arr = json.loads(s)
-            return [str(x).strip() for x in arr]
-        except Exception:
-            pass
-    return [p.strip() for p in s.split(",") if p.strip()]
-
-# If these helpers weren’t defined earlier, provide robust fallbacks now.
-if "_fetch_hist_prices" not in globals():
-    async def _fetch_hist_prices(symbol: str, window_days: Optional[int] = None) -> List[float]:
-        key = (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
-        try:
-            end = _today_utc_date()
-            days = int(window_days) if (window_days and int(window_days) > 0) else 540
-            start = end - timedelta(days=days)
-            s, e = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{s}/{e}"
-                r = await client.get(url, params={"apiKey": key, "adjusted": "true", "sort": "asc", "limit": "50000"})
-                r.raise_for_status()
-                data = (r.json() or {}).get("results", [])
-                px = [float(d["c"]) for d in data if "c" in d]
-                if px: return px
-        except Exception as e:
-            logger.warning(f"_fetch_hist_prices fallback ({symbol}): {e}")
-        # synthetic fallback
-        return list(np.random.lognormal(mean=math.log(100.0), sigma=0.15, size=200))
-
-if "_feat_from_prices" not in globals():
-    async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
-        arr = np.asarray(px, dtype=float)
-        if arr.ndim != 1 or arr.size < 3:
-            return {"mom_20": 0.0, "rvol_20": 0.0, "autocorr_5": 0.0, "rsi": 50.0, "macd": 0.0, "bb_upper": float(arr[-1] if arr.size else 0.0)}
-        rets = np.diff(np.log(arr))
-        mom_20 = float(np.mean(rets[-20:])) if rets.size >= 20 else float(np.mean(rets))
-        rvol_20 = float(np.std(rets[-20:])) if rets.size >= 20 else float(np.std(rets))
-        autocorr_5 = 0.0
-        if rets.size >= 6:
-            try:
-                autocorr_5 = float(np.corrcoef(rets[-6:-1], rets[-5:])[0, 1])
-                if not np.isfinite(autocorr_5): autocorr_5 = 0.0
-            except Exception: pass
-        f = {"mom_20": mom_20, "rvol_20": rvol_20, "autocorr_5": autocorr_5}
-        # TA enrich
-        close_series = pd.Series(arr)
-        try:
-            rsi_val = RSIIndicator(close_series, window=14).rsi().iloc[-1]
-            f["rsi"] = float(rsi_val) if np.isfinite(rsi_val) else 50.0
-        except Exception: f["rsi"] = 50.0
-        try:
-            macd_line = MACD(close_series).macd().iloc[-1]
-            f["macd"] = float(macd_line) if np.isfinite(macd_line) else 0.0
-        except Exception: f["macd"] = 0.0
-        try:
-            bb_upper = BollingerBands(close_series).bollinger_hband().iloc[-1]
-            f["bb_upper"] = float(bb_upper) if np.isfinite(bb_upper) else float(arr[-1])
-        except Exception: f["bb_upper"] = float(arr[-1])
-        # stubs for now
-        f["iv"] = 0.2
-        f["peer_corr"] = 0.0
-        return f
 
 # Optional model loaders (only if missing up top)
 if "load_lstm_model" not in globals():
