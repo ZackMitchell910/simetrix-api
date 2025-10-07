@@ -1,10 +1,38 @@
+import json
+import asyncio
+import uuid
+from dotenv import load_dotenv
+from pydantic_settings import BaseSettings
+from pydantic import Field
+from redis.asyncio import Redis
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import APIKeyHeader, APIKeyQuery
+from fastapi import Depends, HTTPException, BackgroundTasks, WebSocket, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import pandas as pd
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
+from ta.volatility import BollingerBands
+# Assuming external modules; adjust if needed
+from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
+from .feature_store import connect as fs_connect, log_prediction as fs_log_prediction, rollup as _rollup
+from .learners import SGDOnline, ExpWeights as EW
+from .models import RunState, SimRequest, PredictRequest, TrainRequest
 # ----------------------------
 # Optional ML libs (soft deps)
 # ----------------------------
+
 TF_AVAILABLE = False
 SB3_AVAILABLE = False
 import os
 from .track_record import router as track_router
+from datetime import datetime, timedelta, date, timezone
+import httpx
+import logging
+import math
+import numpy as np
+from typing import List, Optional, Dict
 
 
 # TensorFlow / Keras (optional)
@@ -54,6 +82,20 @@ def require_tf() -> None:
         except Exception:
             raise RuntimeError("TensorFlow is not installed on the server.")
 
+def _sigmoid(z: float) -> float:
+    z = np.clip(z, -60.0, 60.0)
+    return 1.0 / (1.0 + np.exp(-z))
+
+def _today_utc_date() -> date:
+    return datetime.now(timezone.utc).date()
+
+def _simple_sentiment(text: str) -> float:
+    # Placeholder stub; replace with actual logic if available (e.g., using NLTK or custom scoring)
+    lower_text = text.lower()
+    positive_words = ["good", "great", "excellent", "bullish"]
+    negative_words = ["bad", "poor", "bearish"]
+    score = sum(1 for word in positive_words if word in lower_text) - sum(1 for word in negative_words if word in lower_text)
+    return score / max(len(text.split()), 1)  # Normalized simple score
 
 # ---------- Keys / config helpers ----------
 def _poly_key() -> str:
@@ -167,25 +209,27 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict:
     # Async enrichments (placeholders)
     f["sentiment"] = 0.0  # float(await _fetch_sentiment(symbol))
     f.update({"vix": 20.0, "spx_ret": 0.0})  # await _fetch_macro()
-
     # TA features (guard against NaNs)
+    close_series = pd.Series(arr)
     try:
-        rsi_val = float(ta_rsi(arr, 14))
+        rsi_val = RSIIndicator(close_series, window=14).rsi().iloc[-1]
+        if not np.isfinite(rsi_val):
+            rsi_val = 50.0
     except Exception:
         rsi_val = 50.0
     f["rsi"] = rsi_val
 
     try:
-        macd, macd_sig, macd_hist = ta_macd(arr)
-        _v = ~np.isnan(macd)
-        f["macd"] = float(macd[_v][-1]) if np.any(_v) else 0.0
+        macd_obj = MACD(close_series)
+        macd_line = macd_obj.macd()
+        f["macd"] = macd_line.iloc[-1] if np.isfinite(macd_line.iloc[-1]) else 0.0
     except Exception:
         f["macd"] = 0.0
 
     try:
-        bb_up, bb_mid, bb_low = ta_bbands(arr)
-        _v = ~np.isnan(bb_up)
-        f["bb_upper"] = float(bb_up[_v][-1]) if np.any(_v) else float(arr[-1])
+        bb_obj = BollingerBands(close_series)
+        bb_upper = bb_obj.bollinger_hband()
+        f["bb_upper"] = bb_upper.iloc[-1] if np.isfinite(bb_upper.iloc[-1]) else float(arr[-1])
     except Exception:
         f["bb_upper"] = float(arr[-1])
 
