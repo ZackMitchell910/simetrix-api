@@ -3,6 +3,7 @@
 # ----------------------------
 TF_AVAILABLE = False
 SB3_AVAILABLE = False
+import os
 
 # TensorFlow / Keras (optional)
 try:
@@ -53,13 +54,10 @@ def require_tf() -> None:
 
 
 # ---------- Keys / config helpers ----------
-MOCK_POLYGON_KEY = os.getenv("PT_POLYGON_KEY_MOCK", "c6e0a5afd54d4b36b1f67d8c927b1983").strip()
-
 def _poly_key() -> str:
     # Prefer real env keys; otherwise fall back to mock/dev key
     return (
         (os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY") or "").strip()
-        or MOCK_POLYGON_KEY
     )
 
 def _server_api_key() -> str:
@@ -320,10 +318,6 @@ REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
 # --- RL constants ---
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))  # single source of truth
 
-# Warn only if we’re using the mock key (so you know you’re on dev data)
-if settings.polygon_key and settings.polygon_key.strip() == MOCK_POLYGON_KEY:
-    logger.warning("Using MOCK Polygon key (dev). Set PT_POLYGON_KEY for real data.")
-
 # --- FastAPI App ---
 app = FastAPI(
     title="PredictiveTwin API",
@@ -523,10 +517,18 @@ async def _labeling_daemon():
 
 async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
     """
-    Background task: builds a Monte Carlo artifact, logs a summary
-    to DuckDB.predictions (pred_id-keyed) and mirrors to the PathPanda Feature Store.
+    Builds a Monte Carlo artifact, logs a summary to DuckDB.predictions (pred_id-keyed),
+    and mirrors to the PathPanda Feature Store.
+
+    Updates included:
+      - News/options/futures tweaks applied BEFORE simulation.
+      - Vol-aware drift tilt: mu += k * (2p-1) * sigma_ann
+      - Deterministic seed via (symbol, horizon, model_id, UTC date) with run_id fallback.
+      - np.random.default_rng for better determinism.
+      - p50_line / eod_idx fixes, EOD estimate export.
     """
     logger.info(f"Starting simulation for run_id={run_id}, symbol={req.symbol}")
+
     # -------- ensure run exists --------
     try:
         rs = await _ensure_run(run_id)
@@ -547,7 +549,7 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         if req.horizon_days > settings.horizon_days_max or req.n_paths > settings.n_paths_max:
             raise ValueError("input limits exceeded")
 
-        # ---------- History / params ----------
+        # ---------- History / base params ----------
         window_days = _dynamic_window_days(req.horizon_days, req.timespan)
         historical_prices = await _fetch_cached_hist_prices(req.symbol, window_days, redis)
         if not historical_prices or len(historical_prices) < 30:
@@ -555,42 +557,78 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
 
         px_arr = np.array(historical_prices, dtype=float)
         rets = np.diff(np.log(px_arr))
-        # daily scale by default; coarse hourly if requested
-        scale = 252 if req.timespan == "day" else 252 * 24
-        mu_ann = float(np.mean(rets) * scale) if rets.size else 0.0
+        scale = 252 if req.timespan == "day" else 252 * 24  # simple hourly alt
+        mu_ann    = float(np.mean(rets) * scale) if rets.size else 0.0
         sigma_ann = float(np.std(rets) * math.sqrt(scale)) if rets.size else 0.2
         sigma_ann = float(np.clip(sigma_ann, 1e-4, 1.5))
-        mu_ann = float(np.clip(mu_ann, -2.0, 2.0))
+        mu_ann    = float(np.clip(mu_ann, -2.0,  2.0))
 
-        # ---------- ML adjustment (bounded drift tilt) ----------
+        # ---------- ML adjustment → VOL-AWARE DRIFT TILT ----------
+        # Ensemble probability p in [0,1]; compute signed confidence c = (2p-1) in [-1,1].
+        # Vol-aware tilt: mu += k * c * sigma_ann  (k ~ 0.3 keeps it modest and scale-aware)
         ensemble_prob = 0.5
         try:
-            # Try the heavier ensemble briefly, then fall back to the light, then 0.5
-            ensemble_prob = await asyncio.wait_for(
-                get_ensemble_prob(req.symbol, redis, req.horizon_days), timeout=1.0
-            )
+            ensemble_prob = await asyncio.wait_for(get_ensemble_prob(req.symbol, redis, req.horizon_days), timeout=1.0)
         except Exception:
             try:
-                ensemble_prob = await asyncio.wait_for(
-                    get_ensemble_prob_light(req.symbol, redis, req.horizon_days), timeout=0.5
-                )
+                ensemble_prob = await asyncio.wait_for(get_ensemble_prob_light(req.symbol, redis, req.horizon_days), timeout=0.5)
             except Exception:
                 ensemble_prob = 0.5
+        conf = (2.0 * float(ensemble_prob) - 1.0)  # [-1,1]
+        mu_ann = float(mu_ann + (0.30 * conf * sigma_ann))  # <-- vol-aware drift tilt
 
-        mu_ann *= (2 * float(ensemble_prob) - 1.0) * 0.5  # cap the tilt
+        # ---------- Optional news/options/futures tweaks (BEFORE sim) ----------
+        sentiment = 0.0
+        if req.include_news:
+            try:
+                poly_ticker = req.symbol.upper().strip()
+                key = _poly_key()
+                since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+                url = "https://api.polygon.io/v2/reference/news"
+                params = {"ticker": poly_ticker, "published_utc.gte": since, "limit": "20", "apiKey": key}
+                async with httpx.AsyncClient(timeout=8.0) as client:
+                    r = await client.get(url, params=params)
+                    if r.status_code == 200:
+                        items = (r.json() or {}).get("results", []) or []
+                        if items:
+                            ss = [_safe_sent((it.get("title") or "")) for it in items]
+                            if ss:
+                                sentiment = float(np.clip(np.mean(ss) * 0.2, -0.05, 0.05))
+            except Exception as e:
+                logger.info(f"news sentiment failed: {e}")
+
+        if req.include_options:
+            # Placeholder widening until we wire the surface properly
+            sigma_ann = float(np.clip(sigma_ann * 1.05, 1e-4, 1.5))
+        if req.include_futures:
+            # Tiny carry/basis nudge
+            mu_ann += 0.001
+
+        # fold sentiment as an additive drift tweak (after vol-aware tilt)
+        mu_ann = float(np.clip(mu_ann + sentiment, -3.0, 3.0))
 
         # ---------- Monte Carlo (GBM) ----------
-        np.random.seed(abs(hash(run_id)) % (2**32 - 1))
         S0 = float(px_arr[-1])
         dt = 1.0 / float(scale)
         n_days = max(1, int(req.horizon_days))
 
-        Z = np.random.normal(size=(req.n_paths, n_days))
+        # Deterministic seed: (symbol, horizon, model_id, UTC date) with run_id fallback
+        model_id = "mc_v1"
+        utc_day = datetime.utcnow().strftime("%Y-%m-%d")
+        try:
+            seed_key = f"{req.symbol.upper()}|{n_days}|{model_id}|{utc_day}"
+            seed = abs(hash(seed_key)) % (2**32 - 1)
+        except Exception:
+            seed = abs(hash(run_id)) % (2**32 - 1)
+
+        rng = np.random.default_rng(seed)
+        Z = rng.normal(size=(req.n_paths, n_days))
+
         drift = (mu_ann - 0.5 * sigma_ann**2) * dt
         diffusion = sigma_ann * math.sqrt(dt)
         log_returns = drift + diffusion * Z
-        log_paths = np.cumsum(log_returns, axis=1)
-        paths = S0 * np.exp(np.concatenate([np.zeros((req.n_paths, 1)), log_paths], axis=1))
+        log_paths  = np.cumsum(log_returns, axis=1)  # (paths, days)
+        paths = S0 * np.exp(np.concatenate([np.zeros((req.n_paths, 1)), log_paths], axis=1))  # (paths, days+1)
 
         # Progress tick (post-paths)
         rs.progress = 40
@@ -615,49 +653,26 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
             np.nan_to_num(arr, copy=False, nan=fallback, posinf=fallback, neginf=fallback)
             arr[:] = _ffill_nonfinite(arr, fallback)
 
-        # ---------- Optional news/options/futures tweaks ----------
-        sentiment = 0.0
-        if req.include_news:
-            try:
-                # light, local sentiment: fetch recent Polygon news titles and average _safe_sent
-                poly_ticker = req.symbol.upper().strip()
-                key = _poly_key()
-                since = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
-                url = "https://api.polygon.io/v2/reference/news"
-                params = {"ticker": poly_ticker, "published_utc.gte": since, "limit": "20", "apiKey": key}
-                async with httpx.AsyncClient(timeout=8.0) as client:
-                    r = await client.get(url, params=params)
-                    if r.status_code == 200:
-                        items = (r.json() or {}).get("results", []) or []
-                        if items:
-                            ss = [_safe_sent((it.get("title") or "")) for it in items]
-                            if ss:
-                                # small nudge; clip to avoid overpowering MC
-                                sentiment = float(np.clip(np.mean(ss) * 0.2, -0.05, 0.05))
-            except Exception as e:
-                logger.info(f"news sentiment failed: {e}")
-
-        if req.include_options:
-            sigma_ann *= 1.05  # placeholder tweak
-        if req.include_futures:
-            mu_ann += 0.001   # placeholder tweak
-
         # ---------- Terminal distribution metrics ----------
-        terminal = paths[:, -1]
-        prob_up = float(np.clip(np.mean(terminal > S0) + sentiment, 0.0, 1.0))
+        T = paths.shape[1]                # n_days + 1
+        eod_idx = min(1, T - 1)           # 0=now, 1=end-of-day (first step), capped
+        eod_mean = float(paths[:, eod_idx].mean())
+        eod_med  = float(p50_line[eod_idx])
+        eod_p05  = float(p95_low[eod_idx])
+        eod_p95  = float(p95_high[eod_idx])
 
-        # VaR/ES as returns
+        terminal = paths[:, -1]
+        prob_up  = float(np.mean(terminal > S0))  # drift already contains sentiment
+
         ret_terminal = (terminal - S0) / S0
         var95 = float(np.percentile(ret_terminal, 5))
         es_mask = ret_terminal <= var95
         es95 = float(ret_terminal[es_mask].mean()) if es_mask.any() else float(var95)
 
-        # Terminal price quantiles for logging into pred store
         term_q05 = float(np.percentile(terminal, 5))
         term_q50 = float(np.percentile(terminal, 50))
         term_q95 = float(np.percentile(terminal, 95))
 
-        # Hit-prob ribbons for a few abs thresholds
         thresholds_pct = np.array([-0.05, 0.00, 0.05, 0.10], dtype=float)
         thresholds_abs = (1.0 + thresholds_pct) * float(S0)  # (K,)
         probs_by_day = ((paths[:, :, None] >= thresholds_abs[None, None, :]).mean(axis=0).T).tolist()  # (K,T)
@@ -685,17 +700,30 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
                 {"feature": "mom_20",        "weight": 0.14},
                 {"feature": "ensemble_prob", "weight": float(ensemble_prob)},
             ],
-            "model_info": {"direction": "MonteCarlo", "regime": "lognormal"},
-            "calibration": {"window": window_days, "p80_empirical": 0.8},
+            "model_info": {
+                "direction": "MonteCarlo",
+                "regime": "lognormal",
+                "model_id": "mc_v1",
+                "seed_hint": int(seed),
+                "timescale": req.timespan,
+            },
+            "calibration": {"window": int(window_days), "p80_empirical": 0.8},
             "terminal_prices": [float(x) for x in terminal.tolist()],
             "var_es": {"var95": var95, "es95": es95},  # returns
             "hit_probs": {
                 "thresholds_abs": [float(x) for x in thresholds_abs.tolist()],
                 "probs_by_day": probs_by_day,
             },
+            "eod_estimate": {
+                "day_index": int(eod_idx),
+                "median": eod_med,
+                "mean": eod_mean,
+                "p05": eod_p05,
+                "p95": eod_p95
+            },
         }
 
-        # ---------- Persist: DuckDB.predictions (pred_id-keyed) ----------
+        # ---------- Persist: DuckDB.predictions ----------
         try:
             pred_id = str(uuid4())
             insert_prediction({
@@ -705,9 +733,7 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
                 "horizon_d": int(req.horizon_days),
                 "model_id": "mc_v1",
                 "prob_up_next": float(prob_up),
-                "p05": term_q05,             # terminal PRICE q05
-                "p50": term_q50,             # terminal PRICE q50
-                "p95": term_q95,             # terminal PRICE q95
+                "p05": term_q05, "p50": term_q50, "p95": term_q95,  # terminal PRICE quantiles
                 "spot0": float(S0),
                 "user_ctx": {"ui": "pathpanda", "run_id": run_id, "n_paths": int(req.n_paths)},
                 "run_id": run_id,
@@ -719,17 +745,15 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
         try:
             con = fs_connect()
             fs_log_prediction(con, {
-                "run_id":       run_id,                     # join key for FS ↔ outcomes
+                "run_id":       run_id,
                 "model_id":     "mc_v1",
                 "symbol":       req.symbol.upper(),
                 "issued_at":    datetime.now(timezone.utc).isoformat(),
                 "horizon_days": int(req.horizon_days),
-                "yhat_mean":    term_q50,                   # mid as PRICE
+                "yhat_mean":    term_q50,                  # price mid
                 "prob_up":      float(prob_up),
-                "q05":          term_q05,                   # PRICE quantiles
-                "q50":          term_q50,
-                "q95":          term_q95,
-                "uncertainty":  float(np.std(terminal)),    # dispersion of terminal prices
+                "q05":          term_q05, "q50": term_q50, "q95": term_q95,
+                "uncertainty":  float(np.std(terminal)),
                 "features_ref": {
                     "window_days":  int(window_days),
                     "paths":        int(req.n_paths),
@@ -737,6 +761,7 @@ async def run_simulation(run_id: str, req: SimRequest, redis: Redis):
                     "mu_ann":       float(mu_ann),
                     "sigma_ann":    float(sigma_ann),
                     "timespan":     req.timespan,
+                    "seed_hint":    int(seed),
                 },
             })
             con.close()
@@ -763,21 +788,14 @@ async def health():
             redis_ok = await REDIS.ping()
     except Exception:
         redis_ok = False
-
     key = (settings.polygon_key or "").strip()
-    key_mode = "none"
-    try:
-        # MOCK_POLYGON_KEY is defined earlier in this file
-        key_mode = "mock" if key and key == MOCK_POLYGON_KEY else ("real" if key else "none")
-    except Exception:
-        pass
-
+    key_mode = "real" if key else "none"
     return {
         "ok": True,
         "redis_ok": bool(redis_ok),
         "redis_url": settings.redis_url,
         "polygon_key_present": bool(key),
-        "polygon_key_mode": key_mode,  # "real" | "mock" | "none"
+        "polygon_key_mode": key_mode,  # "real" | "none"
         "n_paths_max": settings.n_paths_max,
         "horizon_days_max": settings.horizon_days_max,
         "pathday_budget_max": settings.pathday_budget_max,
