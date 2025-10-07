@@ -1,146 +1,88 @@
-import json
-import asyncio
-import uuid
-from dotenv import load_dotenv
-from pydantic_settings import BaseSettings
-from pydantic import Field
-from redis.asyncio import Redis
-from fastapi import FastAPI
+# --- stdlib
+import os, json, asyncio, logging, math
+from datetime import datetime, timedelta, date, timezone
+from uuid import uuid4
+from typing import List, Optional, Dict
+
+# --- third-party
+from dotenv import load_dotenv; load_dotenv()
+import numpy as np
+import pandas as pd
+import httpx
+
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, APIKeyQuery
-from fastapi import Depends, HTTPException, BackgroundTasks, WebSocket
-from fastapi.responses import StreamingResponse
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-import pandas as pd
+
+from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
+from redis.asyncio import Redis
+
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
-# Assuming external modules; adjust if needed
-from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
-# Feature store imports (support both new & old names)
-from .feature_store import connect as fs_connect
 
+# --- local modules (feature store with back-compat)
+from .feature_store import connect as fs_connect
 try:
-    # Newer names
     from .feature_store import insert_prediction as fs_log_prediction
 except ImportError:
-    # Back-compat
     from .feature_store import log_prediction as fs_log_prediction  # type: ignore
 
 try:
-    # Newer name
     from .feature_store import compute_and_upsert_metrics_daily as _rollup
 except ImportError:
-    # Back-compat
     from .feature_store import rollup as _rollup  # type: ignore
-# Prefer the current names; fall back if an older branch still uses SGDOnline
+
+# learners: prefer new names, fall back to old
 try:
     from .learners import OnlineLinear as SGDOnline, ExpWeights as EW
 except ImportError:
-    from .learners import SGDOnline, ExpWeights as EW  # back-compat
-# ----------------------------
-# Optional ML libs (soft deps)
-# ----------------------------
+    from .learners import SGDOnline, ExpWeights as EW  # type: ignore
 
-TF_AVAILABLE = False
-SB3_AVAILABLE = False
-import os
-from .track_record import router as track_router
-from datetime import datetime, timedelta, date, timezone
-import httpx
-import logging
-import math
-import numpy as np
-from typing import List, Optional, Dict
-import os.path
+# DUCK utils — pick the path that exists in your repo:
+from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
+# If your file is actually at src/db/duck.py, change the above to:
+# from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
 
-# TensorFlow / Keras (optional)
+# --- logging / app / CORS
+logger = logging.getLogger("predictive")
+logging.basicConfig(level=logging.INFO)
+
+app = FastAPI(title="PredictiveTwin API")
+CORS_ORIGINS = os.getenv("PT_CORS_ORIGINS", "").split(",") if os.getenv("PT_CORS_ORIGINS") else ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# API-key gate
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+api_key_query = APIKeyQuery(name="api_key", auto_error=False)
+PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
+
+async def verify_api_key(
+    x_key: Optional[str] = Depends(api_key_header),
+    q_key: Optional[str] = Depends(api_key_query),
+):
+    key = x_key or q_key
+    if PT_API_KEY and key != PT_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return PT_API_KEY
+
+# Optional: Track-record router (guarded so missing file won't crash deploy)
 try:
-    from tensorflow.keras.models import load_model as _tf_load_model
-    from tensorflow.keras.models import Sequential as _TF_Sequential
-    from tensorflow.keras.layers import LSTM as _TF_LSTM, GRU as _TF_GRU, Dense as _TF_Dense
-    TF_AVAILABLE = True
-except Exception:
-    # Stubs so references won't NameError; calling them will raise a clear ImportError.
-    def _missing_tf(*_a, **_k):
-        raise ImportError("TensorFlow is not installed on the server.")
-    _tf_load_model = _missing_tf
-    _TF_Sequential = _missing_tf
-    _TF_LSTM = _missing_tf
-    _TF_GRU = _missing_tf
-    _TF_Dense = _missing_tf
+    from .track_record import router as track_router  # type: ignore
+    app.include_router(track_router, prefix="/track")
+    logger.info("Track-record routes enabled at /track")
+except Exception as e:
+    logger.warning(f"Track-record routes disabled: {e}")
 
-# Public names used elsewhere
-load_model = _tf_load_model
-Sequential = _TF_Sequential
-LSTM = _TF_LSTM
-GRU = _TF_GRU
-Dense = _TF_Dense
-
-# RL / Gym (optional)
-try:
-    import gymnasium as gym
-except Exception:
-    gym = None
-
-try:
-    from stable_baselines3 import DQN
-    SB3_AVAILABLE = True
-except Exception:
-    DQN = None
-    SB3_AVAILABLE = False
-from pydantic import BaseModel, Field
-from typing import Optional
-
-class SimRequest(BaseModel):
-    symbol: str
-    horizon_days: int = Field(ge=1, le=365*2)
-    n_paths: int = Field(default=500, ge=50, le=20000)
-    seed: Optional[int] = None
-
-class TrainRequest(BaseModel):
-    symbol: str
-    lookback_days: int = Field(default=365, ge=30, le=3650)
-
-class PredictRequest(BaseModel):
-    symbol: str
-    horizon_days: int = Field(default=30, ge=1, le=365)
-    use_online: bool = True
-
-class RunState(BaseModel):
-    run_id: str
-    status: str
-    started_at: float
-    progress: float = 0.0
-
-
-def require_tf() -> None:
-    """Call this right before any code path that needs TensorFlow."""
-    if not TF_AVAILABLE:
-        # Using HTTPException is nice for endpoints; RuntimeError is fine for internal calls.
-        try:
-            from fastapi import HTTPException  # local import to avoid circulars at import time
-            raise HTTPException(status_code=503, detail="TensorFlow is not installed on the server.")
-        except Exception:
-            raise RuntimeError("TensorFlow is not installed on the server.")
-
-def _sigmoid(z: float) -> float:
-    z = np.clip(z, -60.0, 60.0)
-    return 1.0 / (1.0 + np.exp(-z))
-
-def _today_utc_date() -> date:
-    return datetime.now(timezone.utc).date()
-
-def _simple_sentiment(text: str) -> float:
-    # Placeholder stub; replace with actual logic if available (e.g., using NLTK or custom scoring)
-    lower_text = text.lower()
-    positive_words = ["good", "great", "excellent", "bullish"]
-    negative_words = ["bad", "poor", "bearish"]
-    score = sum(1 for word in positive_words if word in lower_text) - sum(1 for word in negative_words if word in lower_text)
-    return score / max(len(text.split()), 1)  # Normalized simple score
-
-# ---------- Keys / config helpers ----------
 def _poly_key() -> str:
     # Prefer real env keys; otherwise fall back to mock/dev key
     return (
