@@ -7,7 +7,8 @@ from pydantic import Field
 from redis.asyncio import Redis
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, APIKeyQuery
-from fastapi import Depends, HTTPException, BackgroundTasks, WebSocket, StreamingResponse
+from fastapi import Depends, HTTPException, BackgroundTasks, WebSocket
+from fastapi.responses import StreamingResponse
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 import pandas as pd
@@ -33,7 +34,7 @@ import logging
 import math
 import numpy as np
 from typing import List, Optional, Dict
-
+import os.path
 
 # TensorFlow / Keras (optional)
 try:
@@ -1709,25 +1710,45 @@ async def models(_api_key: str = Depends(verify_api_key)):
     return {"models": await _list_models()}
 
 
+# ---- Optional static hosting (disabled by default) ----
+# If you want the API to also serve your built frontend, set PT_FRONTEND_DIR
+# to the absolute path of the SPA build directory (the one with index.html).
+FRONTEND_DIR = os.getenv("PT_FRONTEND_DIR", "").strip()
+
 @app.get("/ui/fan-chart.tsx")
 async def get_fan_chart_tsx():
-    path = r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\src\components\FanChart.tsx"
-    if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return {"filename": "FanChart.tsx", "contents": f.read()}
-    raise HTTPException(404, "FanChart.tsx not found")
+    # Only try to read the file if FRONTEND_DIR is provided
+    if FRONTEND_DIR:
+        candidate = os.path.join(FRONTEND_DIR, "src", "components", "FanChart.tsx")
+        if os.path.isfile(candidate):
+            with open(candidate, "r", encoding="utf-8") as f:
+                return {"filename": "FanChart.tsx", "contents": f.read()}
+    # In container deployments (like Render) this usually isn't present.
+    raise HTTPException(404, "FanChart.tsx not available on this deployment")
 
+if FRONTEND_DIR:
+    # Serve static assets & SPA only if configured
+    try:
+        app.mount("/assets",
+                  StaticFiles(directory=os.path.join(FRONTEND_DIR, "assets")),
+                  name="assets")
 
-@app.get("/{path:path}", response_class=HTMLResponse)
-async def spa_fallback(path: str):
-    file_path = os.path.join(r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist", path)
-    if os.path.isfile(file_path):
-        return FileResponse(file_path)
-    return FileResponse(r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist\index.html")
-
-
-app.mount(
-    "/assets",
-    StaticFiles(directory=r"C:\Users\snowb\OneDrive\Desktop\market-twin-mvp\frontend\dist\assets"),
-    name="assets",
-)
+        @app.get("/{path:path}", response_class=HTMLResponse)
+        async def spa_fallback(path: str):
+            file_path = os.path.join(FRONTEND_DIR, path)
+            if os.path.isfile(file_path):
+                return FileResponse(file_path)
+            index = os.path.join(FRONTEND_DIR, "index.html")
+            if os.path.isfile(index):
+                return FileResponse(index)
+            raise HTTPException(404, "index.html not found")
+    except Exception as e:
+        logger.warning(f"Static hosting disabled: {e}")
+else:
+    # Default: API only. Helpful response instead of 404s for all paths.
+    @app.get("/{path:path}")
+    async def catch_all(path: str):
+        return {
+            "status": "ok",
+            "message": "PredictiveTwin API is running. No static frontend configured on this service."
+        }
