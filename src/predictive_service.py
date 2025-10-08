@@ -237,6 +237,7 @@ async def _shutdown():
     except Exception as e:
         logger.error(f"Error closing Redis: {e}")
 
+
 # Optional model loaders (only if missing up top)
 if "load_lstm_model" not in globals():
     def load_lstm_model(symbol: str):
