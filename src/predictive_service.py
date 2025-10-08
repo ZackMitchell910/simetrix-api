@@ -1,8 +1,10 @@
 # --- stdlib
+from __future__ import annotations
 import os, json, asyncio, logging, math, pickle
 from datetime import datetime, timedelta, date, timezone
 from uuid import uuid4
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Literal
+
 
 # --- third-party
 from dotenv import load_dotenv; load_dotenv()
@@ -80,6 +82,7 @@ try:
 except Exception:
     from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome  # type: ignore
 
+
 # --- logging / app (single instance)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
@@ -92,6 +95,33 @@ app = FastAPI(
     redirect_slashes=False,
 )
 
+class SimRequest(BaseModel):
+    symbol: str
+    horizon_days: int = Field(default=30, ge=1, le=365)  # hard cap; you also validate later
+    n_paths: int = Field(default=1000, ge=50, le=20000)
+    timespan: Literal["day", "hour", "minute"] = "day"
+    include_news: bool = False
+    include_options: bool = False
+    include_futures: bool = False
+    seed: Optional[int] = None
+
+class TrainRequest(BaseModel):
+    symbol: str
+    lookback_days: int = Field(default=365, ge=30, le=3650)
+
+class PredictRequest(BaseModel):
+    symbol: str
+    horizon_days: int = Field(default=30, ge=1, le=365)
+    use_online: bool = True  # keep for parity with your code
+
+class RunState(BaseModel):
+    run_id: str
+    status: Literal["queued", "running", "done", "error"] = "queued"
+    started_at: float = Field(default_factory=lambda: datetime.now(timezone.utc).timestamp())
+    progress: float = 0.0
+    error: Optional[str] = None
+    artifact: Optional[Dict] = None
+    
 # ----------------- helpers / config -----------------
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     s = os.getenv(name, "")
