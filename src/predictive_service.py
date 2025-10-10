@@ -25,7 +25,11 @@ from redis.asyncio import Redis
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
-from statsmodels.tsa.arima.model import ARIMA
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    ARIMA_AVAILABLE = True
+except Exception:
+    ARIMA_AVAILABLE = False
 
 
 # --- optional ML libs (soft deps; guard all usages)
@@ -414,15 +418,20 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
         if len(preds) > p_idx:
             components.append(preds[p_idx]); names.append("arima")
 
-        # Map weights
         wts = []
         for nm in names:
             wts.append(mw.get(nm, 0.25))
         # Normalize
-        wts = np.array(wts, dtype=float); wts = wts / (wts.sum() if wts.sum() else 1.0)
+        wts = np.array(wts, dtype=float)
+        wts = wts / (wts.sum() if wts.sum() else 1.0)
 
         prob = float(np.clip(float(np.dot(wts, np.array(components, dtype=float))) + rl_adjust, 0.0, 1.0))
         return prob
+
+    except Exception:
+        # Any unexpected failure → safe fallback and a useful traceback in logs
+        logger.exception("get_ensemble_prob failed; returning 0.5 fallback")
+        return 0.5
 
 
 def _meta_weights(symbol: str, horizon_days: int) -> dict:
