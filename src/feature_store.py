@@ -9,7 +9,7 @@ PathPanda DuckDB Feature Store
 
 from __future__ import annotations
 import os, json, datetime as dt
-from typing import Iterable, Optional, Mapping, Any
+from typing import Iterable, Optional, Mapping, Any, List, Tuple
 
 import duckdb
 import numpy as np
@@ -268,6 +268,50 @@ def generate_accuracy_statements(
         statements.append(f"Simetrix predicted {sym}'s price within {pct_error:.1f}% of the actual closing value over a {horizon}-day horizon.")
 
     return statements
+
+def get_recent_mdape(
+    con: duckdb.DuckDBPyConnection,
+    symbol: str,
+    horizon_days: int,
+    lookback_days: int = 30
+) -> float:
+    """
+    Returns recent MDAPE across that symbol/horizon. If missing, returns NaN.
+    """
+    row = con.execute("""
+        SELECT median(mape) AS mdape
+        FROM metrics_daily
+        WHERE symbol = ? AND horizon_days = ? AND date >= date 'now' - INTERVAL ? DAY
+    """, [symbol.upper(), int(horizon_days), int(lookback_days)]).fetchone()
+    if not row or row[0] is None:
+        return float("nan")
+    return float(row[0])
+
+def get_recent_coverage(
+    con: duckdb.DuckDBPyConnection,
+    symbol: str,
+    horizon_days: int,
+    lookback_days: int = 21
+) -> Tuple[float, int]:
+    """
+    Returns (avg_p90_cov, n) over the last N days for symbol + horizon.
+    If no rows, returns (float("nan"), 0).
+    """
+    rows = con.execute("""
+        SELECT p90_cov, n
+        FROM metrics_daily
+        WHERE symbol = ? AND horizon_days = ? AND date >= date 'now' - INTERVAL ? DAY
+    """, [symbol.upper(), int(horizon_days), int(lookback_days)]).fetchall()
+    if not rows:
+        return float("nan"), 0
+    # Weighted average by n
+    num, den = 0.0, 0
+    for p90, nn in rows:
+        if p90 is None or nn is None: 
+            continue
+        num += float(p90) * int(nn)
+        den += int(nn)
+    return ((num / den) if den else float("nan"), den)
 
 # ---------- Maintenance ----------
 
