@@ -25,6 +25,8 @@ from redis.asyncio import Redis
 from ta.momentum import RSIIndicator
 from ta.trend import MACD
 from ta.volatility import BollingerBands
+from statsmodels.tsa.arima.model import ARIMA
+
 
 # --- optional ML libs (soft deps; guard all usages)
 TF_AVAILABLE = False
@@ -61,6 +63,9 @@ except Exception:
 
 # --- local modules (feature store with back-compat)
 from .feature_store import connect as fs_connect
+from .feature_store import get_recent_coverage
+from .feature_store import get_recent_mdape
+
 try:
     from .feature_store import insert_prediction as fs_log_prediction
 except ImportError:
@@ -115,6 +120,7 @@ class RunState(BaseModel):
     artifact: Optional[Dict] = None
 
 # ----------------- helpers / config -----------------
+
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     s = os.getenv(name, "")
     if not s:
@@ -179,8 +185,8 @@ CORS_ORIGINS = _parse_cors_list(settings.cors_origins_raw)
 DEFAULT_ORIGINS = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "https://pathpanda.io",
-    "https://pathpanda.netlify.app",
+    "https://simetrix.io",
+    "https://www.simetrix.io",
 ]
 ALLOWED_ORIGINS = sorted(set(CORS_ORIGINS or DEFAULT_ORIGINS))
 
@@ -385,20 +391,123 @@ async def get_ensemble_prob(symbol: str, redis: Redis, horizon_days: int = 1) ->
             env.close()
         except Exception as e:
             logger.info(f"RL skipped in ensemble: {e}")
-
-        # Ensemble
+        # --- Ensemble with meta-weights ---
         if not preds:
             return 0.5
-        ew = EW(); ew.init(len(preds))
-        # Equal weights via no-op losses; could wire real validation losses here.
-        ew.update(np.array([0.1] * len(preds), dtype=float))
-        prob_up = float(np.clip(sum(w * p for w, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
-        return prob_up
-    except Exception as e:
-        logger.warning(f"Ensemble prob failed for {symbol}: {e}")
-        return 0.5
+
+        # Order: [linear, lstm?, arima?] → map to weights
+        mw = _meta_weights(symbol, int(horizon_days))
+        components = []
+        names = []
+
+        # Linear is always first if present
+        if "coef" in model_linear:
+            components.append(preds[0]); names.append("linear")
+
+        # LSTM present?
+        p_idx = 1
+        if "keras" in str(type(globals().get("Sequential", None))).lower() or TF_AVAILABLE:
+            if len(preds) >= 2:
+                components.append(preds[p_idx]); names.append("lstm"); p_idx += 1
+
+        # ARIMA present?
+        if len(preds) > p_idx:
+            components.append(preds[p_idx]); names.append("arima")
+
+        # Map weights
+        wts = []
+        for nm in names:
+            wts.append(mw.get(nm, 0.25))
+        # Normalize
+        wts = np.array(wts, dtype=float); wts = wts / (wts.sum() if wts.sum() else 1.0)
+
+        prob = float(np.clip(float(np.dot(wts, np.array(components, dtype=float))) + rl_adjust, 0.0, 1.0))
+        return prob
+
+
+def _meta_weights(symbol: str, horizon_days: int) -> dict:
+    """
+    Compute simple weights for {linear, lstm, arima, rl} from recent performance.
+    Lower MDAPE → higher weight. Returns normalized dict.
+    """
+    try:
+        con = fs_connect()
+        mdape = get_recent_mdape(con, symbol, horizon_days, lookback_days=30)
+        con.close()
+    except Exception:
+        mdape = float("nan")
+
+    # If no metrics yet, default equal-ish
+    base = {"linear": 0.28, "lstm": 0.28, "arima": 0.28, "rl": 0.16}
+
+    if not np.isfinite(mdape):
+        return base
+
+    # Convert error → weight scale: smaller mdape → bigger weight
+    # Map mdape% ~ [2..25] → weight multiplier [1.3..0.7]
+    mult = float(np.clip(1.3 - 0.03 * (mdape - 2.0), 0.7, 1.3))
+    # Favor linear in low mdape (stable), favor rl slightly otherwise
+    w_lin = base["linear"] * (1.0 if mdape > 8.0 else mult)
+    w_lstm = base["lstm"] * 0.95
+    w_arima = base["arima"] * 0.90
+    w_rl = base["rl"] * (1.05 if mdape > 10.0 else 0.95)
+
+    ws = np.array([w_lin, w_lstm, w_arima, w_rl], dtype=float)
+    ws = ws / (ws.sum() if ws.sum() else 1.0)
+    return {"linear": float(ws[0]), "lstm": float(ws[1]), "arima": float(ws[2]), "rl": float(ws[3])}
+
+def _calibration_sigma_scale(symbol: str, horizon_d: int) -> float:
+    """
+    If empirical P90 coverage < target, inflate sigma a bit; if > target, deflate slightly.
+    Target = 0.90. Uses gentle scaling so it’s stable.
+    """
+    try:
+        con = fs_connect()
+        cov, n = get_recent_coverage(con, symbol, horizon_d, lookback_days=21)
+        con.close()
+        if not np.isfinite(cov):
+            return 1.0
+        target = 0.90
+        err = float(np.clip(target - cov, -0.30, 0.30))   # -0.30..+0.30
+        # Map coverage error to multiplicative sigma scale ~ +/- 10%
+        # e.g., if cov=0.80 (err=+0.10) → scale up by ~ +7%
+        scale = float(np.clip(1.0 + 0.7 * err, 0.85, 1.15))
+        return scale
+    except Exception:
+        return 1.0
 
 # --- small utilities used elsewhere in file ---
+def _detect_regime(px: np.ndarray) -> dict:
+    """
+    Classify a simple market regime from price series.
+    Returns: {"name": str, "score": float}  score in [-1, +1]
+    """
+    px = np.asarray(px, dtype=float)
+    if px.size < 40:
+        return {"name": "neutral", "score": 0.0}
+
+    # Compute daily log-returns, realized vol, and short-term momentum
+    rets = np.diff(np.log(px))
+    rv20  = float(np.std(rets[-20:]) * math.sqrt(252)) if rets.size >= 20 else float(np.std(rets) * math.sqrt(252))
+    mom20 = float((px[-1] / px[max(0, len(px)-21)]) - 1.0)
+
+    # Normalized features → crude score
+    # rv20 typical 0.15–0.7 in equities; clamp to stability
+    v = float(np.clip((rv20 - 0.30) / 0.30, -1.5, 1.5))  # positive when vol is high
+    m = float(np.clip(mom20 / 0.10, -1.5, 1.5))          # +1 if +10% last ~month
+
+    # Heuristic regime mapping
+    if v > 0.6 and m < -0.3:
+        name, score = "vol-shock", -0.7         # defensive tilt
+    elif m > 0.4 and v < 0.3:
+        name, score = "bull-trend", 0.6
+    elif m < -0.4 and v < 0.3:
+        name, score = "bear-trend", -0.5
+    else:
+        name, score = "neutral", float(np.clip(m - 0.3*v, -0.4, 0.4))
+
+    return {"name": name, "score": float(np.clip(score, -1.0, 1.0))}
+
 async def _list_models() -> List[str]:
     if not REDIS: return []
     keys = await REDIS.keys("model:*")
@@ -494,7 +603,17 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
         sigma_ann = float(np.std(rets) * math.sqrt(scale)) if rets.size else 0.2
         sigma_ann = float(np.clip(sigma_ann, 1e-4, 1.5))
         mu_ann    = float(np.clip(mu_ann, -2.0,  2.0))
-
+        # --- after computing mu_ann, sigma_ann from history (just before ML adjustment) ---
+        reg = _detect_regime(px_arr)
+        # Regime-aware nudges:
+        if reg["name"] == "vol-shock":
+            sigma_ann = float(np.clip(sigma_ann * 1.15, 1e-4, 1.8))
+            mu_ann    = float(np.clip(mu_ann - 0.10 * sigma_ann, -3.0, 3.0))
+        elif reg["name"] == "bull-trend":
+            mu_ann = float(np.clip(mu_ann + 0.08 * sigma_ann, -3.0, 3.0))
+        elif reg["name"] == "bear-trend":
+            mu_ann = float(np.clip(mu_ann - 0.08 * sigma_ann, -3.0, 3.0))
+        # neutral: no extra change
         # ---------- ML adjustment → VOL-AWARE DRIFT TILT ----------
         ensemble_prob = 0.5
         try:
@@ -523,7 +642,13 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                         if items:
                             ss = [_safe_sent((it.get("title") or "")) for it in items]
                             if ss:
-                                sentiment = float(np.clip(np.mean(ss) * 0.2, -0.05, 0.05))
+                                sent_mean = float(np.mean(ss))
+                                sent_std  = float(np.std(ss))
+                                # Semantic-ish intensity: strong, consistent tone → bigger tilt
+                                sem_intensity = float(np.clip(abs(sent_mean) * (1.0 + 0.5 * (1.0 - np.tanh(sent_std))), 0.0, 0.15))
+                                # Direction from mean sign; cap to ~ +/- 3% drift share
+                                semantic_tilt = float(np.clip(np.sign(sent_mean) * sem_intensity, -0.03, 0.03))
+                                sentiment = float(np.clip(sentiment + semantic_tilt, -0.07, 0.07))
             except Exception as e:
                 logger.info(f"news sentiment failed: {e}")
 
@@ -534,6 +659,8 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
         # fold sentiment after tilt
         mu_ann = float(np.clip(mu_ann + sentiment, -3.0, 3.0))
+        sigma_scale = _calibration_sigma_scale(req.symbol, int(req.horizon_days))
+        sigma_ann = float(np.clip(sigma_ann * sigma_scale, 1e-4, 2.0))
 
         # ---------- Monte Carlo (GBM) ----------
         S0 = float(px_arr[-1])
@@ -621,19 +748,21 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             },
             "prob_up_end": prob_up,
             "drivers": [
-                {"feature": "rvol_20",       "weight": 0.36},
-                {"feature": "autocorr_5",    "weight": 0.19},
-                {"feature": "mom_20",        "weight": 0.14},
+                {"feature": "rvol_20", "weight": 0.36},
+                {"feature": "autocorr_5", "weight": 0.19},
+                {"feature": "mom_20", "weight": 0.14},
                 {"feature": "ensemble_prob", "weight": float(ensemble_prob)},
+                {"feature": "news_semantic", "weight": float(semantic_tilt if 'semantic_tilt' in locals() else 0.0)},
             ],
             "model_info": {
                 "direction": "MonteCarlo",
-                "regime": "lognormal",
+                "regime": reg["name"],
+                "regime_score": float(reg["score"]),
                 "model_id": "mc_v1",
                 "seed_hint": int(seed),
                 "timescale": req.timespan,
             },
-            "calibration": {"window": int(window_days), "p80_empirical": 0.8},
+            "calibration": {"window": int(window_days), "p80_empirical": 0.8, "sigma_scale": float(sigma_scale)},
             "terminal_prices": [float(x) for x in terminal.tolist()],
             "var_es": {"var95": var95, "es95": es95},  # returns
             "hit_probs": {
@@ -648,18 +777,19 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                 "p95": eod_p95
             },
         }
-
         # ---------- Persist: DuckDB.predictions ----------
         try:
             pred_id = str(uuid4())
             insert_prediction({
                 "pred_id": pred_id,
-                "ts": datetime.utcnow(),
+                "ts": datetime.utcnow(),  # keep naive UTC to match existing table if that's how it's defined
                 "symbol": req.symbol.upper(),
                 "horizon_d": int(req.horizon_days),
                 "model_id": "mc_v1",
                 "prob_up_next": float(prob_up),
-                "p05": term_q05, "p50": term_q50, "p95": term_q95,
+                "p05": float(term_q05),
+                "p50": float(term_q50),
+                "p95": float(term_q95),
                 "spot0": float(S0),
                 "user_ctx": {"ui": "pathpanda", "run_id": run_id, "n_paths": int(req.n_paths)},
                 "run_id": run_id,
@@ -676,9 +806,11 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                 "symbol":       req.symbol.upper(),
                 "issued_at":    datetime.now(timezone.utc).isoformat(),
                 "horizon_days": int(req.horizon_days),
-                "yhat_mean":    term_q50,
+                "yhat_mean":    float(term_q50),
                 "prob_up":      float(prob_up),
-                "q05":          term_q05, "q50": term_q50, "q95": term_q95,
+                "q05":          float(term_q05),
+                "q50":          float(term_q50),
+                "q95":          float(term_q95),
                 "uncertainty":  float(np.std(terminal)),
                 "features_ref": {
                     "window_days":  int(window_days),
@@ -694,42 +826,50 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
         except Exception as e:
             logger.warning(f"Feature Store mirror failed: {e}")
 
-        # ---------- Finish ----------
-        rs.status = "done"; rs.progress = 100
+        # ---------- Finish (success) ----------
+        rs.status = "done"
+        rs.progress = 100
         await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
         logger.info(f"Completed simulation for run_id={run_id}")
 
     except Exception as e:
-        rs.status = "error"; rs.error = str(e)  # type: ignore[attr-defined]
-        await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
+        # ---------- Failure path (do NOT mark done) ----------
         logger.exception(f"Simulation failed for run_id={run_id}: {e}")
 
-        # ---------- Mirror: PathPanda Feature Store ----------
+        # Try to mirror a minimal snapshot so we can debug later; guard all lookups
         try:
             con = fs_connect()
             fs_log_prediction(con, {
                 "run_id":       run_id,
                 "model_id":     "mc_v1",
-                "symbol":       req.symbol.upper(),
+                "symbol":       getattr(req, "symbol", "UNK").upper() if getattr(req, "symbol", None) else "UNK",
                 "issued_at":    datetime.now(timezone.utc).isoformat(),
-                "horizon_days": int(req.horizon_days),
-                "yhat_mean":    term_q50,                  # price mid
-                "prob_up":      float(prob_up),
-                "q05":          term_q05, "q50": term_q50, "q95": term_q95,
-                "uncertainty":  float(np.std(terminal)),
+                "horizon_days": int(getattr(req, "horizon_days", 0) or 0),
+                "yhat_mean":    float(locals().get("term_q50")) if "term_q50" in locals() else None,
+                "prob_up":      float(locals().get("prob_up", 0.5)),
+                "q05":          float(locals().get("term_q05")) if "term_q05" in locals() else None,
+                "q50":          float(locals().get("term_q50")) if "term_q50" in locals() else None,
+                "q95":          float(locals().get("term_q95")) if "term_q95" in locals() else None,
+                "uncertainty":  float(np.std(locals().get("terminal"))) if "terminal" in locals() else None,
                 "features_ref": {
-                    "window_days":  int(window_days),
-                    "paths":        int(req.n_paths),
-                    "S0":           float(S0),
-                    "mu_ann":       float(mu_ann),
-                    "sigma_ann":    float(sigma_ann),
-                    "timespan":     req.timespan,
-                    "seed_hint":    int(seed),
+                    "window_days":  int(locals().get("window_days", 0) or 0),
+                    "paths":        int(getattr(req, "n_paths", 0) or 0),
+                    "S0":           float(locals().get("S0")) if "S0" in locals() else None,
+                    "mu_ann":       float(locals().get("mu_ann")) if "mu_ann" in locals() else None,
+                    "sigma_ann":    float(locals().get("sigma_ann")) if "sigma_ann" in locals() else None,
+                    "timespan":     getattr(req, "timespan", None),
+                    "seed_hint":    int(locals().get("seed")) if "seed" in locals() else None,
+                    "error":        str(e)[:200],
                 },
             })
             con.close()
-        except Exception as e:
-            logger.warning(f"Feature Store mirror failed: {e}")
+        except Exception as e2:
+            logger.warning(f"Feature Store error-path mirror failed: {e2}")
+
+        rs.status = "error"
+        rs.error = str(e)
+        # keep whatever progress we had; do not force 100
+        await redis.set(f"run:{run_id}", rs.json(), ex=settings.run_ttl_seconds)
 
         # ---------- Finish ----------
         rs.status = "done"
@@ -864,9 +1004,8 @@ async def config():
         "horizon_days_max": settings.horizon_days_max,
         "pathday_budget_max": settings.pathday_budget_max,
         "predictive_defaults": settings.predictive_defaults,
-        "cors_origins": settings.cors_origins,
+        "cors_origins": ALLOWED_ORIGINS,
     }
-
 
 @app.get("/simulate/{run_id}/stream")
 async def simulate_stream(run_id: str, _api_key: str = Depends(verify_api_key)):
@@ -1405,76 +1544,66 @@ class OnlineLearnRequest(BaseModel):
 
 @app.post("/learn/online")
 async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(verify_api_key)):
-    # 1) Load labeled samples (features: mom_20, rvol_20, autocorr_5)
-    try:
-        X, y = _load_labeled_samples(req.symbol, limit=max(64, req.steps * req.batch))
-    except Exception as e:
-        logger.exception(f"Failed to load labeled samples for {req.symbol}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to load labeled samples")
+    """
+    Mini online-learning pass on recent labeled samples.
+    Uses three core features {mom_20, rvol_20, autocorr_5} from _load_labeled_samples().
+    Updates Redis model:{SYMBOL}_linear in-place.
+    """
+    X, y = _load_labeled_samples(req.symbol, limit=max(128, req.steps * req.batch))
+    if X.size == 0 or y.size == 0:
+        return {"status": "no_data"}
 
-    if len(X) < 4:
-        raise HTTPException(status_code=422, detail="Not enough labeled samples yet")
-
-    # 2) Load existing linear model (always 4 weights: [bias, w_mom, w_rvol, w_autocorr])
-    key = await _model_key(req.symbol + "_linear")  # keep this key everywhere
+    # Pull current model (or init)
+    key = await _model_key(req.symbol + "_linear")
+    w0 = None
+    meta = {}
     raw = await REDIS.get(key)
     if raw:
-        m = json.loads(raw)
-        coef = np.array(m.get("coef", []), dtype=float)
-        if coef.size < 4:
-            coef = np.pad(coef, (0, 4 - coef.size))
-        elif coef.size > 4:
-            coef = coef[:4]
-    else:
-        coef = np.zeros(4, dtype=float)
+        try:
+            js = json.loads(raw)
+            w0 = np.asarray(js.get("coef", []), dtype=float)
+            feats = js.get("features", ["mom_20", "rvol_20", "autocorr_5"])
+            meta = {k: js.get(k) for k in ("trained_at","n_samples")}
+            # align dimensionality if needed
+            if w0.shape[0] != len(feats) + 1:  # +1 for bias
+                w0 = None
+        except Exception:
+            w0 = None
 
-    # 3) Online SGD on logistic loss (3 features)
-    sgd = SGDOnline(lr=req.lr, l2=req.l2)
-    sgd.init(3)            # bias + 3 features
-    sgd.w = coef.copy()    # class aligns internally if needed
+    # Build batches
+    rng = np.random.default_rng(42)
+    idx = np.arange(X.shape[0]); rng.shuffle(idx)
+    Xs = X[idx]; ys = y[idx].astype(float)
 
-    rng = np.random.default_rng(0)
-    for _ in range(req.steps):
-        idx = rng.choice(len(X), size=min(req.batch, len(X)), replace=False)
-        for i in idx:
-            sgd.update(X[i], float(y[i]))
+    # Initialize learner
+    learner = SGDOnline(lr=float(req.lr), l2=float(req.l2))
+    learner.init(X.shape[1])  # bias handled internally in learner
 
-    # 4) Exp-weights over two experts: old vs new (use stable log-loss)
-    def _sigmoid_arr(z: np.ndarray) -> np.ndarray:
-        z = np.clip(z.astype(float), -60.0, 60.0)
-        return 1.0 / (1.0 + np.exp(-z))
+    # Optionally warm start
+    if w0 is not None and hasattr(learner, "w"):
+        learner.w = w0.astype(float)
 
-    k = max(8, min(len(X), len(X)//8 or len(X)))
-    hold = slice(0, k)
+    # Train
+    steps = int(req.steps)
+    bsz   = int(req.batch)
+    for t in range(steps):
+        lo = (t * bsz) % Xs.shape[0]
+        hi = lo + bsz
+        xb = Xs[lo:hi]
+        yb = ys[lo:hi]
+        # simple classification target (>= mid)
+        for i in range(xb.shape[0]):
+            learner.update(xb[i], float(yb[i]))
 
-    def logloss(w: np.ndarray) -> float:
-        z = w[0] + X[hold, 0]*w[1] + X[hold, 1]*w[2] + X[hold, 2]*w[3]
-        p = _sigmoid_arr(z)
-        eps = 1e-9
-        return -float(np.mean(y[hold]*np.log(p + eps) + (1 - y[hold])*np.log(1 - p + eps)))
-
-    old_loss = logloss(coef)
-    new_loss = logloss(sgd.w)
-
-    ew = EW(eta=req.eta)
-    ew.init(2)
-    ew.update(np.array([old_loss, new_loss], dtype=float))
-
-    # 5) Save updated model back to the same key
-    updated = {
-        "symbol": req.symbol.upper(),
-        "coef": [float(c) for c in sgd.w],  # exactly 4 numbers
+    # Persist back to Redis
+    model = {
+        "coef": learner.w.tolist(),
         "features": ["mom_20", "rvol_20", "autocorr_5"],
         "trained_at": datetime.now(timezone.utc).isoformat(),
-        "n_samples": int(len(X)),
-        "window_days": None,
-        "online": True,
-        "exp_weights": [float(w) for w in ew.w],
-        "losses": {"old": float(old_loss), "new": float(new_loss)},
+        "n_samples": int((meta.get("n_samples") or 0) + X.shape[0]),
     }
-    await REDIS.set(key, json.dumps(updated))
-    return {"status": "ok", "model": updated}
-
+    await REDIS.set(key, json.dumps(model))
+    return {"status": "ok", "model": model}
 
 @app.post("/predict")
 async def predict(req: PredictRequest, _api_key: str = Depends(verify_api_key)):
