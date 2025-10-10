@@ -87,14 +87,6 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
 
-app = FastAPI(
-    title="PredictiveTwin API",
-    version="1.2.1",
-    docs_url="/api-docs",
-    redoc_url=None,
-    redirect_slashes=False,
-)
-
 class SimRequest(BaseModel):
     symbol: str
     horizon_days: int = Field(default=30, ge=1, le=365)  # hard cap; you also validate later
@@ -147,19 +139,6 @@ def _today_utc_date() -> date:
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
 
-def _parse_cors_list(raw: Optional[str]) -> list[str]:
-    # None/"" -> no list; caller will apply sensible defaults
-    if not raw or not raw.strip():
-        return []
-    s = raw.strip()
-    if s.startswith("["):
-        try:
-            arr = json.loads(s)
-            return [str(x).strip() for x in arr if str(x).strip()]
-        except Exception:
-            pass
-    return [p.strip() for p in s.split(",") if p.strip()]
-
 # --- Settings (pydantic-settings v2)
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PT_", case_sensitive=False)
@@ -181,24 +160,55 @@ class Settings(BaseSettings):
     }
 
 settings = Settings()
-CORS_ORIGINS = _parse_cors_list(settings.cors_origins_raw)
 
-# --- Redis client (text mode)
+# ---- CORS allowlist (build before app.add_middleware) ----
+def _parse_cors_list(raw: Optional[str]) -> list[str]:
+    # None/"" -> []; JSON array or comma-separated accepted
+    if not raw or not raw.strip():
+        return []
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            arr = json.loads(s)
+            return [str(x).strip() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+CORS_ORIGINS = _parse_cors_list(settings.cors_origins_raw)
+DEFAULT_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://pathpanda.io",
+    "https://pathpanda.netlify.app",
+]
+ALLOWED_ORIGINS = sorted(set(CORS_ORIGINS or DEFAULT_ORIGINS))
+
+# --- Create app (must exist before adding middleware/mounts) ---
+app = FastAPI(
+    title="PredictiveTwin API",
+    version="1.2.1",
+    docs_url="/api-docs",
+    redoc_url=None,
+    redirect_slashes=False,
+)
+
+# --- Redis client (text mode) ---
 REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
 
-# --- CORS (once)
+# --- CORS middleware (after app is created, before routes) ---
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     # Allow Netlify preview subdomains like https://deploy-preview-123--pathpanda.netlify.app
     allow_origin_regex=r"https://.*\.netlify\.app$",
-    allow_credentials=False,  # set True only if you use cookies/sessions
-    allow_methods=["GET", "POST", "OPTIONS"],  # custom header triggers preflight
+    allow_credentials=False,  # flip True only if you actually use cookies/sessions
+    allow_methods=["GET", "POST", "OPTIONS"],  # custom headers trigger preflight
     allow_headers=["Content-Type", "Accept", "X-API-Key", "Authorization"],
     max_age=86400,  # cache preflight for a day
 )
 
-# Optional static frontend (cross-platform; avoids Windows path)
+# --- Optional static frontend (mount after CORS so it inherits it) ---
 # Set PT_STATIC_DIR in Render if you want to serve your built frontend.
 STATIC_DIR = os.getenv("PT_STATIC_DIR", "frontend/dist")
 if os.path.isdir(STATIC_DIR):
@@ -206,7 +216,7 @@ if os.path.isdir(STATIC_DIR):
     app.mount("/app", StaticFiles(directory=STATIC_DIR, html=True), name="app")
     logger.info(f"Mounted static frontend from {STATIC_DIR} at /app")
 
-# --- API key gate (once)
+# --- API key gate (header OR query) ---
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 api_key_query  = APIKeyQuery(name="api_key", auto_error=False)
 PT_API_KEY = os.getenv("PT_API_KEY", "dev-local")
@@ -220,13 +230,14 @@ async def verify_api_key(
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
     return supplied
 
-# --- optional track-record router (guarded so missing file won't crash deploy)
+# --- optional track-record router (guarded so missing file won't crash deploy) ---
 try:
     from .track_record import router as track_router  # type: ignore
     app.include_router(track_router, prefix="/track")
     logger.info("Track-record routes enabled at /track")
 except Exception as e:
     logger.warning(f"Track-record routes disabled: {e}")
+
 
 # --- RL constants (single source of truth)
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
