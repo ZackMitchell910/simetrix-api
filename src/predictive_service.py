@@ -121,7 +121,7 @@ class RunState(BaseModel):
     progress: float = 0.0
     error: Optional[str] = None
     artifact: Optional[Dict] = None
-    
+
 # ----------------- helpers / config -----------------
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     s = os.getenv(name, "")
@@ -148,14 +148,14 @@ async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
 
 def _parse_cors_list(raw: Optional[str]) -> list[str]:
-    # Accept: None/"" -> ["*"], JSON array string, or comma-separated string
-    if raw is None or raw.strip() == "":
-        return ["*"]
+    # None/"" -> no list; caller will apply sensible defaults
+    if not raw or not raw.strip():
+        return []
     s = raw.strip()
     if s.startswith("["):
         try:
             arr = json.loads(s)
-            return [str(x).strip() for x in arr]
+            return [str(x).strip() for x in arr if str(x).strip()]
         except Exception:
             pass
     return [p.strip() for p in s.split(",") if p.strip()]
@@ -189,10 +189,13 @@ REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
 # --- CORS (once)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    # Allow Netlify preview subdomains like https://deploy-preview-123--pathpanda.netlify.app
+    allow_origin_regex=r"https://.*\.netlify\.app$",
+    allow_credentials=False,  # set True only if you use cookies/sessions
+    allow_methods=["GET", "POST", "OPTIONS"],  # custom header triggers preflight
+    allow_headers=["Content-Type", "Accept", "X-API-Key", "Authorization"],
+    max_age=86400,  # cache preflight for a day
 )
 
 # Optional static frontend (cross-platform; avoids Windows path)
@@ -835,6 +838,13 @@ async def metrics_rollup(_api_key: str = Depends(verify_api_key), day: Optional[
     con.close()
     return {"status": "ok", "date": d.isoformat(), "rows_upserted": int(n)}
 
+# New endpoint for accuracy statements
+@app.get("/accuracy-statements")
+def get_accuracy_statements(limit: int = Query(50, ge=1, le=200)):
+    from .feature_store import generate_accuracy_statements
+    con = get_con()  # Assuming get_con from feature_store
+    statements = generate_accuracy_statements(limit=limit)
+    return {"statements": statements}
 
 @app.get("/config")
 async def config():
