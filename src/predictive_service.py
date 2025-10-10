@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import httpx
 
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader, APIKeyQuery
 from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
@@ -843,8 +843,8 @@ async def metrics_rollup(_api_key: str = Depends(verify_api_key), day: Optional[
     Run daily metrics rollup for predictions joined with outcomes.
     Optional: ?day=YYYY-MM-DD (defaults to today).
     """
-    d = _dt.date.fromisoformat(day) if day else _dt.date.today()
-    con = _fs_connect()
+    d = date.fromisoformat(day) if day else date.today()
+    con = fs_connect()
     n = _rollup(con, day=d)
     con.close()
     return {"status": "ok", "date": d.isoformat(), "rows_upserted": int(n)}
