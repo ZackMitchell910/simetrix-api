@@ -157,7 +157,10 @@ try:
     from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
 except Exception:
     from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome  # type: ignore
-
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("src.predictive_service:app", host="0.0.0.0", port=port, log_level="info")
 # --- logging / app (single instance)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
