@@ -27,9 +27,8 @@ stable-baselines3==2.3.0
 torch>=2.3,<3            # SB3 needs PyTorch
 
 # --- TensorFlow (CPU builds)
-tensorflow-intel==2.15.0; platform_system == "Windows"
-tensorflow==2.15.0; platform_system != "Windows"
-
+# tensorflow-intel==2.15.0  # Windows-only; comment out for Linux deployment
+tensorflow==2.20.0
 # --- Quantum
 qiskit==1.2.4
 qiskit-aer>=0.15,<0.16
