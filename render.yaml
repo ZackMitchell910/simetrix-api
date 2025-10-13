@@ -1,0 +1,105 @@
+services:
+  # -------------------- WEB API --------------------
+  - type: web
+    name: pathpanda-api
+    env: python
+    region: oregon
+    plan: starter
+    buildCommand: |
+      pip install -U pip
+      pip install -r requirements.txt
+    startCommand: uvicorn src.predictive_service:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # --- REQUIRED SECRETS (set in Render dashboard after creating the Blueprint) ---
+      - key: PT_API_KEY            # your app auth for protected routes
+        sync: false
+      - key: PT_POLYGON_KEY        # your Polygon key
+        sync: false
+      - key: XAI_API_KEY           # your xAI key
+        sync: false
+      - key: REDIS_URL             # a Render/Upstash Redis URL
+        sync: false
+
+      # --- LLM model (can keep default) ---
+      - key: XAI_MODEL
+        value: grok-4-latest
+
+      # --- Runtime tuning (gentle by default) ---
+      - key: PT_FREE_MODE
+        value: "0"
+      - key: PT_QS_TASKS
+        value: "12"
+      - key: PT_QS_JITTER_MS
+        value: "250"
+      - key: PT_POLY_CONC
+        value: "2"
+      - key: PT_BACKFILL_PAUSE_S
+        value: "2.5"
+      - key: PT_QUANT_BUDGET_PER_DAY
+        value: "6"
+      - key: PT_WARM_BUDGET
+        value: "2"
+
+      # Optional: widen variety a bit
+      - key: PT_DAILY_SEED_K
+        value: "20"
+      - key: PT_DAILY_RANK_K
+        value: "5"
+
+      # Optional: expose top-N in /quant/daily/today
+      # - key: PT_TOP_N
+      #   value: "5"
+      # - key: PT_EXPOSE_FINALISTS
+      #   value: "1"
+
+      # Optional: persist DuckDB on a mounted disk (if your code reads PT_DUCKDB_PATH)
+      # - key: PT_DUCKDB_PATH
+      #   value: /var/data/pathpanda.duckdb
+
+    # Optional: attach a small persistent disk if you want DuckDB to survive deploys
+    # disks:
+    #   - name: duckdb
+    #     mountPath: /var/data
+    #     sizeGB: 1
+
+  # -------------------- CRON: warm/health (UTC) --------------------
+  - type: cron
+    name: warm-and-health
+    schedule: "5 12 * * 1-5"   # weekdays 12:05 UTC (~pre-market warm)
+    envVars:
+      - key: SERVICE_URL       # set to your web's public URL after first deploy
+        sync: false
+    startCommand: |
+      curl -fsS "https://$SERVICE_URL/health" >/dev/null
+      curl -fsS "https://$SERVICE_URL/quant/daily/today" >/dev/null
+
+  # -------------------- CRON: premarket ingest+run (UTC) --------------------
+  - type: cron
+    name: premarket-ingest-and-run
+    schedule: "20 13 * * 1-5"  # ~10 min before US open, in UTC
+    envVars:
+      - key: SERVICE_URL
+        sync: false
+      - key: PT_API_KEY
+        sync: false
+    startCommand: |
+      Y=$(date -u -d "yesterday" +%F || date -v-1d +%F)
+      curl -fsS -X POST "https://$SERVICE_URL/admin/ingest/daily?d=$Y" -H "X-API-Key: $PT_API_KEY"
+      curl -fsS -X POST "https://$SERVICE_URL/quant/daily/run?horizon=30" -H "X-API-Key: $PT_API_KEY"
+
+  # -------------------- CRON: after-close ingest+maint (UTC) --------------------
+  - type: cron
+    name: after-close-ingest-and-train
+    schedule: "10 21 * * 1-5"  # ~10 min after US close, in UTC
+    envVars:
+      - key: SERVICE_URL
+        sync: false
+      - key: PT_API_KEY
+        sync: false
+    startCommand: |
+      T=$(date -u +%F)
+      curl -fsS -X POST "https://$SERVICE_URL/admin/ingest/daily?d=$T" -H "X-API-Key: $PT_API_KEY"
+      # optional maintenance endpoint if you have it (labels/learners etc.)
+      curl -fsS -X POST "https://$SERVICE_URL/admin/cron/daily" -H "X-API-Key: $PT_API_KEY" || true
