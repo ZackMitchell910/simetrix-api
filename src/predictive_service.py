@@ -3510,58 +3510,60 @@ async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
 
     return {"status": "ok", "models_trained": 4}
 
+load_gymnasium()
+if gym is not None:
+    class StockEnv(gym.Env):  # type: ignore[attr-defined]
+        """Simple price-following env."""
+        metadata = {"render_modes": []}
 
-class StockEnv(gym.Env):  # type: ignore[attr-defined]
-    """Simple price-following env."""
-    metadata = {"render_modes": []}
+        def __init__(self, prices, window_len: int = 100):
+            super().__init__()
+            px = np.asarray(prices, dtype=np.float32)
+            if px.ndim != 1 or px.size < 2:
+                raise ValueError("prices must be a 1D array with length >= 2")
+            self.prices = px
+            self.window_len = int(window_len)
+            self.observation_space = gym.spaces.Box(  # type: ignore[attr-defined]
+                low=-np.inf, high=np.inf, shape=(self.window_len,), dtype=np.float32
+            )
+            self.action_space = gym.spaces.Discrete(3)  # type: ignore[attr-defined]
+            self.current_step = 0
+            self.max_steps = len(self.prices) - 2
 
-    def __init__(self, prices, window_len: int = 100):
-        super().__init__()
-        px = np.asarray(prices, dtype=np.float32)
-        if px.ndim != 1 or px.size < 2:
-            raise ValueError("prices must be a 1D array with length >= 2")
-        self.prices = px
-        self.window_len = int(window_len)
-        self.observation_space = gym.spaces.Box(  # type: ignore[attr-defined]
-            low=-np.inf, high=np.inf, shape=(self.window_len,), dtype=np.float32
-        )
-        self.action_space = gym.spaces.Discrete(3)  # type: ignore[attr-defined]
-        self.current_step = 0
-        self.max_steps = len(self.prices) - 2
+        def reset(self, *, seed=None, options=None):
+            super().reset(seed=seed)
+            self.current_step = 0
+            return self._get_obs(), {}
 
-    def reset(self, *, seed=None, options=None):
-        super().reset(seed=seed)
-        self.current_step = 0
-        return self._get_obs(), {}
+        def _get_obs(self):
+            end = self.current_step + 1
+            start = max(0, end - self.window_len)
+            window = self.prices[start:end]
+            if window.size < self.window_len:
+                pad = np.full(self.window_len - window.size, window[0], dtype=np.float32)
+                window = np.concatenate([pad, window])
+            base = window[0] if window[0] != 0 else 1.0
+            return (window / base).astype(np.float32)
 
-    def _get_obs(self):
-        end = self.current_step + 1
-        start = max(0, end - self.window_len)
-        window = self.prices[start:end]
-        if window.size < self.window_len:
-            pad = np.full(self.window_len - window.size, window[0], dtype=np.float32)
-            window = np.concatenate([pad, window])
-        base = window[0] if window[0] != 0 else 1.0
-        return (window / base).astype(np.float32)
-
-    def step(self, action):
-        # map discrete -> position {-1, 0, +1}
-        if action == 0:
-            a = -1.0
-        elif action == 1:
-            a = 0.0
-        else:
-            a = 1.0
-        prev_price = float(self.prices[self.current_step])
-        self.current_step += 1
-        curr_price = float(self.prices[self.current_step])
-        pct_change = 0.0 if prev_price == 0 else (curr_price - prev_price) / prev_price
-        reward = float(a * pct_change)
-        terminated = self.current_step >= self.max_steps
-        truncated = False
-        obs = self._get_obs()
-        info = {}
-        return obs, reward, terminated, truncated, info
+        def step(self, action):
+            if action == 0:
+                a = -1.0
+            elif action == 1:
+                a = 0.0
+            else:
+                a = 1.0
+            prev_price = float(self.prices[self.current_step])
+            self.current_step += 1
+            curr_price = float(self.prices[self.current_step])
+            pct_change = 0.0 if prev_price == 0 else (curr_price - prev_price) / prev_price
+            reward = float(a * pct_change)
+            terminated = self.current_step >= self.max_steps
+            truncated = False
+            obs = self._get_obs()
+            info = {}
+            return obs, reward, terminated, truncated, info
+else:
+    StockEnv = None
 
 
 class OnlineLearnRequest(BaseModel):
