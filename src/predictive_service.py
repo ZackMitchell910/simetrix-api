@@ -47,6 +47,7 @@ def load_arima():
             ARIMA_AVAILABLE = True
         except Exception:
             ARIMA_AVAILABLE = False
+load_arima()
 
 def load_tensorflow():
     global TF_AVAILABLE, load_model, Sequential, LSTM, GRU, Dense
@@ -63,6 +64,7 @@ def load_tensorflow():
             TF_AVAILABLE = True
         except Exception:
             TF_AVAILABLE = False
+load_tensorflow()
 
 def load_gymnasium():
     global gym
@@ -72,6 +74,7 @@ def load_gymnasium():
             gym = _gym
         except Exception:
             gym = None
+load_gymnasium()
 
 def load_stable_baselines3():
     global SB3_AVAILABLE, DQN
@@ -82,7 +85,12 @@ def load_stable_baselines3():
             SB3_AVAILABLE = True
         except Exception:
             SB3_AVAILABLE = False
-
+load_stable_baselines3() 
+if SB3_AVAILABLE:
+    pass
+else:
+    logging.warning("Stable Baselines3 not available; RL training disabled.")
+load_stable_baselines3()
 # Globals for models from learners
 ENSEMBLE = None
 EXP_W = None
@@ -93,7 +101,7 @@ def load_learners():
         from .learners import OnlineLinear, ExpWeights
         ENSEMBLE = OnlineLinear(lr=0.05, l2=1e-4)
         EXP_W = ExpWeights(eta=2.0)
-
+load_learners()
 # --- local modules (feature store with back-compat)
 from .feature_store import connect as fs_connect
 from .feature_store import get_recent_coverage, get_recent_mdape
@@ -1911,7 +1919,6 @@ async def simulate_stream(run_id: str, _ok: bool = Depends(require_key)):  # was
         headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"},
     )
 
-
 # ===== Bulk EOD ingest to DuckDB (stocks + crypto) ============================
 def _poly_to_app_symbol(s: str) -> str:
     # "X:BTCUSD" -> "BTC-USD"; "BTCUSD" -> "BTC-USD"; equities unchanged
@@ -3510,7 +3517,6 @@ async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
 
     return {"status": "ok", "models_trained": 4}
 
-load_gymnasium()
 if gym is not None:
     class StockEnv(gym.Env):  # type: ignore[attr-defined]
         """Simple price-following env."""
@@ -3793,8 +3799,10 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
 
 @app.get("/models")
 async def models(_api_key: str = Depends(require_key)):
-    load_learners()  
-    load_tensorflow()  
+    load_learners()
+    load_tensorflow()
+    if not TF_AVAILABLE:
+        raise HTTPException(status_code=500, detail="TensorFlow not available")
     return {"models": await _list_models()}
 
 
