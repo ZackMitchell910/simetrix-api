@@ -21,43 +21,78 @@ from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 from secrets import token_urlsafe
-# (optional libs guarded)
-try:
-    from statsmodels.tsa.arima.model import ARIMA
-    ARIMA_AVAILABLE = True
-except Exception:
-    ARIMA_AVAILABLE = False
+
+# Lazy loaders for optional libraries
+ARIMA_AVAILABLE = False
+ARIMA = None
 
 TF_AVAILABLE = False
-try:
-    from tensorflow.keras.models import load_model as _tf_load_model
-    from tensorflow.keras.models import Sequential as _TF_Sequential
-    from tensorflow.keras.layers import LSTM as _TF_LSTM, GRU as _TF_GRU, Dense as _TF_Dense
-    TF_AVAILABLE = True
-except Exception:
-    def _missing_tf(*_a, **_k):
-        raise ImportError("TensorFlow is not installed on the server.")
-    _tf_load_model = _missing_tf; _TF_Sequential = _missing_tf
-    _TF_LSTM = _missing_tf; _TF_GRU = _missing_tf; _TF_Dense = _missing_tf
+load_model = None
+Sequential = None
+LSTM = None
+GRU = None
+Dense = None
 
-# public aliases
-load_model = _tf_load_model
-Sequential = _TF_Sequential
-LSTM = _TF_LSTM
-GRU = _TF_GRU
-Dense = _TF_Dense
+gym = None
 
-try:
-    import gymnasium as gym  # noqa
-except Exception:
-    gym = None
+SB3_AVAILABLE = False
+DQN = None
 
-try:
-    from stable_baselines3 import DQN  # noqa
-    SB3_AVAILABLE = True
-except Exception:
-    DQN = None
-    SB3_AVAILABLE = False
+def load_arima():
+    global ARIMA_AVAILABLE, ARIMA
+    if not ARIMA_AVAILABLE:
+        try:
+            from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+            ARIMA = _ARIMA
+            ARIMA_AVAILABLE = True
+        except Exception:
+            ARIMA_AVAILABLE = False
+
+def load_tensorflow():
+    global TF_AVAILABLE, load_model, Sequential, LSTM, GRU, Dense
+    if not TF_AVAILABLE:
+        try:
+            from tensorflow.keras.models import load_model as _tf_load_model
+            from tensorflow.keras.models import Sequential as _TF_Sequential
+            from tensorflow.keras.layers import LSTM as _TF_LSTM, GRU as _TF_GRU, Dense as _TF_Dense
+            load_model = _tf_load_model
+            Sequential = _TF_Sequential
+            LSTM = _TF_LSTM
+            GRU = _TF_GRU
+            Dense = _TF_Dense
+            TF_AVAILABLE = True
+        except Exception:
+            TF_AVAILABLE = False
+
+def load_gymnasium():
+    global gym
+    if gym is None:
+        try:
+            import gymnasium as _gym
+            gym = _gym
+        except Exception:
+            gym = None
+
+def load_stable_baselines3():
+    global SB3_AVAILABLE, DQN
+    if not SB3_AVAILABLE:
+        try:
+            from stable_baselines3 import DQN as _DQN
+            DQN = _DQN
+            SB3_AVAILABLE = True
+        except Exception:
+            SB3_AVAILABLE = False
+
+# Globals for models from learners
+ENSEMBLE = None
+EXP_W = None
+
+def load_learners():
+    global ENSEMBLE, EXP_W
+    if ENSEMBLE is None:
+        from .learners import OnlineLinear, ExpWeights
+        ENSEMBLE = OnlineLinear(lr=0.05, l2=1e-4)
+        EXP_W = ExpWeights(eta=2.0)
 
 # --- local modules (feature store with back-compat)
 from .feature_store import connect as fs_connect
@@ -119,7 +154,6 @@ except Exception:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
 logger = logging.getLogger(__name__)
-
 # ----------------- helpers / config -----------------
 async def llm_summarize_async(
     prompt_user: dict,
@@ -216,7 +250,6 @@ class SGDOnline:
         grad[1:] += self.l2 * self.w[1:]
         self.w -= self.lr * grad
 
-
 class EW:
     """
     Exponential Weights combiner for ensembling probabilities.
@@ -260,12 +293,14 @@ def _poly_key() -> str:
         return (settings.polygon_key or "").strip()
     except Exception:
         return ""
+
 def _poly_crypto_to_app(sym: str) -> str:
     # "X:BTCUSD" -> "BTC-USD"
     s = (sym or "").upper()
     if s.startswith("X:") and s.endswith("USD"):
         return f"{s[2:-3]}-USD"
     return s
+
 async def ingest_grouped_daily(d: date):
     """
     Ingest Polygon grouped daily bars for US stocks and global crypto for a given UTC date.
@@ -417,6 +452,7 @@ async def maybe_require_key(request: Request):
 
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
+
 TOP_STOCKS = [
     'NVDA', 'MSFT', 'AAPL', 'GOOGL', 'AMZN', 'META', 'AVGO', 'TSLA', 'TSM', 'BRK.B',
     'ORCL', 'JPM', 'WMT', 'LLY', 'V', 'NFLX', 'MA', 'XOM', 'JNJ', 'PLTR',
@@ -462,35 +498,51 @@ def _norm_crypto_symbol(s: str) -> str:
 # --- Settings (pydantic-settings v2)
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="PT_", case_sensitive=False)
+
+    # API keys / upstreams
     polygon_key: Optional[str] = Field(default_factory=_poly_key)
     news_api_key: Optional[str] = None
+
+    # Infra & app
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
     cors_origins_raw: Optional[str] = None
+
+    # Cookies
     cookie_name: str = Field("pt_app", validation_alias="PT_COOKIE_NAME")
     cookie_max_age: int = Field(60 * 60 * 24, validation_alias="PT_COOKIE_MAX_AGE")  # 1 day
     cookie_secure: bool = Field(default_factory=lambda: bool(os.getenv("RENDER")) or os.getenv("ENV","dev") == "prod")
+
+    # Limits / budgets
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
     horizon_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_HORIZON_DAYS_MAX", "3650")))
     lookback_days_max: int = Field(default_factory=lambda: int(os.getenv("PT_LOOKBACK_DAYS_MAX", str(365*10))))
     pathday_budget_max: int = Field(default_factory=lambda: int(os.getenv("PT_PATHDAY_BUDGET_MAX", "500000")))
     max_active_runs: int = Field(default_factory=lambda: int(os.getenv("PT_MAX_ACTIVE_RUNS", "2")))
     run_ttl_seconds: int = Field(default_factory=lambda: int(os.getenv("PT_RUN_TTL_SECONDS", "3600")))
+
+    # Defaults for /simulate convenience
     predictive_defaults: dict = {
         "X:BTCUSD": {"horizon_days": 365, "n_paths": 10000, "lookback_preset": "3y"},
-        "NVDA": {"horizon_days": 30, "n_paths": 5000, "lookback_preset": "180d"},
-        }
-    watchlist_equities: str = Field(
-        ",".join(TOP_STOCKS),
-        validation_alias="PT_WATCHLIST_EQUITIES",
-    )
+        "NVDA":     {"horizon_days": 30,  "n_paths": 5000,  "lookback_preset": "180d"},
+    }
+
+    # Watchlists (strings → comma lists)
+    watchlist_equities: str = Field(",".join(TOP_STOCKS), validation_alias="PT_WATCHLIST_EQUITIES")
     watchlist_cryptos: str = Field(
         ",".join(_norm_crypto_symbol(x) for x in TOP_CRYPTOS),
         validation_alias="PT_WATCHLIST_CRYPTOS",
     )
+
+    # Feature flags
     shortlist_disable: bool = Field(False, validation_alias="PT_SHORTLIST_DISABLE")
 
+    # Access control (optional)
+    open_access: bool = Field(default_factory=lambda: os.getenv("PT_OPEN_ACCESS", "1") == "1")
+    pt_api_key: Optional[str] = None
 
 settings = Settings()
+
+# Canonical watchlist sets derived from settings
 WL_EQ = sorted({t.strip().upper() for t in settings.watchlist_equities.split(",") if t.strip()})[:200]
 WL_CR = sorted({_norm_crypto_symbol(t) for t in settings.watchlist_cryptos.split(",") if t.strip()})[:200]
 
@@ -3586,6 +3638,8 @@ async def learn_online(req: OnlineLearnRequest, _api_key: str = Depends(require_
 
 @app.post("/predict")
 async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
+    load_learners()
+    load_tensorflow()
     """
     Returns an ensemble probability that the next move is up, logs the prediction to DuckDB,
     and mirrors the row into the PathPanda Feature Store so dashboards/metrics see it.
@@ -3737,12 +3791,13 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
 
 @app.get("/models")
 async def models(_api_key: str = Depends(require_key)):
+    load_learners()  
+    load_tensorflow()  
     return {"models": await _list_models()}
 
 
 # ---- Optional static hosting (disabled by default) ----
-# If you want the API to also serve your built frontend, set PT_FRONTEND_DIR
-# to the absolute path of the SPA build directory (the one with index.html).
+
 FRONTEND_DIR = os.getenv("PT_FRONTEND_DIR", "").strip()
 # ----------------- Health -----------------
 @app.get("/health")
