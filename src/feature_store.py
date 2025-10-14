@@ -64,6 +64,51 @@ CREATE TABLE IF NOT EXISTS metrics_daily (
 CREATE INDEX IF NOT EXISTS idx_pred_symbol_time ON predictions(symbol, issued_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pred_model_time  ON predictions(model_id, issued_at DESC);
 CREATE INDEX IF NOT EXISTS idx_out_symbol_time  ON outcomes(symbol, realized_at DESC);
+
+CREATE TABLE IF NOT EXISTS mc_params (
+  symbol         TEXT PRIMARY KEY,
+  mu             DOUBLE,
+  sigma          DOUBLE,
+  lookback_mu    INTEGER,
+  lookback_sigma INTEGER,
+  updated_at     TIMESTAMP DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS mc_metrics (
+  as_of          DATE,
+  symbol         TEXT,
+  horizon_days   INTEGER,
+  mape           DOUBLE,
+  mdape          DOUBLE,
+  n              INTEGER,
+  mu             DOUBLE,
+  sigma          DOUBLE,
+  n_paths        INTEGER,
+  lookback_mu    INTEGER,
+  lookback_sigma INTEGER,
+  seeded_by      TEXT,
+  PRIMARY KEY (as_of, symbol, horizon_days)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fs_mc_metrics_symbol_time
+  ON mc_metrics(symbol, as_of DESC, horizon_days);
+
+CREATE SEQUENCE IF NOT EXISTS ingest_log_id_seq START 1;
+
+CREATE TABLE IF NOT EXISTS ingest_log (
+  id           BIGINT PRIMARY KEY DEFAULT nextval('ingest_log_id_seq'),
+  as_of        DATE NOT NULL,
+  source       TEXT NOT NULL,
+  row_count    INTEGER NOT NULL,
+  sha256       TEXT NOT NULL,
+  duration_ms  INTEGER,
+  ok           BOOLEAN NOT NULL DEFAULT TRUE,
+  error        TEXT,
+  created_at   TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_ingest_log_asof
+  ON ingest_log(as_of DESC, id DESC);
 """
 
 # ---------- Connection / bootstrap ----------
@@ -84,7 +129,80 @@ _PRED_COLS = (
     "run_id","model_id","symbol","issued_at","horizon_days",
     "yhat_mean","prob_up","q05","q50","q95","uncertainty","features_ref"
 )
+def upsert_mc_params(con, symbol: str, mu: float, sigma: float,
+                     lookback_mu: int, lookback_sigma: int) -> None:
+    con.execute("""
+        INSERT OR REPLACE INTO mc_params
+        (symbol, mu, sigma, lookback_mu, lookback_sigma, updated_at)
+        VALUES (?, ?, ?, ?, ?, now())
+    """, (symbol, mu, sigma, lookback_mu, lookback_sigma))
 
+def insert_mc_metrics(con, rows: list[tuple]) -> int:
+    """
+    rows: [(as_of, symbol, horizon_days, mape, mdape, n, mu, sigma, n_paths,
+            lookback_mu, lookback_sigma, seeded_by), ...]
+    """
+    con.executemany("""
+        INSERT OR REPLACE INTO mc_metrics
+        (as_of, symbol, horizon_days, mape, mdape, n, mu, sigma, n_paths,
+         lookback_mu, lookback_sigma, seeded_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, rows)
+    return con.rowcount
+
+def log_ingest_event(
+    con,
+    *,
+    as_of: dt.date | str,
+    source: str,
+    row_count: int,
+    sha256: str,
+    duration_ms: int | None = None,
+    ok: bool = True,
+    error: str | None = None,
+) -> None:
+    as_of_val = str(as_of)
+    con.execute(
+        """
+        INSERT INTO ingest_log (as_of, source, row_count, sha256, duration_ms, ok, error)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (as_of_val, source, int(row_count), sha256, duration_ms, bool(ok), error),
+    )
+
+def get_mc_metrics(con, symbol: str | None = None, limit: int = 200) -> list[dict]:
+    where = "WHERE symbol = ?" if symbol else ""
+    args  = [symbol] if symbol else []
+    rs = con.execute(f"""
+        SELECT as_of, symbol, horizon_days, mape, mdape, n, mu, sigma, n_paths,
+               lookback_mu, lookback_sigma, seeded_by
+        FROM mc_metrics
+        {where}
+        ORDER BY as_of DESC, horizon_days
+        LIMIT {int(max(1, min(limit, 1000)))}
+    """, args).fetchall()
+    cols = ["as_of","symbol","horizon_days","mape","mdape","n","mu","sigma",
+            "n_paths","lookback_mu","lookback_sigma","seeded_by"]
+    return [dict(zip(cols, r)) for r in rs]
+def get_latest_mc_metric(
+    con: duckdb.DuckDBPyConnection,
+    symbol: str,
+    horizon_days: int,
+) -> dict | None:
+    row = con.execute(
+        """
+        SELECT as_of, mape, mdape, n, mu, sigma, n_paths, lookback_mu, lookback_sigma, seeded_by
+        FROM mc_metrics
+        WHERE symbol = ? AND horizon_days = ?
+        ORDER BY as_of DESC
+        LIMIT 1
+        """,
+        [symbol.upper(), int(horizon_days)],
+    ).fetchone()
+    if not row:
+        return None
+    cols = ["as_of", "mape", "mdape", "n", "mu", "sigma", "n_paths", "lookback_mu", "lookback_sigma", "seeded_by"]
+    return dict(zip(cols, row))
 def _pred_tuple(pred: Mapping) -> tuple:
     return tuple(pred.get(c) for c in _PRED_COLS)
 

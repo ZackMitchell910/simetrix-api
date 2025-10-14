@@ -43,8 +43,34 @@ CREATE TABLE IF NOT EXISTS metrics_daily (
   n_preds INTEGER,
   PRIMARY KEY (date, model_id, symbol)
 );
+CREATE TABLE IF NOT EXISTS mc_params (
+  symbol         TEXT PRIMARY KEY,
+  mu             DOUBLE,
+  sigma          DOUBLE,
+  lookback_mu    INTEGER,
+  lookback_sigma INTEGER,
+  updated_at     TIMESTAMP
+);
 
+CREATE TABLE IF NOT EXISTS mc_metrics (
+  as_of         DATE,
+  symbol        TEXT,
+  horizon_days  INTEGER,
+  mape          DOUBLE,
+  mdape         DOUBLE,
+  n             INTEGER,
+  mu            DOUBLE,
+  sigma         DOUBLE,
+  n_paths       INTEGER,
+  lookback_mu   INTEGER,
+  lookback_sigma INTEGER,
+  seeded_by     TEXT,
+  PRIMARY KEY (as_of, symbol, horizon_days)
+);
 -- Helpful indexes for fast windows & lookups
+
+CREATE INDEX IF NOT EXISTS idx_mc_metrics_sym_time
+  ON mc_metrics(symbol, as_of DESC, horizon_days);
 CREATE INDEX IF NOT EXISTS idx_predictions_symbol_ts ON predictions(symbol, ts);
 CREATE INDEX IF NOT EXISTS idx_outcomes_predid ON outcomes(pred_id);
 """

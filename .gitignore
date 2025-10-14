@@ -39,3 +39,4 @@ render.yaml.local
 .env
 .env.*
 src/.env.local
+node_modules/

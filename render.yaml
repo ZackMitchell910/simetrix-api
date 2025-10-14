@@ -30,11 +30,15 @@ services:
       - key: PT_FREE_MODE
         value: "0"
       - key: PT_QS_TASKS
-        value: "12"
+        value: "6"
       - key: PT_QS_JITTER_MS
-        value: "250"
+        value: "350"
       - key: PT_POLY_CONC
-        value: "2"
+        value: "1"
+      - key: PT_LLM_RETRY_ATTEMPTS
+        value: "3"
+      - key: PT_LLM_RETRY_BACKOFF
+        value: "1.5"
       - key: PT_BACKFILL_PAUSE_S
         value: "2.5"
       - key: PT_QUANT_BUDGET_PER_DAY
@@ -87,7 +91,7 @@ services:
     startCommand: |
       Y=$(date -u -d "yesterday" +%F || date -v-1d +%F)
       curl -fsS -X POST "https://$SERVICE_URL/admin/ingest/daily?d=$Y" -H "X-API-Key: $PT_API_KEY"
-      curl -fsS -X POST "https://$SERVICE_URL/quant/daily/run?horizon=30" -H "X-API-Key: $PT_API_KEY"
+      curl -fsS -X POST "https://$SERVICE_URL/quant/daily/run?horizon=14" -H "X-API-Key: $PT_API_KEY"
 
   # -------------------- CRON: after-close ingest+maint (UTC) --------------------
   - type: cron

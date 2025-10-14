@@ -1,12 +1,13 @@
 # --- stdlib
 from __future__ import annotations
-import os, json, asyncio, logging, math, pickle
+import os, json, asyncio, logging, math, pickle, shutil
 from datetime import datetime, timedelta, date, timezone
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 from typing import List, Optional, Any, Callable, Dict, Literal, Sequence, Tuple
 from contextlib import asynccontextmanager
 import time, inspect
-
+import hmac, hashlib, base64
 # --- third-party
 from dotenv import load_dotenv; load_dotenv()
 import numpy as np
@@ -14,18 +15,44 @@ import pandas as pd
 import random
 import httpx
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, Query, Header, Body, Request, Response
+from fastapi import (
+    FastAPI, Depends, HTTPException, WebSocket, Query, Header, Body,
+    Request, Response, Security, status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes
 from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 from secrets import token_urlsafe
+from starlette.middleware.base import BaseHTTPMiddleware
+from jose import JWTError, jwt
+from src.auth_service import authenticate, upsert_user, all_scopes_for, get_user, UserKey
+from src.db.migrations import run_all as run_all_migrations
+from src.observability import install_observability, log_json, job_ok, job_fail
+from src.quotas import enforce_limits, rate_limit, quota_consume, BASE_LIMIT_PER_MIN, SIM_LIMIT_PER_MIN, CRON_LIMIT_PER_MIN, PLAN_DEFAULT
+from src.observability import get_recent_logs
+from src.quotas import (
+    usage_today, usage_today_for_caller,
+    get_plan_for_key, set_plan_for_key,
+    SIM_LIMIT_PER_MIN, BASE_LIMIT_PER_MIN, CRON_LIMIT_PER_MIN,
+)
+from src.infra.backups import create_duckdb_backup
+from src.sim_validation import rollforward_validation
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("predictive")
-logger = logging.getLogger(__name__)
+
+START_TIME = datetime.now(timezone.utc)
+BACKUP_DIR = Path(os.getenv("PT_BACKUP_DIR", "backups"))
+JWT_ALGORITHM = "HS256"
+
+_loader_lock = asyncio.Lock()
+REDIS: Redis | None = None
+LS_WEBHOOK_SECRET = (os.getenv("LS_WEBHOOK_SECRET") or "").encode("utf-8")
+os.environ.setdefault("SERVICE_NAME", "simetrix-api")
 
 app = FastAPI(
     title="Simetrix API",
@@ -35,6 +62,219 @@ app = FastAPI(
     redirect_slashes=False,
 )
 APP = app  # back-compat if any decorator still uses APP
+SCOPES = {
+    "simulate": "Run and view simulations",
+    "admin": "Administrative operations",
+    "cron": "Scheduled automation hooks",
+}
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", scopes=SCOPES, auto_error=False)
+install_observability(app)
+class BaselineRateLimitMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        # Skip docs/metrics/health to avoid noise
+        p = request.url.path
+        if p.startswith("/metrics") or p.startswith("/health") or p.startswith("/status") or p.startswith("/api-docs"):
+            return await call_next(request)
+        # Admin can be handled per-endpoint; we still set a mild baseline
+        try:
+            rate_limit(REDIS, request, scope="base", limit_per_min=BASE_LIMIT_PER_MIN)
+        except HTTPException as e:
+            log_json("error", msg="rate_limit_block", scope="base", path=p, detail=e.detail)
+            return JSONResponse(status_code=e.status_code, content={"ok": False, "error": e.detail})
+        return await call_next(request)
+
+app.add_middleware(BaselineRateLimitMiddleware)
+# --- Response helpers ---
+def ok(data: Any | None = None, **extra: Any) -> dict:
+    payload: dict[str, Any] = {"ok": True}
+    if data is not None:
+        payload["data"] = data
+    if extra:
+        payload.update(extra)
+    return payload
+
+def fail(detail: str, status_code: int = status.HTTP_400_BAD_REQUEST, **extra: Any) -> JSONResponse:
+    content: dict[str, Any] = {"ok": False, "error": str(detail)}
+    if extra:
+        content.update(extra)
+    return JSONResponse(status_code=status_code, content=content)
+
+def _create_access_token(user: UserKey, scopes: Sequence[str]) -> str:
+    if user.id is None:
+        raise ValueError("User missing primary key")
+    issued_at = datetime.now(timezone.utc)
+    expires_at = issued_at + timedelta(minutes=int(settings.jwt_exp_minutes))
+    scope_list = sorted({s.strip() for s in scopes if s}) or ["simulate"]
+    payload = {
+        "sub": str(user.id),
+        "email": user.email,
+        "plan": user.plan,
+        "scopes": scope_list,
+        "iat": int(issued_at.timestamp()),
+        "exp": int(expires_at.timestamp()),
+    }
+    return jwt.encode(payload, settings.jwt_secret, algorithm=JWT_ALGORITHM)
+
+def _decode_token(token: str) -> dict:
+    try:
+        return jwt.decode(token, settings.jwt_secret, algorithms=[JWT_ALGORITHM])
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid access token") from exc
+
+async def _authenticate_bearer(request: Request, required_scopes: Sequence[str], token: str | None) -> UserKey:
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    payload = _decode_token(token)
+    sub = payload.get("sub")
+    if not sub:
+        raise HTTPException(status_code=401, detail="Token missing subject")
+    try:
+        user_id = int(sub)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid subject in token") from exc
+    user = get_user(user_id)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User inactive or missing")
+    token_scopes = payload.get("scopes") or []
+    missing = [scope for scope in required_scopes if scope not in token_scopes]
+    if missing:
+        raise HTTPException(status_code=403, detail=f"Missing scopes: {', '.join(missing)}")
+    request.state.caller_id = f"user:{user.id}"
+    request.state.plan = payload.get("plan") or user.plan or PLAN_DEFAULT
+    request.state.scopes = list(token_scopes)
+    request.state.user = user
+    request.state.auth_source = "oauth"
+    return user
+
+async def require_user(
+    request: Request,
+    security_scopes: SecurityScopes,
+    token: str | None = Depends(oauth2_scheme),
+) -> UserKey:
+    required = security_scopes.scopes or ["simulate"]
+    return await _authenticate_bearer(request, required, token)
+
+# --- Auth dependency (define BEFORE any route uses it)
+async def require_key(
+    request: Request,
+    security_scopes: SecurityScopes,
+    token: str | None = Depends(oauth2_scheme),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_pt_key: str | None  = Header(default=None, alias="x-pt-key"),
+    api_key: str | None   = Query(default=None),
+) -> bool:
+    required_scopes = security_scopes.scopes or ["simulate"]
+
+    if token:
+        await _authenticate_bearer(request, required_scopes, token)
+        return True
+
+    provided = (x_api_key or x_pt_key or api_key or "").strip()
+    expected = settings.pt_api_key or os.getenv("PT_API_KEY", "")
+    open_access = bool(getattr(settings, "open_access", True))
+
+    if provided:
+        if expected and provided != expected:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+        plan = get_plan_for_key(REDIS, provided) if REDIS else PLAN_DEFAULT
+        if asyncio.iscoroutine(plan):
+            try:
+                plan = await plan
+            except Exception:
+                plan = PLAN_DEFAULT
+        if isinstance(plan, bytes):
+            plan = plan.decode("utf-8", errors="ignore")
+        request.state.caller_id = f"key:{provided}"
+        request.state.plan = plan or PLAN_DEFAULT
+        request.state.scopes = ["simulate", "admin", "cron"]
+        request.state.user = None
+        request.state.auth_source = "api_key"
+        return True
+
+    if open_access and not any(scope in {"admin", "cron"} for scope in required_scopes):
+        host = request.client.host if request.client else "0.0.0.0"
+        request.state.caller_id = f"anon:{host}"
+        request.state.plan = PLAN_DEFAULT
+        request.state.scopes = ["simulate"]
+        request.state.user = None
+        request.state.auth_source = "open_access"
+        return True
+
+    raise HTTPException(status_code=401, detail="Invalid or missing credentials")
+@app.post("/auth/token", summary="Obtain an OAuth2 access token")
+async def issue_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    user = authenticate(form_data.username, form_data.password)
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+    allowed_scopes = set(all_scopes_for(user))
+    requested = set(form_data.scopes or [])
+    if requested and not requested.issubset(allowed_scopes):
+        raise HTTPException(status_code=403, detail="Requested scope not permitted for this user")
+    scopes = list(requested or (allowed_scopes or {"simulate"}))
+    token = _create_access_token(user, scopes)
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_in": int(settings.jwt_exp_minutes) * 60,
+        "scope": " ".join(scopes),
+    }
+
+@app.get("/auth/me", summary="Return current authenticated user context")
+async def auth_me(request: Request, user: UserKey = Security(require_user, scopes=["simulate"])):
+    granted = getattr(request.state, "scopes", [])
+    return {
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "plan": user.plan,
+            "scopes": list(all_scopes_for(user)),
+        },
+        "granted_scopes": list(granted),
+    }
+
+async def ensure_tf():
+    global TF_AVAILABLE
+    if TF_AVAILABLE:
+        return
+    async with _loader_lock:
+        if TF_AVAILABLE:
+            return
+        # run the heavy import without blocking the event loop
+        await asyncio.to_thread(load_tensorflow)
+
+async def ensure_sb3():
+    global SB3_AVAILABLE
+    if SB3_AVAILABLE:
+        return
+    async with _loader_lock:
+        if SB3_AVAILABLE:
+            return
+        await asyncio.to_thread(load_stable_baselines3)
+
+async def ensure_arima():
+    global ARIMA_AVAILABLE
+    if ARIMA_AVAILABLE:
+        return
+    async with _loader_lock:
+        if ARIMA_AVAILABLE:
+            return
+        await asyncio.to_thread(load_arima)
+@app.post("/admin/warm")
+async def warm(_ok: bool = Security(require_key, scopes=["admin"])):
+    await asyncio.gather(
+        ensure_tf(),
+        ensure_arima(),
+        # ensure_sb3(),  # include if you actually need RL on web node
+    )
+    return {"ok": True, "tf": TF_AVAILABLE, "arima": ARIMA_AVAILABLE, "sb3": SB3_AVAILABLE}
+    
+@app.get("/models")
+async def models(_ok: bool = Depends(require_key)):
+    await ensure_tf()
+    if not TF_AVAILABLE:
+        raise HTTPException(503, "TensorFlow unavailable")
+    # return something meaningful for your UI
+    return {"models": ["tf_lstm", "tf_gru"], "tf": True}
 
 @app.get("/")
 def root():
@@ -70,6 +310,7 @@ async def health():
         "horizon_days_max": settings.horizon_days_max,
         "pathday_budget_max": settings.pathday_budget_max,
     }
+
 
 # Lazy loaders for optional libraries
 ARIMA_AVAILABLE = False
@@ -158,8 +399,8 @@ def load_learners():
 load_learners()
 # --- local modules (feature store with back-compat)
 try:
-    from .feature_store import connect as fs_connect
-    from .feature_store import get_recent_coverage, get_recent_mdape
+    from .feature_store import connect as fs_connect, DB_PATH as FS_DB_PATH
+    from .feature_store import get_recent_coverage, get_recent_mdape, log_ingest_event
     try:
         from .feature_store import insert_prediction as _fs_ins  # type: ignore
     except Exception:
@@ -171,8 +412,8 @@ try:
 except Exception:
     # If relative failed, try absolute module name
     try:
-        from feature_store import connect as fs_connect  # type: ignore
-        from feature_store import get_recent_coverage, get_recent_mdape  # type: ignore
+        from feature_store import connect as fs_connect, DB_PATH as FS_DB_PATH  # type: ignore
+        from feature_store import get_recent_coverage, get_recent_mdape, log_ingest_event  # type: ignore
         try:
             from feature_store import insert_prediction as _fs_ins  # type: ignore
         except Exception:
@@ -185,8 +426,10 @@ except Exception:
         fs_connect = None
         get_recent_coverage = None
         get_recent_mdape = None
+        log_ingest_event = None  # type: ignore
         _fs_ins = None
         _fs_log = None
+        FS_DB_PATH = None  # type: ignore
         logger.warning("feature_store unavailable; logging to FS disabled")
 
 # Choose the best available implementation
@@ -215,11 +458,12 @@ def fs_log_prediction(con, row: dict) -> None:
     except TypeError:
         # Fallback: implementation expects only (row)
         return _FS_LOG_IMPL(row)
-# DUCK utils — try db.duck first, fall back to duck
+# DUCK utils - try db.duck first, fall back to duck
 try:
-    from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome
+    from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome, DB_PATH as CORE_DB_PATH
 except Exception:
     from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome  # type: ignore
+    CORE_DB_PATH = os.getenv("PT_DUCKDB_PATH", str(Path("data/pt.duckdb")))
 
 # -----------------------------------------------------------------------------
 # Settings (pydantic-settings v2)
@@ -244,7 +488,34 @@ class Settings(BaseSettings):
     redis_url: str = Field(default_factory=lambda: os.getenv("PT_REDIS_URL", "redis://localhost:6379/0"))
     cors_origins_raw: Optional[str] = None
 
-    # Cookies
+    backup_dir: str = Field(default_factory=lambda: os.getenv("PT_BACKUP_DIR", "backups"))
+    backup_keep: int = Field(
+        default_factory=lambda: int(os.getenv("PT_BACKUP_KEEP", "7")),
+        ge=1,
+        le=90,
+        description="Number of DuckDB backups to keep per database",
+    )
+    backup_interval_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("PT_BACKUP_INTERVAL_MINUTES", "1440")),
+        ge=60,
+        description="Interval between automated DuckDB backups (minutes)",
+    )
+    daily_quant_horizon_days: int = Field(
+        default_factory=lambda: int(os.getenv("PT_DAILY_QUANT_HORIZON", "14")),
+        ge=5,
+        le=90,
+        description="Default horizon (days) for daily quant Monte Carlo runs.",
+    )
+    daily_quant_hhmm: str = Field(
+        default_factory=lambda: os.getenv("PT_DAILY_QUANT_HHMM", "08:45"),
+        description="Local HH:MM (24h) in target timezone to run daily quant.",
+    )
+    daily_quant_timezone: str = Field(
+        default_factory=lambda: os.getenv("PT_DAILY_QUANT_TZ", "America/New_York"),
+        description="IANA timezone name for scheduling the daily quant job.",
+    )
+
+# Cookies
     cookie_name: str = Field("pt_app", validation_alias="PT_COOKIE_NAME")
     cookie_max_age: int = Field(60 * 60 * 24, validation_alias="PT_COOKIE_MAX_AGE")  # 1 day
     cookie_secure: bool = Field(default_factory=lambda: bool(os.getenv("RENDER")) or os.getenv("ENV","dev") == "prod")
@@ -256,6 +527,25 @@ class Settings(BaseSettings):
     pathday_budget_max: int = Field(default_factory=lambda: int(os.getenv("PT_PATHDAY_BUDGET_MAX", "500000")))
     max_active_runs: int = Field(default_factory=lambda: int(os.getenv("PT_MAX_ACTIVE_RUNS", "2")))
     run_ttl_seconds: int = Field(default_factory=lambda: int(os.getenv("PT_RUN_TTL_SECONDS", "3600")))
+    validation_target_mape: float = Field(
+        default=5.0,
+        validation_alias="PT_VALIDATION_TARGET_MAPE",
+        ge=0.1,
+        le=50.0,
+        description="Desired MAPE (%) for Monte Carlo validation auto-tuning.",
+    )
+    validation_lookbacks: str = Field(
+        default="20,60,120",
+        validation_alias="PT_VALIDATION_LOOKBACKS",
+        description="Comma-separated list of lookback windows (trading days) for validation.",
+    )
+    validation_max_samples: int = Field(
+        default=120,
+        validation_alias="PT_VALIDATION_MAX_SAMPLES",
+        ge=20,
+        le=500,
+        description="Max number of roll-forward validation samples per lookback.",
+    )
 
     # Defaults for /simulate convenience
     predictive_defaults: dict = {
@@ -267,6 +557,8 @@ class Settings(BaseSettings):
     # (defined after TOP_* constants appear; we'll set them later)
     watchlist_equities: str = Field("", validation_alias="PT_WATCHLIST_EQUITIES")
     watchlist_cryptos: str = Field("", validation_alias="PT_WATCHLIST_CRYPTOS")
+    equity_watch: List[str] = Field(default_factory=list, validation_alias="PT_EQUITY_WATCH")
+    crypto_watch: List[str] = Field(default_factory=list, validation_alias="PT_CRYPTO_WATCH")
 
     # Feature flags
     shortlist_disable: bool = Field(False, validation_alias="PT_SHORTLIST_DISABLE")
@@ -275,11 +567,256 @@ class Settings(BaseSettings):
     open_access: bool = Field(default_factory=lambda: os.getenv("PT_OPEN_ACCESS", "1") == "1")
     pt_api_key: Optional[str] = None
 
+    # Auth tokens
+    jwt_secret: str = Field(default_factory=lambda: os.getenv("PT_JWT_SECRET", "dev-secret"))
+    jwt_exp_minutes: int = Field(default_factory=lambda: int(os.getenv("PT_JWT_EXP_MINUTES", "60")))
+
 settings = Settings()
+BACKUP_DIR = Path(settings.backup_dir).expanduser()
+REDIS = Redis.from_url(settings.redis_url, decode_responses=True)
+try:
+    applied = run_all_migrations()
+    if applied:
+        logger.info("Migrations applied: %s", applied)
+except Exception:
+    logger.exception("Failed to execute startup migrations")
+
+# Validation tuning knobs (parsed from settings; fall back to sane defaults)
+def _parse_int_list(raw: str) -> list[int]:
+    vals: list[int] = []
+    for token in str(raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            v = int(token)
+        except ValueError:
+            continue
+        if v > 0:
+            vals.append(v)
+    return vals
+
+VALIDATION_LOOKBACKS = _parse_int_list(settings.validation_lookbacks) or [20, 60, 120]
+VALIDATION_TARGET_MAPE = float(settings.validation_target_mape or 5.0)
+VALIDATION_MAX_SAMPLES = int(max(20, min(settings.validation_max_samples, 500)))
+VALIDATION_BARS_PER_YEAR = 252.0
+
+def _parse_hhmm(value: str) -> tuple[int, int]:
+    try:
+        hh, mm = value.strip().split(":")
+        h = max(0, min(23, int(hh)))
+        m = max(0, min(59, int(mm)))
+        return h, m
+    except Exception:
+        return (8, 45)
+
+BACKUP_KEEP = max(1, int(settings.backup_keep))
+BACKUP_INTERVAL_SECONDS = max(3600, int(settings.backup_interval_minutes) * 60)
+BACKUP_TARGETS: list[tuple[str, Path]] = []
+if "CORE_DB_PATH" in globals() and CORE_DB_PATH:
+    BACKUP_TARGETS.append(("core", Path(CORE_DB_PATH).expanduser()))
+if "FS_DB_PATH" in globals() and FS_DB_PATH:
+    BACKUP_TARGETS.append(("feature_store", Path(FS_DB_PATH).expanduser()))
+
+try:
+    DAILY_QUANT_TZ = ZoneInfo(settings.daily_quant_timezone)
+except Exception:
+    DAILY_QUANT_TZ = timezone.utc
+    logger.warning("Falling back to UTC for daily quant scheduler (invalid timezone: %s)", settings.daily_quant_timezone)
+
+DAILY_QUANT_HOUR, DAILY_QUANT_MINUTE = _parse_hhmm(settings.daily_quant_hhmm)
+_LAST_SCHEDULED_QUANT: str | None = None
+
+def _latest_mc_metric(symbol: str, horizon_days: int) -> dict | None:
+    if not fs_connect:
+        return None
+    try:
+        from .feature_store import get_latest_mc_metric  # type: ignore
+    except Exception:
+        try:
+            from feature_store import get_latest_mc_metric  # type: ignore
+        except Exception:
+            return None
+
+    con = fs_connect()
+    try:
+        return get_latest_mc_metric(con, symbol.upper(), int(horizon_days))
+    except Exception as exc:
+        logger.debug("get_latest_mc_metric failed for %s/%s: %s", symbol, horizon_days, exc)
+        return None
+    finally:
+        con.close()
 
 # -----------------------------------------------------------------------------
 # Helpers / config (independent)
 # -----------------------------------------------------------------------------
+# --- validator core ---
+async def _validate_mc_paths(symbols: list[str], days: int, n_paths: int) -> dict:
+    """
+    Run roll-forward Monte Carlo validation for each symbol and persist tuning artifacts.
+    """
+    try:
+        from .feature_store import upsert_mc_params, insert_mc_metrics  # type: ignore
+    except Exception:
+        from feature_store import upsert_mc_params, insert_mc_metrics  # type: ignore
+
+    today = datetime.now(timezone.utc).date()
+    as_of = today.isoformat()
+    seeded_by = "symbol|horizon"
+
+    results: list[dict[str, Any]] = []
+    params_rows: list[tuple[str, float, float, int, int]] = []
+    metric_rows: list[tuple[Any, ...]] = []
+
+    for sym in [s.strip().upper() for s in symbols if s.strip()]:
+        try:
+            window_days = max(400, days + max(VALIDATION_LOOKBACKS) + 50)
+            px = await _fetch_cached_hist_prices(sym, window_days=window_days, redis=REDIS)
+            arr = np.asarray([p for p in px if isinstance(p, (int, float)) and math.isfinite(p)], float)
+        except Exception as exc:
+            results.append({"symbol": sym, "skipped": True, "reason": f"history_fetch_failed:{exc}"})
+            continue
+
+        if arr.size < (days + min(VALIDATION_LOOKBACKS) + 5):
+            results.append({"symbol": sym, "skipped": True, "reason": "insufficient_history"})
+            continue
+
+        try:
+            tune = rollforward_validation(
+                arr,
+                horizon_days=days,
+                lookbacks=VALIDATION_LOOKBACKS,
+                n_paths=n_paths,
+                target_mape=VALIDATION_TARGET_MAPE,
+                max_samples=VALIDATION_MAX_SAMPLES,
+                bars_per_year=VALIDATION_BARS_PER_YEAR,
+            )
+        except ValueError as exc:
+            results.append({"symbol": sym, "skipped": True, "reason": str(exc)})
+            continue
+
+        best = tune.best
+        mu_daily = float(best.mu_ann / VALIDATION_BARS_PER_YEAR)
+        sigma_daily = float(best.sigma_ann / math.sqrt(VALIDATION_BARS_PER_YEAR))
+
+        params_rows.append((sym, mu_daily, sigma_daily, int(best.lookback), int(best.lookback)))
+
+        variants = [
+            {
+                "lookback": r.lookback,
+                "samples": r.samples,
+                "mape": r.mape,
+                "mdape": r.mdape,
+                "mu_ann": r.mu_ann,
+                "sigma_ann": r.sigma_ann,
+            }
+            for r in tune.results
+        ]
+
+        results.append({
+            "symbol": sym,
+            "horizon_days": int(days),
+            "mape": best.mape,
+            "mdape": best.mdape,
+            "n": int(best.samples),
+            "mu": mu_daily,
+            "sigma": sigma_daily,
+            "mu_ann": best.mu_ann,
+            "sigma_ann": best.sigma_ann,
+            "lookback": int(best.lookback),
+            "recommended_n_paths": int(tune.recommended_n_paths),
+            "target_mape": VALIDATION_TARGET_MAPE,
+            "candidates": variants,
+        })
+
+        metric_rows.append((
+            as_of,
+            sym,
+            int(days),
+            float(best.mape),
+            float(best.mdape),
+            int(best.samples),
+            mu_daily,
+            sigma_daily,
+            int(tune.recommended_n_paths),
+            int(best.lookback),
+            int(best.lookback),
+            seeded_by,
+        ))
+
+    con = fs_connect()
+    try:
+        for (sym, mu_final, sig_final, lb_mu, lb_sig) in params_rows:
+            upsert_mc_params(con, sym, mu_final, sig_final, lb_mu, lb_sig)
+        if metric_rows:
+            insert_mc_metrics(con, metric_rows)
+    finally:
+        con.close()
+
+    return {
+        "as_of": as_of,
+        "horizon_days": int(days),
+        "n_paths": int(n_paths),
+        "target_mape": VALIDATION_TARGET_MAPE,
+        "lookbacks": VALIDATION_LOOKBACKS,
+        "items": results,
+    }
+
+async def _backup_once() -> None:
+    if not BACKUP_TARGETS:
+        return
+    for name, db_path in BACKUP_TARGETS:
+        try:
+            dest = await asyncio.to_thread(create_duckdb_backup, db_path, BACKUP_DIR, keep=BACKUP_KEEP)
+            log_json("info", msg="duckdb_backup_ok", db=name, dest=str(dest))
+        except FileNotFoundError:
+            log_json("warning", msg="duckdb_backup_missing", db=name, path=str(db_path))
+        except Exception as exc:
+            log_json("error", msg="duckdb_backup_fail", db=name, error=str(exc))
+
+async def _backup_loop() -> None:
+    if not BACKUP_TARGETS or BACKUP_INTERVAL_SECONDS <= 0:
+        return
+    await asyncio.sleep(random.uniform(5.0, 25.0))
+    while True:
+        await _backup_once()
+        await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
+
+
+# --- routes ---
+@app.post("/admin/backup", summary="Trigger an immediate DuckDB backup")
+async def admin_backup(_ok: bool = Security(require_key, scopes=["admin"])):
+    await _backup_once()
+    return {"ok": True, "targets": [name for name, _ in BACKUP_TARGETS]}
+
+@app.post("/admin/validate/mc")
+async def admin_validate_mc(
+    days: int = Query(30, ge=1, le=365),
+    symbols: str | None = Query(None, description="Comma-separated, defaults to watchlist"),
+    n_paths: int = Query(4000, ge=500, le=200000),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    # default universe: any list you keep in env/redis; fallback to a small set
+    syms = [s.strip() for s in (symbols.split(",") if symbols else ["SPY","QQQ","BTC-USD","ETH-USD"])]
+    out = await _validate_mc_paths(syms, days=days, n_paths=n_paths)
+    return {"ok": True, "data": out}
+
+@app.get("/v1/metrics/mc")
+async def get_mc_metrics_api(
+    symbol: str | None = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    try:
+        from .feature_store import get_mc_metrics  # type: ignore
+    except Exception:
+        from feature_store import get_mc_metrics  # type: ignore
+
+    con = fs_connect()
+    try:
+        rows = get_mc_metrics(con, symbol.strip().upper() if symbol else None, limit=limit)
+    finally:
+        con.close()
+    return {"ok": True, "data": rows}
 def _env_list(name: str, default: List[str] | None = None) -> List[str]:
     s = os.getenv(name, "")
     if not s:
@@ -304,45 +841,31 @@ def _sigmoid(z: float) -> float:
 def _today_utc_date() -> date:
     return datetime.now(timezone.utc).date()
 
-async def maybe_require_key(request: Request):
-    # Open testing: allow all when open_access = True
-    open_access = bool(getattr(settings, "open_access", True))
-    expected = getattr(settings, "pt_api_key", None) or os.getenv("PT_API_KEY", "")
-    if open_access or not expected:
-        return True
-
-    key = request.headers.get("X-API-Key") or request.query_params.get("api_key") or ""
-    if key != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return True
-
 async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
 
 TOP_STOCKS = [
-    'NVDA', 'MSFT', 'AAPL', 'GOOGL', 'AMZN', 'META', 'AVGO', 'TSLA', 'TSM', 'BRK.B',
-    'ORCL', 'JPM', 'WMT', 'LLY', 'V', 'NFLX', 'MA', 'XOM', 'JNJ', 'PLTR',
-    'COST', 'ABBV', 'BABA', 'ASML', 'AMD', 'HD', 'BAC', 'PG', 'UNH', 'SAP',
-    'GE', 'CVX', 'KO', 'CSCO', 'IBM', 'AZN', 'NVO', 'NVS', 'TMUS', 'WFC',
-    'TM', 'MS', 'GS', 'PM', 'CAT', 'CRM', 'ABT', 'HSBC', 'AXP', 'RTX',
-    'MRK', 'LIN', 'SHEL', 'MU', 'SHOP', 'MCD', 'RY', 'APP', 'TMO', 'DIS',
-    'UBER', 'ANET', 'PEP', 'BX', 'NOW', 'T', 'PDD', 'SONY', 'INTU', 'BLK',
-    'ARM', 'LRCX', 'INTC', 'C', 'QCOM', 'MUFG', 'AMAT', 'VZ', 'NEE', 'GEV',
-    'SCHW', 'HDB', 'BKNG', 'BA', 'TXN', 'ISRG', 'AMGN', 'ACN', 'TJX', 'APH',
-    'SPGI', 'SAN', 'ETN', 'DHR', 'UL', 'PANW', 'GILD', 'ADBE', 'BSX', 'PFE'
+    'NVDA', 'MSFT', 'AAPL', 'AMZN', 'GOOGL', 'META', 'BRK.B', '2222.SR', 'TSM', 'AVGO',
+    'TSLA', 'WMT', 'JPM', 'V', 'UNH', 'XOM', 'MA', 'PG', 'JNJ', 'COST',
+    'HD', 'ASML', 'CVX', 'ABBV', 'TMUS', 'MRK', 'LLY', 'WFC', 'NFLX', 'AMD',
+    'KO', 'BAC', 'CRM', 'ABT', 'DHR', 'TXN', 'LIN', 'ACN', 'QCOM', 'PM',
+    'NEE', 'COP', 'ORCL', 'GE', 'AMGN', 'T', 'SPGI', 'UBER', 'ISRG', 'RTX',
+    'VZ', 'PFE', 'ABNB', 'C', 'ETN', 'UNP', 'IBM', 'SYK', 'BSX', 'MU',
+    'CAT', 'SCHW', 'KLAC', 'TJX', 'DE', 'LMT', 'MDT', 'ADP', 'GILD', 'ZTS',
+    'CB', 'LOW', 'HON', 'USB', 'INTU', 'PGR', 'BKNG', 'AXP', 'GS', 'MMC',
+    'BLK', 'AMT', 'PLD', 'SBUX', 'CMG', 'BX', 'REGN', 'CBRE', 'SNPS', 'CDNS',
+    'ICE', 'PANW', 'MELI', 'ADI', 'MDLZ', 'MO', 'CSX', 'BMY', 'KL', 'STZ'
 ]
 
 TOP_CRYPTOS = [
-    'BTC', 'ETH', 'USDT', 'BNB', 'XRP', 'SOL', 'USDC', 'DOGE', 'TRX', 'ADA',
-    'LINK', 'USDe', 'HYPE', 'SUI', 'XLM', 'AVAX', 'BCH', 'LTC', 'HBAR', 'LEO',
-    'MNT', 'SHIB', 'TON', 'CRO', 'DOT', 'XMR', 'DAI', 'UNI', 'WLFI', 'OKB',
-    'AAVE', 'BGB', 'ENA', 'PEPE', 'NEAR', 'APT', 'ZEC', 'TAO', 'ETC', 'ASTER',
-    'IP', 'ONDO', 'USD1', 'WLD', 'PYUSD', 'POL', 'ICP', 'ARB', 'M', 'KCS',
-    'KAS', 'ALGO', 'PUMP', 'ATOM', 'VET', 'PENGU', 'PI', 'SEI', 'FLR', 'RENDER',
-    'FIL', 'SKY', 'BONK', 'TRUMP', 'JUP', 'XPL', 'IMX', 'GT', 'SPX', '2Z',
-    'XDC', 'CAKE', 'OP', 'QNT', 'INJ', 'PAXG', 'FET', 'TIA', 'FDUSD', 'STX',
-    'LDO', 'CRV', 'MYX', 'XAUt', 'AERO', 'DEXE', 'PYTH', 'FLOKI', 'KAIA', 'GRT',
-    'ETHFI', 'NEXO', 'RLUSD', 'S', 'ENS', 'PENDLE', 'IOTA', 'CFX', 'RAY', 'XTZ'
+    'BTC-USD', 'ETH-USD', 'BNB-USD', 'XRP-USD', 'SOL-USD', 'DOGE-USD', 'TRX-USD', 'ADA-USD', 'HYPE-USD', 'LINK-USD',
+    'XLM-USD', 'BCH-USD', 'SUI-USD', 'AVAX-USD', 'LEO-USD', 'HBAR-USD', 'LTC-USD', 'SHIB-USD', 'MNT-USD', 'TON-USD',
+    'XMR-USD', 'CRO-USD', 'DOT-USD', 'UNI-USD', 'TAO-USD', 'OKB-USD', 'AAVE-USD', 'ZEC-USD', 'BGB-USD', 'PEPE-USD',
+    'NEAR-USD', 'ENA-USD', 'ASTER-USD', 'APT-USD', 'ETC-USD', 'ONDO-USD', 'POL-USD', 'WLD-USD', 'ICP-USD', 'ARB-USD',
+    'ALGO-USD', 'ATOM-USD', 'KAS-USD', 'VET-USD', 'PENGU-USD', 'FLR-USD', 'RENDER-USD', 'SKY-USD', 'GT-USD', 'SEI-USD',
+    'PUMP-USD', 'CAKE-USD', 'JUP-USD', 'FIL-USD', 'IMX-USD', 'SPX-USD', 'XDC-USD', 'QNT-USD', 'INJ-USD', 'TIA-USD',
+    'LDO-USD', 'STX-USD', 'OP-USD', 'FET-USD', 'AERO-USD', 'CRV-USD', 'NEXO-USD', 'GRT-USD', 'PYTH-USD', 'KAIA-USD',
+    'SNX-USD', 'FLOKI-USD', 'ATH-USD', 'XTZ-USD', 'ENS-USD', 'ETHFI-USD', 'MORPHO-USD', 'PENDLE-USD', 'IOTA-USD'
 ]
 
 def _norm_crypto_symbol(s: str) -> str:
@@ -365,12 +888,45 @@ def _norm_crypto_symbol(s: str) -> str:
 if not settings.watchlist_equities:
     settings.watchlist_equities = ",".join(TOP_STOCKS)
 if not settings.watchlist_cryptos:
-    settings.watchlist_cryptos = ",".join(_norm_crypto_symbol(x) for x in TOP_CRYPTOS)
+    settings.watchlist_cryptos = ",".join(TOP_CRYPTOS)
 
 
-# Canonical watchlist sets derived from settings
-WL_EQ = sorted({t.strip().upper() for t in settings.watchlist_equities.split(",") if t.strip()})[:200]
-WL_CR = sorted({_norm_crypto_symbol(t) for t in settings.watchlist_cryptos.split(",") if t.strip()})[:200]
+def _dedupe_upper(seq: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in seq:
+        s = str(raw or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _dedupe_crypto(seq: Sequence[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in seq:
+        sym = _norm_crypto_symbol(raw)
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return out
+
+
+equity_items = settings.watchlist_equities.split(",") if settings.watchlist_equities else list(TOP_STOCKS)
+crypto_items = settings.watchlist_cryptos.split(",") if settings.watchlist_cryptos else list(TOP_CRYPTOS)
+
+# Canonical watchlist sets derived from settings (preserve declared order)
+WL_EQ = _dedupe_upper(equity_items)[:200]
+WL_CR = _dedupe_crypto(crypto_items)[:200]
+
+# Derived arrays for daily quant and other jobs
+if not getattr(settings, "equity_watch", None):
+    settings.equity_watch = WL_EQ.copy()
+if not getattr(settings, "crypto_watch", None):
+    settings.crypto_watch = WL_CR.copy()
 
 # Config knobs (reasonable defaults)
 STAT_BARS_QUICK = 252          # ~1y worth of bars to estimate μ/σ
@@ -400,13 +956,84 @@ def auto_rel_levels(
     rungs = (-2*base, -base, 0.0, base, 2*base)
     return tuple(float(x) for x in rungs)
 
+_BG_TASKS: list[asyncio.Task] = []
+
+def _run_bg(name: str, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+    """
+    Run a background coroutine with observability.
+    - Logs start/finish
+    - Records job_ok / job_fail
+    - Captures exceptions so they don't crash the loop
+    """
+    async def _wrapper():
+        t0 = time.perf_counter()
+        started_at = datetime.now(timezone.utc).isoformat()
+        log_json("info", msg="bg_task_start", task=name, started_at=started_at)
+        try:
+            result = await coro
+            dur = round(time.perf_counter() - t0, 3)
+            job_ok(name, duration_s=dur)
+            log_json("info", msg="bg_task_ok", task=name, duration_s=dur)
+            return result
+        except asyncio.CancelledError:
+            # treat as graceful stop
+            dur = round(time.perf_counter() - t0, 3)
+            log_json("info", msg="bg_task_cancelled", task=name, duration_s=dur)
+            raise
+        except Exception as e:
+            dur = round(time.perf_counter() - t0, 3)
+            job_fail(name, err=str(e), duration_s=dur)
+            log_json("error", msg="bg_task_fail", task=name, duration_s=dur, error=str(e))
+            # don't re-raise to avoid bubbling
+            return None
+
+    task = asyncio.create_task(_wrapper(), name=name)
+    _BG_TASKS.append(task)
+    return task
+
+# ---------- startup ----------
 @app.on_event("startup")
 async def _on_startup():
-    init_schema()
-    asyncio.create_task(_gc_loop())
-    asyncio.create_task(_labeling_daemon())
-    asyncio.create_task(_warm_start())  # warm but gentle
+    # init_schema (measure+log)
+    t0 = time.perf_counter()
+    try:
+        init_schema()
+        dur = round(time.perf_counter() - t0, 3)
+        job_ok("init_schema", duration_s=dur)
+        log_json("info", msg="init_schema_ok", duration_s=dur)
+    except Exception as e:
+        dur = round(time.perf_counter() - t0, 3)
+        job_fail("init_schema", err=str(e), duration_s=dur)
+        log_json("error", msg="init_schema_fail", duration_s=dur, error=str(e))
+        # don't crash startup
+    # Background loops (observable)
+    _run_bg("gc_loop", _gc_loop())
+    _run_bg("labeling_daemon", _labeling_daemon())
+    _run_bg("warm_start", _warm_start())  # warm but gentle
+    _run_bg("duckdb_backup", _backup_loop())
+    _run_bg("quant_scheduler", _daily_quant_scheduler())
 
+    
+
+
+# ---------- graceful shutdown ----------
+@app.on_event("shutdown")
+async def _on_shutdown():
+    log_json("info", msg="shutdown_begin", n_tasks=len(_BG_TASKS))
+    # cancel & await (best-effort)
+    for t in _BG_TASKS:
+        if not t.done():
+            t.cancel()
+    # give tasks a moment to exit gracefully
+    try:
+        await asyncio.wait(_BG_TASKS, timeout=2.5)
+    except Exception as e:
+        log_json("error", msg="shutdown_wait_error", error=str(e))
+    # log final states
+    states = [{"name": getattr(t, "get_name", lambda: "bg_task")(), "done": t.done(), "cancelled": t.cancelled()} for t in _BG_TASKS]
+    log_json("info", msg="shutdown_complete", task_states=states)
+
+# ---------- warm start (instrumented) ----------
 async def _warm_start():
     """
     On cold start, gently prime data & cache without tripping rate limits.
@@ -414,78 +1041,88 @@ async def _warm_start():
     - Single-day ingest only (yesterday) if bars_daily is missing
     - Prime today's cache once, using the daily compute budget
     """
+    job = "warm_start"
+    t0 = time.perf_counter()
     try:
         # spread boots across instances
         jitter_ms = int(os.getenv("PT_WARM_JITTER_MS", "300"))
         if jitter_ms > 0:
-            await asyncio.sleep(random.random() * (jitter_ms / 1000.0))
+            jt = random.random() * (jitter_ms / 1000.0)
+            log_json("info", msg="warm_start_jitter", job=job, sleep_s=round(jt, 3))
+            await asyncio.sleep(jt)
 
-        # 1) If bars_daily is missing, ingest only yesterday (best effort)
+        # 1) Check for bars_daily
         try:
             con = fs_connect()
             has = con.execute(
                 "SELECT 1 FROM information_schema.tables WHERE lower(table_name)='bars_daily'"
             ).fetchall()
             con.close()
+            log_json("info", msg="warm_table_check", job=job, bars_daily_present=bool(has))
         except Exception as e:
-            logger.info(f"warm table-check skipped: {e}")
+            log_json("error", msg="warm_table_check_failed", job=job, error=str(e))
             has = []
 
         if not has:
             y = datetime.now(timezone.utc).date() - timedelta(days=1)
             if _poly_key_present() and not _is_weekend(y):
                 try:
+                    t_ing = time.perf_counter()
                     await ingest_grouped_daily(y)
+                    log_json("info", msg="warm_ingest_ok", job=job, day=y.isoformat(),
+                             duration_s=round(time.perf_counter() - t_ing, 3))
                 except Exception as e:
-                    logger.info(f"warm ingest skipped: {e}")
+                    log_json("error", msg="warm_ingest_skip", job=job, day=y.isoformat(), error=str(e))
             else:
-                logger.info("warm ingest skipped: weekend or no Polygon key")
+                log_json("info", msg="warm_ingest_skipped", job=job, reason="weekend_or_no_polygon_key")
 
-        # 2) Prime today's cache (idempotent; will no-op if already cached)
+        # 2) Prime today's cache (idempotent)
         if REDIS:
             d = datetime.now(timezone.utc).date().isoformat()
             base = f"quant:daily:{d}"
             try:
                 eq = await REDIS.get(f"{base}:equity")
                 cr = await REDIS.get(f"{base}:crypto")
+                log_json("info", msg="warm_cache_probe", job=job, equity_cached=bool(eq), crypto_cached=bool(cr))
             except Exception as e:
-                logger.info(f"warm redis get failed: {e}")
+                log_json("error", msg="warm_cache_probe_fail", job=job, error=str(e))
                 eq = cr = None
 
             if not (eq and cr):
                 warm_budget = int(os.getenv("PT_WARM_BUDGET", "2"))
                 try:
                     if await _quant_allow(REDIS, max_calls_per_day=warm_budget):
+                        t_quant = time.perf_counter()
+                        err = None
                         try:
                             await _run_daily_quant()
+                        except Exception as e:
+                            err = str(e)
                         finally:
                             try:
                                 await _quant_consume(REDIS)
                             except Exception:
                                 pass
+                        dur = round(time.perf_counter() - t_quant, 3)
+                        if err:
+                            log_json("error", msg="warm_quant_fail", job=job, duration_s=dur, error=err)
+                        else:
+                            log_json("info", msg="warm_quant_ok", job=job, duration_s=dur)
                     else:
-                        logger.info("warm quant skipped: budget exhausted")
+                        log_json("info", msg="warm_quant_skipped", job=job, reason="budget_exhausted")
                 except Exception as e:
-                    logger.info(f"warm quant skipped: {e}")
+                    log_json("error", msg="warm_quant_outer_fail", job=job, error=str(e))
         else:
-            logger.info("warm start: no REDIS configured; skipping cache prime")
+            log_json("info", msg="warm_skip", job=job, reason="no_redis_configured")
+
+        dur_total = round(time.perf_counter() - t0, 3)
+        job_ok(job, duration_s=dur_total)
+        log_json("info", msg="warm_done", job=job, duration_s=dur_total)
 
     except Exception as e:
-        logger.info(f"warm_start outer skipped: {e}")
-
-@app.on_event("shutdown")
-async def _shutdown():
-    global REDIS, _gc_task
-    try:
-        if _gc_task:
-            _gc_task.cancel()
-    except Exception:
-        pass
-    try:
-        if REDIS:
-            await REDIS.close()
-    except Exception:
-        pass
+        dur_total = round(time.perf_counter() - t0, 3)
+        job_fail(job, err=str(e), duration_s=dur_total)
+        log_json("error", msg="warm_outer_fail", job=job, duration_s=dur_total, error=str(e))
 # ---------- Targets & Odds (first-passage + terminal hit) ----------
 def _barrier_stats(paths: np.ndarray, level: float, side: str, bars_per_day: int) -> dict:
     """
@@ -715,17 +1352,6 @@ DEFAULT_ORIGINS = [
     "https://simetrix.vercel.app",
 ]
 ALLOWED_ORIGINS = sorted(set(CORS_ORIGINS or DEFAULT_ORIGINS))
-# --- Auth dependency (define BEFORE any route uses it)
-def require_key(
-    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-    x_pt_key: str | None  = Header(default=None, alias="x-pt-key"),  # compat
-    api_key: str | None   = Query(default=None),                     # compat
-) -> bool:
-    expected = os.getenv("PT_API_KEY", "dev-local")
-    provided = (x_api_key or x_pt_key or api_key or "").strip()
-    if not provided or provided != expected:
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
-    return True
 
 # --- CORS (apply after ALLOWED_ORIGINS is computed)
 app.add_middleware(
@@ -745,8 +1371,6 @@ if static_path.is_dir():
     logger.info(f"Mounted static frontend from {static_path} at /app")
 FRONTEND_DIR = os.getenv("PT_FRONTEND_DIR", "").strip()
 
-# --- Redis client (text mode)
-REDIS: Redis | None = Redis.from_url(settings.redis_url, decode_responses=True)
 # --- RL constants
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
 # --- Background GC + startup/shutdown
@@ -893,6 +1517,7 @@ async def ingest_grouped_daily(d: date):
     Creates/updates DuckDB table `bars_daily` (PRIMARY KEY: symbol, ts).
     Returns: {"ok": True, "upserted": <int>}
     """
+    t_start = time.perf_counter()
     key = _poly_key()
     day = d.isoformat()
     async def _fetch_json(cli: httpx.AsyncClient, url: str, params: dict) -> dict:
@@ -979,6 +1604,8 @@ async def ingest_grouped_daily(d: date):
     if not to_upsert:
         return {"ok": True, "upserted": 0}
 
+    payload_hash = hashlib.sha256(json.dumps(to_upsert, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
+
     # --- DuckDB upsert ---
     con = fs_connect()
     try:
@@ -1005,8 +1632,20 @@ async def ingest_grouped_daily(d: date):
             to_upsert,
         )
         con.execute("COMMIT")
-    except Exception:
+        if log_ingest_event:
+            try:
+                duration_ms = int((time.perf_counter() - t_start) * 1000)
+                log_ingest_event(con, as_of=day, source="polygon_grouped", row_count=len(to_upsert), sha256=payload_hash, duration_ms=duration_ms, ok=True)
+            except Exception as exc:
+                logger.debug(f"log_ingest_event_failed: {exc}")
+    except Exception as e:
         con.execute("ROLLBACK")
+        if log_ingest_event:
+            try:
+                duration_ms = int((time.perf_counter() - t_start) * 1000)
+                log_ingest_event(con, as_of=day, source="polygon_grouped", row_count=len(to_upsert), sha256=payload_hash, duration_ms=duration_ms, ok=False, error=str(e))
+            except Exception:
+                pass
         raise
     finally:
         con.close()
@@ -1078,6 +1717,97 @@ class RunState(BaseModel):
     startedAt: str | None = None
     finishedAt: str | None = None
     error: str | None = None
+#------------Lemon Squezzy checkout------------
+def _ls_valid_sig(raw: bytes, sig_b64: str) -> bool:
+    if not LS_WEBHOOK_SECRET or not sig_b64:
+        return False
+    mac = hmac.new(LS_WEBHOOK_SECRET, msg=raw, digestmod=hashlib.sha256).digest()
+    expected = base64.b64encode(mac).decode("utf-8")
+    return hmac.compare_digest(expected, sig_b64)
+
+async def _grant_plan(email: str, plan: str, ttl_days: int | None = 365) -> None:
+    if not REDIS or not email: return
+    key = f"user:{email.lower()}:plan"
+    if ttl_days:
+        await REDIS.set(key, plan, ex=ttl_days*24*3600)
+    else:
+        await REDIS.set(key, plan)
+
+async def _revoke_or_downgrade(email: str) -> None:
+    if not REDIS or not email: return
+    key = f"user:{email.lower()}:plan"
+    await REDIS.set(key, "free", ex=30*24*3600)  # keep a short TTL
+
+def _norm_plan_name(s: str | None) -> str:
+    s = (s or "").strip().lower()
+    if "enterprise" in s: return "enterprise"
+    if "pro" in s: return "pro"
+    return "free"
+
+def _payload_email(attrs: dict) -> str:
+    return (
+        attrs.get("user_email") or
+        attrs.get("customer_email") or
+        attrs.get("email") or
+        ""
+    )
+
+@app.post("/billing/webhook")
+async def lemon_webhook(request: Request):
+    raw = await request.body()
+    sig = request.headers.get("X-Signature", "")
+    if not _ls_valid_sig(raw, sig):
+        raise HTTPException(status_code=401, detail="invalid signature")
+
+    payload = json.loads(raw.decode("utf-8") or "{}")
+    meta = payload.get("meta") or {}
+    event = (meta.get("event_name") or "").strip().lower()
+    data  = payload.get("data") or {}
+    attrs = (data.get("attributes") or {})
+
+    # --- Idempotency guard: skip if we've seen this event id ---
+    evt_id = meta.get("event_id") or data.get("id")
+    if REDIS and evt_id:
+        if await REDIS.sismember("ls:events:seen", evt_id):
+            return {"ok": True, "idempotent": True}
+        await REDIS.sadd("ls:events:seen", evt_id)
+        await REDIS.expire("ls:events:seen", 14*24*3600)
+
+    email = (_payload_email(attrs) or "").lower()
+    variant_name = _norm_plan_name(attrs.get("variant_name") or attrs.get("name"))
+
+    # Handle events
+    if event in {
+        "order_created",
+        "subscription_created",
+        "subscription_updated",
+    }:
+        await _grant_plan(email, variant_name, ttl_days=365)
+    elif event in {
+        "subscription_cancelled",
+        "subscription_expired",
+        "order_refunded",
+    }:
+        await _revoke_or_downgrade(email)
+    else:
+        # ignore others
+        pass
+
+    return {"ok": True, "event": event, "email": email, "plan": variant_name}
+
+# Simple plan lookup (use with real auth later)
+@app.get("/me")
+async def me(email: str):
+    email = (email or "").strip().lower()
+    plan = "free"
+    if REDIS and email:
+        p = await REDIS.get(f"user:{email}")
+        if p: plan = p
+        else:
+            p2 = await REDIS.get(f"user:{email}:plan")
+            if p2: plan = p2
+    return {"email": email, "plan": plan}
+#------------End Lemon Squezzy checkout------------
 
 # ----------------- Utilities -----------------
 async def _list_models() -> List[str]:
@@ -1551,6 +2281,19 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
         if iv30 and isinstance(iv30, (float, int)) and iv30 > 0:
             sigma_ann = float(max(sigma_ann, float(iv30)))
 
+        recommended_paths: int | None = None
+        mc_tuning = _latest_mc_metric(req.symbol, int(req.horizon_days))
+        if mc_tuning:
+            try:
+                mu_tuned_ann = float(mc_tuning.get("mu") or 0.0) * VALIDATION_BARS_PER_YEAR
+                sigma_tuned_ann = float(mc_tuning.get("sigma") or 0.0) * math.sqrt(VALIDATION_BARS_PER_YEAR)
+                mu_tuned_ann *= shrink  # align with horizon shrink applied to fresh estimate
+                mu_ann = float(np.clip((mu_ann + mu_tuned_ann) * 0.5, -mu_cap, mu_cap))
+                sigma_ann = float(np.clip((sigma_ann + sigma_tuned_ann) * 0.5, 1e-4, SIGMA_CAP))
+                recommended_paths = int(mc_tuning.get("n_paths") or 0)
+            except Exception as exc:
+                logger.debug("Monte Carlo tuning blend failed: %s", exc)
+
         # ---------- Warnings ----------
         warnings: list[str] = []
         if px_arr.size < 126 * bpd:  # ~6 months of bars
@@ -1639,6 +2382,16 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
         # ---------- Simulate ----------
         H  = int(req.horizon_days)
         N  = int(req.n_paths)
+        if recommended_paths:
+            # Respect global budgets and user request; only scale up.
+            max_budget_paths = max(1, settings.pathday_budget_max // max(1, H))
+            target_paths = min(int(recommended_paths), settings.n_paths_max, max_budget_paths)
+            if target_paths > N:
+                N = target_paths
+                warnings.append(
+                    f"Auto-tuned path count increased to {N} to target {VALIDATION_TARGET_MAPE:.1f}% MAPE calibration"
+                )
+        N = int(np.clip(N, 500, settings.n_paths_max))
         engine_used = ""
         paths_mat: np.ndarray
 
@@ -1912,18 +2665,34 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
         await redis.setex(f"run:{run_id}", settings.run_ttl_seconds, rs.model_dump_json())
 
 # ----------------- Simulation routes -----------------
-@app.post("/simulate")
-async def simulate(req: SimRequest, _ok: bool = Depends(maybe_require_key)):
+@app.post("/simulate", summary="Start a simulation run")
+async def simulate(
+    req: SimRequest,
+    request: Request,
+    _auth: bool = Security(require_key, scopes=["simulate"])
+):
     """
     Start a simulation run (auth via app-level key; supports open_access toggle).
     Frontend should pass req.mode = "quick" (≈6m) or "deep" (≈10y).
     """
-    # normalize symbol early so logs/keys are consistent
+    # Normalize symbol early so logs/keys are consistent
     try:
         req.symbol = (req.symbol or "").upper().strip()
     except Exception:
-        # if Pydantic model is frozen in your setup, shadow it
+        # If model is frozen, shadow it
         req = req.model_copy(update={"symbol": (req.symbol or "").upper().strip()})
+
+    # Quota cost: deep runs count more than quick
+    mode = (req.mode or "quick").lower().strip()
+    cost_units = 3 if mode == "deep" else 1
+
+    # Enforce rate+quota (simulate scope)
+    enforce_limits(REDIS, request, scope="simulate", per_min=SIM_LIMIT_PER_MIN, cost_units=cost_units)
+
+    # Ensure Redis is available
+    if not REDIS:
+        log_json("error", msg="simulate_enqueue_fail", reason="redis_unavailable", symbol=req.symbol, mode=mode)
+        raise HTTPException(status_code=503, detail="redis_unavailable")
 
     run_id = uuid4().hex  # hex keeps keys simple (no dashes)
     rs = RunState(
@@ -1936,57 +2705,77 @@ async def simulate(req: SimRequest, _ok: bool = Depends(maybe_require_key)):
         startedAt=datetime.now(timezone.utc).isoformat(),
     )
 
-    # use config TTL (not a hard-coded 3600)
-    await REDIS.setex(f"run:{run_id}", settings.run_ttl_seconds, rs.model_dump_json())
+    # Persist run state with configured TTL
+    try:
+        await REDIS.setex(f"run:{run_id}", settings.run_ttl_seconds, rs.model_dump_json())
+    except Exception as e:
+        log_json("error", msg="simulate_enqueue_fail", reason="redis_setex_error", symbol=req.symbol, mode=mode, error=str(e))
+        raise HTTPException(status_code=503, detail="redis_error")
+
+    # Kick off background simulation
     asyncio.create_task(run_simulation(run_id, req, REDIS))
+    log_json("info", msg="simulate_enqueue", run_id=run_id, symbol=req.symbol, mode=mode, horizon_days=rs.horizon_days, paths=rs.paths)
+
     return {"run_id": run_id}
 
-@app.get("/simulate/{run_id}/state")
-async def get_sim_state(run_id: str, _ok: bool = Depends(require_key)):
-    rs = await _ensure_run(run_id)
-    return rs.model_dump()
 
-@app.get("/simulate/{run_id}/status")
-async def simulate_status(run_id: str, _ok: bool = Depends(require_key)):
-    rs = await _ensure_run(run_id)
-    return {"status": rs.status, "progress": rs.progress, "error": rs.error}
-
-@app.websocket("/simulate/{run_id}/ws")
-async def simulate_ws(websocket: WebSocket, run_id: str):
-    await websocket.accept()
+# ------------------ Simulate: state (full) ------------------
+@app.get("/simulate/{run_id}/state", summary="Get full run state")
+async def get_sim_state(run_id: str, request: Request, _ok: bool = Security(require_key, scopes=["simulate"])):
     try:
-        while True:
-            try:
-                rs = await _ensure_run(run_id)
-                await websocket.send_json({"status": rs.status, "progress": rs.progress})
-                if rs.status in ("done", "error"):
-                    if rs.error:
-                        await websocket.send_json({"error": rs.error})
-                    break
-                await asyncio.sleep(0.5)
-            except HTTPException as e:
-                await websocket.send_json({"status": "error", "error": e.detail})
-                break
-    finally:
-        await websocket.close()
-@app.get("/simulate/{run_id}/artifact")
-async def get_sim_artifact(run_id: str, _ok: bool = Depends(require_key)):
+        rs = await _ensure_run(run_id)
+        log_json("info", msg="simulate_state", run_id=run_id, status=rs.status, progress=float(rs.progress or 0.0))
+        return rs.model_dump()
+    except HTTPException as e:
+        log_json("error", msg="simulate_state_err", run_id=run_id, http_status=e.status_code, detail=e.detail)
+        raise
+
+
+# ------------------ Simulate: status (light) ------------------
+@app.get("/simulate/{run_id}/status", summary="Get run status + progress")
+async def simulate_status(run_id: str, request: Request, _ok: bool = Security(require_key, scopes=["simulate"])):
+    try:
+        rs = await _ensure_run(run_id)
+        payload = {"status": rs.status, "progress": rs.progress}
+        log_json("info", msg="simulate_status", run_id=run_id, **payload)
+        return payload
+    except HTTPException as e:
+        log_json("error", msg="simulate_status_err", run_id=run_id, http_status=e.status_code, detail=e.detail)
+        raise
+
+
+# ------------------ Simulate: artifact ------------------
+@app.get("/simulate/{run_id}/artifact", summary="Get final artifact once ready")
+async def get_sim_artifact(run_id: str, request: Request, _ok: bool = Security(require_key, scopes=["simulate"])):
+    if not REDIS:
+        log_json("error", msg="simulate_artifact_err", run_id=run_id, reason="redis_unavailable")
+        raise HTTPException(status_code=503, detail="redis_unavailable")
+
     raw = await REDIS.get(f"artifact:{run_id}")
     if not raw:
         rs = await _ensure_run(run_id)
+        log_json("info", msg="simulate_artifact_pending", run_id=run_id, status=rs.status, progress=float(rs.progress or 0.0))
         raise HTTPException(status_code=202, detail=f"Run {run_id} status={rs.status}; artifact not ready")
+
     try:
         payload = json.loads(raw)
     except Exception:
         payload = {"artifact": (raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw))}
+
+    # Fire-and-forget summarization if missing
     try:
         if isinstance(payload, dict) and not payload.get("summary"):
             asyncio.create_task(_summarize_run(run_id))
     except Exception:
         pass
+
+    log_json("info", msg="simulate_artifact_ok", run_id=run_id, has_summary=bool(isinstance(payload, dict) and payload.get("summary")))
     return JSONResponse(content=payload)
-@app.get("/simulate/{run_id}/stream")
-async def simulate_stream(run_id: str, _ok: bool = Depends(require_key)):  # was verify_api_key
+
+
+# ------------------ Simulate: SSE progress stream ------------------
+@app.get("/simulate/{run_id}/stream", summary="Server-sent events for progress")
+async def simulate_stream(run_id: str, request: Request, _ok: bool = Security(require_key, scopes=["simulate"])):
     async def event_generator():
         stale_ticks = 0
         last = None
@@ -1994,37 +2783,48 @@ async def simulate_stream(run_id: str, _ok: bool = Depends(require_key)):  # was
             try:
                 if not REDIS:
                     yield 'data: {"status":"error","progress":0,"detail":"redis_unavailable"}\n\n'
+                    log_json("error", msg="simulate_stream_err", run_id=run_id, reason="redis_unavailable")
                     break
 
                 raw = await REDIS.get(f"run:{run_id}")
                 if not raw:
                     yield 'data: {"status":"error","progress":0,"detail":"run_not_found_or_expired"}\n\n'
+                    log_json("error", msg="simulate_stream_err", run_id=run_id, reason="run_not_found_or_expired")
                     break
 
                 txt = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 rs = RunState.model_validate_json(txt)
 
-                payload = {"status": rs.status, "progress": float(rs.progress or 0.0)}
+                progress = float(rs.progress or 0.0)
+                payload = {"status": rs.status, "progress": progress}
                 yield f"data: {json.dumps(payload)}\n\n"
 
+                # Throttle logs: only emit on status/progress change
+                sig = (rs.status, round(progress, 2))
+                if sig != last:
+                    last = sig
+                    log_json("info", msg="simulate_stream_tick", run_id=run_id, status=rs.status, progress=round(progress, 4))
+
                 if rs.status in ("done", "error"):
+                    if rs.error:
+                        yield f'data: {json.dumps({"error": rs.error})}\n\n'
                     break
 
-                sig = (rs.status, round(float(rs.progress or 0.0), 2))  # <- fix stall check
+                # Stall detector (~2 minutes)
                 if sig == last:
                     stale_ticks += 1
                 else:
                     stale_ticks = 0
-                    last = sig
-
-                if stale_ticks > 120:  # ~2 minutes
+                if stale_ticks > 120:
                     yield 'data: {"status":"error","progress":0,"detail":"stalled"}\n\n'
+                    log_json("error", msg="simulate_stream_err", run_id=run_id, reason="stalled")
                     break
 
                 await asyncio.sleep(1.0)
 
             except Exception as e:
                 yield f'data: {json.dumps({"status":"error","progress":0,"detail":str(e)[:200]})}\n\n'
+                log_json("error", msg="simulate_stream_err", run_id=run_id, error=str(e)[:200])
                 break
 
     return StreamingResponse(
@@ -2032,7 +2832,6 @@ async def simulate_stream(run_id: str, _ok: bool = Depends(require_key)):  # was
         media_type="text/event-stream",
         headers={"Cache-Control":"no-cache","Connection":"keep-alive","X-Accel-Buffering":"no"},
     )
-
 # ===== Bulk EOD ingest to DuckDB (stocks + crypto) ============================
 def _poly_to_app_symbol(s: str) -> str:
     # "X:BTCUSD" -> "BTC-USD"; "BTCUSD" -> "BTC-USD"; equities unchanged
@@ -2064,45 +2863,70 @@ async def llm_shortlist(kind: str, symbols: list[str], top_k: int = 20) -> list[
         ),
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as cli:
-            r = await cli.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={"Authorization": f"Bearer {key}"},
-                json={
-                    "model": os.getenv("XAI_MODEL", "grok-4-latest"),
-                    "messages": [prompt],
-                    "response_format": {"type": "json_object"},
-                    "temperature": 0.1,
-                },
-            )
-            r.raise_for_status()
-            body = r.json()
-            content = body["choices"][0]["message"]["content"]
-            js = json.loads(content)
-            lst = js.get("list") or []
-            # Keep only items that existed in the input, unique, preserve LLM order
-            picked = []
-            seen = set()
-            allowed = set(base)
-            for x in lst:
-                s = str(x).upper().strip()
-                if s in allowed and s not in seen:
-                    picked.append(s)
-                    seen.add(s)
-                if len(picked) >= top_k:
-                    break
-            # Fallback: fill the remainder from the original order
-            if len(picked) < top_k:
-                for s in base:
-                    if s not in seen:
+    attempts = max(1, int(os.getenv("PT_LLM_RETRY_ATTEMPTS", "2")))
+    backoff = float(os.getenv("PT_LLM_RETRY_BACKOFF", "1.5"))
+
+    for attempt in range(1, attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as cli:
+                r = await cli.post(
+                    "https://api.x.ai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={
+                        "model": os.getenv("XAI_MODEL", "grok-4-latest"),
+                        "messages": [prompt],
+                        "response_format": {"type": "json_object"},
+                        "temperature": 0.1,
+                    },
+                )
+                r.raise_for_status()
+                body = r.json()
+                content = body["choices"][0]["message"]["content"]
+                js = json.loads(content)
+                lst = js.get("list") or []
+                log_json(
+                    "info",
+                    msg="llm_shortlist_result",
+                    provider="xai",
+                    kind=kind,
+                    attempt=attempt,
+                    requested=top_k,
+                    returned=len(lst),
+                    items=lst,
+                )
+                picked: list[str] = []
+                seen: set[str] = set()
+                allowed = set(base)
+                for x in lst:
+                    s = str(x).upper().strip()
+                    if s in allowed and s not in seen:
                         picked.append(s)
+                        seen.add(s)
+                    if len(picked) >= top_k:
+                        break
+                if len(picked) < top_k:
+                    for s in base:
+                        if s not in seen:
+                            picked.append(s)
+                            seen.add(s)
                         if len(picked) >= top_k:
                             break
-            return picked[:top_k]
-    except Exception as e:
-        logger.warning(f"llm_shortlist failed; falling back: {e}")
-        return base[:top_k]
+                if picked:
+                    return picked[:top_k]
+                raise ValueError("empty shortlist after filtering")
+        except Exception as e:
+            logger.warning(f"llm_shortlist attempt {attempt}/{attempts} failed: {e}")
+            if attempt < attempts:
+                await asyncio.sleep(backoff * attempt)
+                continue
+            log_json(
+                "warning",
+                msg="llm_shortlist_fallback",
+                kind=kind,
+                attempts=attempts,
+                error=str(e),
+            )
+            return base[:top_k]
 
 # ====== Simulation → LLM Summary =============================================
 def _band_last(bands: dict, key: str):
@@ -2340,6 +3164,54 @@ async def _summarize_run(run_id: str, force: bool = False) -> dict:
     return out
 
 
+async def _load_precomputed_quant(kind: str, day: str) -> list[dict]:
+    """
+    Optional hook: callers can push pre-ranked or fully-evaluated quant picks into Redis.
+    Uses key quant:calc:{day}:{kind}. Items should be list[dict] with at least {"symbol": "..."}.
+    """
+    if not REDIS:
+        return []
+    key = f"quant:calc:{day}:{kind}"
+    try:
+        raw = await REDIS.get(key)
+        if not raw:
+            return []
+        data = json.loads(raw)
+        if isinstance(data, list):
+            norm = [item for item in data if isinstance(item, dict) and item.get("symbol")]
+            if norm:
+                log_json("info", msg="quant_preload", kind=kind, items=len(norm))
+            return norm
+    except Exception as exc:
+        logger.warning("Failed to load precomputed quant data for %s: %s", key, exc)
+    return []
+
+
+def _normalize_precomputed_result(item: dict, horizon: int) -> dict:
+    out = dict(item)
+    out.setdefault("horizon_days", horizon)
+    out.setdefault("ok", True)
+    return out
+
+
+def _combine_mc_results(prefinal: list[dict], computed: list[dict]) -> list[dict]:
+    seen: set[str] = set()
+    combined: list[dict] = []
+    for row in prefinal:
+        sym = str(row.get("symbol") or "").upper()
+        if sym and sym not in seen:
+            combined.append(row)
+            seen.add(sym)
+    for row in computed:
+        if not isinstance(row, dict) or not row.get("ok"):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        if sym and sym not in seen:
+            combined.append(row)
+            seen.add(sym)
+    return combined
+
+
 # ===== DAILY QUANT (shortlist → MC → LLM → persist) ===========================
 
 async def _quick_score(symbol: str) -> dict:
@@ -2364,9 +3236,9 @@ async def _quick_score(symbol: str) -> dict:
         return {"symbol": symbol, "ok": False}
 
 async def _rank_candidates(symbols: Sequence[str], top_k: int = 8) -> list[dict]:
-    max_tasks   = int(os.getenv("PT_QS_TASKS", "12"))
-    concurrency = int(os.getenv("PT_POLY_CONC", "2"))
-    jitter_ms   = int(os.getenv("PT_QS_JITTER_MS", "0"))
+    max_tasks   = int(os.getenv("PT_QS_TASKS", "6"))
+    concurrency = int(os.getenv("PT_POLY_CONC", "1"))
+    jitter_ms   = int(os.getenv("PT_QS_JITTER_MS", "350"))
 
     # Deterministic daily shuffle so we don't bias alphabetically
     seed = os.getenv("PT_DAILY_SEED") or datetime.utcnow().strftime("%Y%m%d")
@@ -2404,8 +3276,9 @@ async def _rank_candidates(symbols: Sequence[str], top_k: int = 8) -> list[dict]
 
     return good[:top_k]
 
-async def _mc_for(symbol: str, horizon: int = 30, paths: int = 6000) -> tuple[str, dict]:
+async def _mc_for(symbol: str, horizon: int | None = None, paths: int = 6000) -> tuple[str, dict]:
     """Run a one-off MC inline (reusing your worker) and summarize for the judge."""
+    horizon = int(horizon or settings.daily_quant_horizon_days)
     req = SimRequest(symbol=_to_polygon_ticker(symbol), horizon_days=int(horizon), paths=int(paths))
     run_id = uuid4().hex
     rs = RunState(run_id=run_id, status="queued", progress=0.0, symbol=req.symbol,
@@ -2454,9 +3327,10 @@ async def _mc_for(symbol: str, horizon: int = 30, paths: int = 6000) -> tuple[st
     return symbol, summary
 
 
-async def _mc_batch(cands: list[dict], horizon=30, paths=8000) -> list[dict]:
+async def _mc_batch(cands: list[dict], horizon: int | None = None, paths: int = 8000) -> list[dict]:
     picks = cands[:3]  # compute budget: top-3 only
-    tasks = [asyncio.create_task(_mc_for(x["symbol"], horizon, paths)) for x in picks]
+    hz = int(horizon or settings.daily_quant_horizon_days)
+    tasks = [asyncio.create_task(_mc_for(x["symbol"], hz, paths)) for x in picks]
     out = []
     for t in asyncio.as_completed(tasks):
         _sym, summary = await t
@@ -2615,9 +3489,9 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
     """
     # --- config ---
     today_str = datetime.now(timezone.utc).date().isoformat()
-    horizon = int(horizon_days or int(os.getenv("PT_DEFAULT_HORIZON_DAYS", "30")))
-    seed_k  = int(os.getenv("PT_DAILY_SEED_K", "20"))
-    rank_k  = int(os.getenv("PT_DAILY_RANK_K", "5"))
+    horizon = int(horizon_days or settings.daily_quant_horizon_days)
+    seed_k  = int(os.getenv("PT_DAILY_SEED_K", "6"))
+    rank_k  = int(os.getenv("PT_DAILY_RANK_K", "3"))
     mc_conc = int(os.getenv("PT_MC_CONC", "4"))
 
     top_n   = max(1, int(os.getenv("PT_TOP_N", "1")))
@@ -2631,20 +3505,43 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
         logger.warning("Watchlists are empty or missing; equity=%d crypto=%d",
                        len(eq_watch or []), len(cr_watch or []))
 
-    # --- 1) LLM shortlist (deterministic seeded fallback inside llm_shortlist) ---
-    eq_seed: list[str] = await llm_shortlist("equity", list(eq_watch), top_k=seed_k)
-    cr_seed: list[str] = await llm_shortlist("crypto", list(cr_watch), top_k=seed_k)
+    precomp_eq = await _load_precomputed_quant("equity", today_str)
+    precomp_cr = await _load_precomputed_quant("crypto", today_str)
 
-    # --- 2) Prescreen/rank finalists ---
-    eq_rank: list[dict] = await _rank_candidates(eq_seed, top_k=rank_k)
-    cr_rank: list[dict] = await _rank_candidates(cr_seed, top_k=rank_k)
+    eq_prefinal = [_normalize_precomputed_result(item, horizon) for item in precomp_eq if "prob_up_end" in item]
+    cr_prefinal = [_normalize_precomputed_result(item, horizon) for item in precomp_cr if "prob_up_end" in item]
+    eq_precandidates = [item for item in precomp_eq if "prob_up_end" not in item]
+    cr_precandidates = [item for item in precomp_cr if "prob_up_end" not in item]
+
+    # --- 1) Candidate generation (LLM shortlist or external feed) ---
+    if eq_precandidates:
+        eq_rank: list[dict] = [
+            {"symbol": item["symbol"], "score": float(item.get("score", 1.0)), "source": "external"}
+            for item in eq_precandidates
+        ]
+        log_json("info", msg="quant_candidates_external", kind="equity", items=len(eq_rank))
+    else:
+        eq_seed: list[str] = await llm_shortlist("equity", list(eq_watch), top_k=seed_k)
+        eq_rank = await _rank_candidates(eq_seed, top_k=rank_k)
+
+    if cr_precandidates:
+        cr_rank: list[dict] = [
+            {"symbol": item["symbol"], "score": float(item.get("score", 1.0)), "source": "external"}
+            for item in cr_precandidates
+        ]
+        log_json("info", msg="quant_candidates_external", kind="crypto", items=len(cr_rank))
+    else:
+        cr_seed: list[str] = await llm_shortlist("crypto", list(cr_watch), top_k=seed_k)
+        cr_rank = await _rank_candidates(cr_seed, top_k=rank_k)
 
     # Quick visibility in logs
     try:
-        logger.info("Equity prescreen finalists: %s",
-                    [(r.get("symbol"), round(r.get("score") or 0.0, 4)) for r in eq_rank])
-        logger.info("Crypto prescreen finalists: %s",
-                    [(r.get("symbol"), round(r.get("score") or 0.0, 4)) for r in cr_rank])
+        if eq_rank:
+            logger.info("Equity prescreen finalists: %s",
+                        [(r.get("symbol"), round(r.get("score") or 0.0, 4)) for r in eq_rank])
+        if cr_rank:
+            logger.info("Crypto prescreen finalists: %s",
+                        [(r.get("symbol"), round(r.get("score") or 0.0, 4)) for r in cr_rank])
     except Exception:
         pass
 
@@ -2679,7 +3576,8 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
                     return await fn(symbol, hz)
                 # run sync MC off-thread so we don't block the loop
                 return await asyncio.to_thread(fn, symbol, hz)
-        raise RuntimeError("Monte-Carlo helper not found; adjust _mc_summary() call-site.")
+        _sym, summary = await _mc_for(symbol, hz)
+        return summary
 
     # --- 3) Run MC on finalists (concurrency-limited) ---
     async def _mc_batch(finalists: Sequence[dict]) -> list[dict]:
@@ -2700,12 +3598,11 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
 
         return await asyncio.gather(*(_one(x) for x in finalists))
 
-    eq_mc = await _mc_batch(eq_rank)
-    cr_mc = await _mc_batch(cr_rank)
+    eq_mc = await _mc_batch(eq_rank) if eq_rank else []
+    cr_mc = await _mc_batch(cr_rank) if cr_rank else []
 
-    # Keep only successful MC results
-    eq_mc_ok = [x for x in eq_mc if x.get("ok")]
-    cr_mc_ok = [x for x in cr_mc if x.get("ok")]
+    eq_mc_ok = _combine_mc_results(eq_prefinal, eq_mc)
+    cr_mc_ok = _combine_mc_results(cr_prefinal, cr_mc)
 
     # --- 4) Pick winners (highest prob_up_end, then median_return_pct as tiebreak) ---
     def _winner(lst: list[dict]) -> dict:
@@ -2747,10 +3644,55 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
             if expose_finalists:
                 await REDIS.set(f"{base}:equity_finalists", json.dumps(eq_mc_ok))
                 await REDIS.set(f"{base}:crypto_finalists", json.dumps(cr_mc_ok))
+            await REDIS.setex(f"{base}:done", 27 * 3600, "1")
         except Exception as e:
             logger.warning("Failed to cache daily results in Redis: %s", e)
 
     return payload
+
+
+async def _daily_quant_scheduler() -> None:
+    global _LAST_SCHEDULED_QUANT
+    await asyncio.sleep(random.uniform(5.0, 25.0))
+    while True:
+        now_utc = datetime.now(timezone.utc)
+        now_local = now_utc.astimezone(DAILY_QUANT_TZ)
+        today_str = now_local.date().isoformat()
+        target_local = now_local.replace(hour=DAILY_QUANT_HOUR, minute=DAILY_QUANT_MINUTE, second=0, microsecond=0)
+
+        done = False
+        if REDIS:
+            try:
+                done = bool(await REDIS.exists(f"quant:daily:{today_str}:done"))
+            except Exception:
+                done = False
+        if _LAST_SCHEDULED_QUANT == today_str:
+            done = True
+
+        if not done and now_local >= target_local:
+            try:
+                payload = await _run_daily_quant(horizon_days=settings.daily_quant_horizon_days)
+                as_of = payload.get("as_of") or today_str
+                _LAST_SCHEDULED_QUANT = as_of
+                if REDIS and as_of != today_str:
+                    try:
+                        await REDIS.setex(f"quant:daily:{as_of}:done", 27 * 3600, "1")
+                    except Exception:
+                        pass
+                log_json("info", msg="quant_daily_scheduler_ok", as_of=as_of)
+            except Exception as exc:
+                log_json("error", msg="quant_daily_scheduler_fail", error=str(exc))
+                await asyncio.sleep(300)
+            else:
+                await asyncio.sleep(90)
+            continue
+
+        if now_local < target_local:
+            delay = (target_local - now_local).total_seconds()
+        else:
+            next_target = target_local + timedelta(days=1)
+            delay = (next_target - now_local).total_seconds()
+        await asyncio.sleep(max(60, min(delay, 3600)))
 
 def _poly_key_present() -> bool:
     return bool(os.getenv("PT_POLYGON_KEY") or os.getenv("POLYGON_KEY"))
@@ -2758,34 +3700,95 @@ def _poly_key_present() -> bool:
 def _is_weekend(d) -> bool:
     return d.weekday() >= 5  # 5=Sat, 6=Sun
 
-@app.post("/admin/cron/daily")
+@app.post("/admin/cron/daily", summary="Run daily label + online learn")
 async def admin_cron_daily(
-    n: int = 20,              # how many symbols to learn
+    request: Request,
+    n: int = 20,              # how many symbols to learn (per list; equity+crypto de-duped)
     steps: int = 50,          # SGD steps per symbol
     batch: int = 32,          # minibatch size
     _ok: bool = Depends(require_key),
 ):
-    # 1) Label anything matured
-    lab = await outcomes_label(limit=20000, _api_key=True)  # reuse route logic
+    job = "cron_daily"
+    t0 = time.perf_counter()
+    started_at = datetime.now(timezone.utc).isoformat()
+    enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
 
-    # 2) Learn on the top-N of your watchlists (equity + crypto)
-    syms = list(dict.fromkeys(list(WL_EQ)[:n] + list(WL_CR)[:n]))
-    learned = []
-    for s in syms:
-        try:
-            res = await learn_online(
-                OnlineLearnRequest(symbol=s, steps=steps, batch=batch), _api_key=True
-            )
-            learned.append({"symbol": s, "status": res.get("status", "ok")})
-        except Exception as e:
-            learned.append({"symbol": s, "status": "error", "error": str(e)})
+    try:
+        # -------- Start --------
+        log_json("info", msg="cron_start", job=job, n=n, steps=steps, batch=batch)
 
-    return {
-        "ran_at": datetime.now(timezone.utc).isoformat(),
-        "labeled": lab,
-        "n_symbols": len(syms),
-        "learned": learned,
-    }
+        # 1) Label anything matured
+        label_t0 = time.perf_counter()
+        lab = await outcomes_label(limit=20000, _api_key=True)  # reuse route logic
+        label_sec = round(time.perf_counter() - label_t0, 3)
+        log_json("info", msg="cron_labeled", job=job, labeled=lab, duration_s=label_sec)
+
+        # 2) Build symbol set (equity + crypto)
+        syms = list(dict.fromkeys(list(WL_EQ)[:n] + list(WL_CR)[:n]))
+        log_json("info", msg="cron_symbols_prepared", job=job, n_symbols=len(syms))
+
+        # 3) Online learn with small retry loop per symbol
+        learned: list[dict] = []
+        ok_count = 0
+        err_count = 0
+
+        async def learn_one(sym: str) -> dict:
+            sym_t0 = time.perf_counter()
+            last_err = None
+            for attempt in (1, 2):  # 2 attempts
+                try:
+                    res = await learn_online(
+                        OnlineLearnRequest(symbol=sym, steps=steps, batch=batch),
+                        _api_key=True,
+                    )
+                    dur = round(time.perf_counter() - sym_t0, 3)
+                    log_json("info", msg="learn_ok", job=job, symbol=sym, attempt=attempt, duration_s=dur)
+                    return {"symbol": sym, "status": res.get("status", "ok"), "attempt": attempt, "duration_s": dur}
+                except Exception as e:
+                    last_err = str(e)
+                    log_json("error", msg="learn_err", job=job, symbol=sym, attempt=attempt, error=last_err)
+                    # brief backoff on first failure
+                    if attempt == 1:
+                        await asyncio.sleep(0.5)
+            dur = round(time.perf_counter() - sym_t0, 3)
+            return {"symbol": sym, "status": "error", "error": last_err or "unknown", "attempt": 2, "duration_s": dur}
+
+        # sequential to avoid hammering providers; flip to gather() if desired
+        for s in syms:
+            item = await learn_one(s)
+            learned.append(item)
+            if item.get("status") == "ok":
+                ok_count += 1
+            else:
+                err_count += 1
+
+        # -------- Finish --------
+        total_sec = round(time.perf_counter() - t0, 3)
+        summary = {
+            "ok": True,
+            "job": job,
+            "started_at": started_at,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "duration_s": total_sec,
+            "labeled": lab,
+            "n_symbols": len(syms),
+            "learn_ok": ok_count,
+            "learn_err": err_count,
+            "learned": learned,
+            "params": {"n": n, "steps": steps, "batch": batch},
+        }
+
+        # increment success counter + structured log
+        job_ok(job, n=n, steps=steps, batch=batch, duration_s=total_sec, learn_ok=ok_count, learn_err=err_count)
+        log_json("info", msg="cron_done", **summary)
+        return summary
+
+    except Exception as e:
+        # increment fail counter + structured log + HTTP 500
+        err_msg = str(e)
+        job_fail(job, err=err_msg, n=n, steps=steps, batch=batch)
+        log_json("error", msg="cron_failed", job=job, error=err_msg)
+        raise HTTPException(status_code=500, detail=f"{job} failed: {err_msg}")
 
 # --- IBM Quantum / Qiskit diagnostics ---
 @app.get("/quant/aer/diag")
@@ -2899,8 +3902,9 @@ async def _quant_consume(redis: Redis) -> None:
     except Exception:
         pass
 # --- Backfill with politeness pause between days ---
+#------------ADMIN -----------------------
 @app.post("/admin/ingest/backfill")
-async def admin_ingest_backfill(days: int = 7, _ok: bool = Depends(require_key)):
+async def admin_ingest_backfill(days: int = 7, _ok: bool = Security(require_key, scopes=["admin"])):
     base = datetime.now(timezone.utc).date()
     total = 0
     pause_s = float(os.getenv("PT_BACKFILL_PAUSE_S", "2.5"))  # <— NEW
@@ -2910,11 +3914,79 @@ async def admin_ingest_backfill(days: int = 7, _ok: bool = Depends(require_key))
         await asyncio.sleep(pause_s)  # <— NEW
     return {"ok": True, "days": int(days), "rows": total}
 
+@app.get("/admin/logs/latest", summary="Fetch recent service logs (in-memory buffer)")
+async def admin_logs_latest(n: int = 200, _ok: bool = Security(require_key, scopes=["admin"])):
+    try:
+        items = get_recent_logs(n=n)
+        return {"ok": True, "count": len(items), "logs": items}
+    except Exception as e:
+        log_json("error", msg="admin_logs_latest_fail", error=str(e))
+        raise HTTPException(status_code=500, detail="failed to fetch logs")
+
+@app.post("/admin/plan/set", summary="Set subscription plan for an API key (free|pro|inst)")
+async def admin_plan_set(
+    api_key: str = Body(..., embed=True),
+    plan: str = Body(..., embed=True),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    try:
+        new_plan = set_plan_for_key(REDIS, api_key, plan)
+        log_json("info", msg="admin_plan_set", target_key=f"...{api_key[-6:]}", plan=new_plan)
+        return {"ok": True, "api_key_tail": api_key[-6:], "plan": new_plan}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        log_json("error", msg="admin_plan_set_fail", error=str(e))
+        raise HTTPException(status_code=500, detail="failed_to_set_plan")
+
+@app.get("/admin/plan/get", summary="Get subscription plan for an API key")
+async def admin_plan_get(api_key: str = Query(...), _ok: bool = Security(require_key, scopes=["admin"])):
+    try:
+        plan = get_plan_for_key(REDIS, api_key)
+        return {"ok": True, "api_key_tail": api_key[-6:], "plan": plan}
+    except Exception as e:
+        log_json("error", msg="admin_plan_get_fail", error=str(e))
+        raise HTTPException(status_code=500, detail="failed_to_get_plan")
+
+@app.get("/me/limits", summary="Return caller plan and usage/limits for key scopes")
+async def me_limits(request: Request, _ok: bool = Depends(require_key)):
+    try:
+        used_sim, limit_sim, plan_sim, caller = usage_today(REDIS, request, scope="simulate")
+        used_cron, limit_cron, plan_cron = usage_today_for_caller(REDIS, caller, scope="cron")
+        # Both scopes use the same plan; prefer simulate’s read
+        plan = plan_sim or plan_cron
+
+        # seconds until UTC midnight (quota reset hint)
+        now = datetime.now(timezone.utc)
+        tomorrow = (now + timedelta(days=1)).date()
+        reset_at = datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc)
+        seconds_to_reset = int((reset_at - now).total_seconds())
+
+        payload = {
+            "ok": True,
+            "plan": plan,
+            "caller": caller,
+            "reset_secs": seconds_to_reset,
+            "per_min_caps": {
+                "base": BASE_LIMIT_PER_MIN,
+                "simulate": SIM_LIMIT_PER_MIN,
+                "cron": CRON_LIMIT_PER_MIN,
+            },
+            "daily": {
+                "simulate": {"used": used_sim, "limit": limit_sim, "remaining": max(0, limit_sim - used_sim)},
+                "cron": {"used": used_cron, "limit": limit_cron, "remaining": max(0, limit_cron - used_cron)},
+            },
+        }
+        log_json("info", msg="me_limits", plan=plan, caller_tail=caller[-8:])
+        return payload
+    except Exception as e:
+        log_json("error", msg="me_limits_fail", error=str(e))
+        raise HTTPException(status_code=500, detail="failed_to_get_limits")
 
 @app.post("/admin/ingest/daily")
 async def admin_ingest_daily(
     d: Optional[str] = Query(None, description="YYYY-MM-DD (UTC)"),
-    _ok: bool = Depends(require_key),
+    _ok: bool = Security(require_key, scopes=["admin"]),
 ):
     """
     Trigger grouped-daily ingest into DuckDB (creates/updates bars_daily).
@@ -2931,7 +4003,7 @@ async def admin_ingest_daily(
 # ===== DAILY QUANT routes =====================================================
 
 @app.post("/quant/daily/run")
-async def quant_daily_run(horizon: int = 30, _ok: bool = Depends(require_key)):
+async def quant_daily_run(horizon: int | None = None, _ok: bool = Security(require_key, scopes=["cron"])):
     # Avoid over-computation if multiple schedulers/clients call in the same day
     budget = int(os.getenv("PT_QUANT_BUDGET_PER_DAY", "6"))  # e.g., allow up to 6 runs/day
     if REDIS:
@@ -2942,7 +4014,7 @@ async def quant_daily_run(horizon: int = 30, _ok: bool = Depends(require_key)):
         except Exception:
             pass
 
-    out = await _run_daily_quant(horizon_days=int(horizon))
+    out = await _run_daily_quant(horizon_days=int(horizon or settings.daily_quant_horizon_days))
 
     if REDIS:
         try: await _quant_consume(REDIS)
@@ -3311,48 +4383,6 @@ async def get_news(
 
     return result
 
-    # map results
-    seen: set[str] = set()
-    processed: list[dict] = []
-    for item in news:
-        nid = item.get("id") or item.get("url") or item.get("article_url")
-        if not nid or nid in seen:
-            continue
-        seen.add(nid)
-        title = item.get("title", "") or ""
-        processed.append(
-            {
-                "id": nid,
-                "title": title,
-                "url": item.get("article_url") or item.get("url", "") or "",
-                "published_at": item.get("published_utc", "") or "",
-                "source": (item.get("publisher") or {}).get("name", "") or "",
-                "sentiment": _safe_sent(title),
-                "image_url": item.get("image_url", "") or "",
-            }
-        )
-
-    processed.sort(key=lambda x: x.get("published_at", "") or "", reverse=True)
-
-    # extract next_cursor safely
-    next_cursor = None
-    if next_url:
-        try:
-            from urllib.parse import urlparse, parse_qs
-            q = parse_qs(urlparse(next_url).query)
-            next_cursor = q.get("cursor", [None])[0]
-        except Exception:
-            next_cursor = None
-
-    result = {"items": processed, "nextCursor": next_cursor}
-
-    if REDIS:
-        try:
-            await REDIS.setex(cache_key, 3600, json.dumps(result))
-        except Exception as e:
-            logger.warning(f"Redis setex failed for {cache_key}: {e}")
-
-    return result
 # --- Options snapshot (Polygon) ---
 @app.get("/options/{symbol}")
 async def get_options_snapshot(
@@ -3836,16 +4866,6 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
         "p95": q95,
         "spot0": spot0,
     }
-
-
-@app.get("/models")
-async def models(_api_key: str = Depends(require_key)):
-    load_learners()
-    load_tensorflow()
-    if not TF_AVAILABLE:
-        raise HTTPException(status_code=500, detail="TensorFlow not available")
-    return {"models": await _list_models()}
-
 @app.get("/ui/fan-chart.tsx")
 async def get_fan_chart_tsx():
     # Only try to read the file if FRONTEND_DIR is provided
@@ -3883,3 +4903,7 @@ else:
             "status": "ok",
             "message": "SIMETRIX.IO API Is Running."
         }
+
+
+
+
