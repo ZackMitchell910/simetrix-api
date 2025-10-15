@@ -1,7 +1,7 @@
 services:
   # -------------------- WEB API --------------------
   - type: web
-    name: pathpanda-api
+    name: simetrix-api
     env: python
     region: oregon
     plan: starter

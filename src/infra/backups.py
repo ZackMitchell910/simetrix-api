@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import shutil
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+
+import duckdb
 
 
 def _prune_old_backups(folder: Path, stem_prefix: str, keep: int) -> None:
@@ -22,7 +23,7 @@ def _prune_old_backups(folder: Path, stem_prefix: str, keep: int) -> None:
 
 def create_duckdb_backup(db_path: str | Path, target_dir: str | Path, *, keep: int = 7) -> Path:
     """
-    Copy the DuckDB file at `db_path` into `target_dir` with a UTC timestamp suffix.
+    Create an online DuckDB backup at `db_path` into `target_dir` with a UTC timestamp suffix.
 
     Parameters
     ----------
@@ -47,7 +48,19 @@ def create_duckdb_backup(db_path: str | Path, target_dir: str | Path, *, keep: i
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     stem = src.stem or "duckdb"
     dest = target / f"{stem}-{timestamp}.duckdb"
-    shutil.copy2(src, dest)
+
+    # Export the live database to a temporary directory, then import into the
+    # destination file. This keeps the primary writer connection online.
+    with tempfile.TemporaryDirectory(prefix=f"{stem}-export-") as tmp_dir:
+        export_path = Path(tmp_dir) / "export"
+        export_path.mkdir(parents=True, exist_ok=True)
+
+        export_sql_path = export_path.as_posix().replace("'", "''")
+        with duckdb.connect(str(src)) as source_con:
+            source_con.execute(f"EXPORT DATABASE '{export_sql_path}'")
+
+        with duckdb.connect(str(dest)) as dest_con:
+            dest_con.execute(f"IMPORT DATABASE '{export_sql_path}'")
 
     keep = max(1, int(keep))
     _prune_old_backups(target, stem, keep)
