@@ -1698,6 +1698,11 @@ class SimRequest(BaseModel):
     def young_threshold_bars(self) -> int:
         return 126 * self.bars_per_day()
 
+TRAIN_REFRESH_HOURS = float(os.getenv("PT_TRAIN_REFRESH_HOURS", "12") or 0)
+TRAIN_REFRESH_DELTA = timedelta(hours=TRAIN_REFRESH_HOURS) if TRAIN_REFRESH_HOURS > 0 else None
+QUICK_TRAIN_LOOKBACK_DAYS = max(30, min(settings.lookback_days_max, int(os.getenv("PT_TRAIN_QUICK_LOOKBACK_DAYS", "180"))))
+DEEP_TRAIN_LOOKBACK_DAYS = max(30, min(settings.lookback_days_max, int(os.getenv("PT_TRAIN_DEEP_LOOKBACK_DAYS", "3650"))))
+
 class TrainRequest(BaseModel):
     symbol: str
     lookback_days: int = Field(default=365, ge=30, le=3650)
@@ -2242,6 +2247,11 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             window_days = 180 if mode == "quick" else int(min(settings.lookback_days_max, 3650))
         else:
             window_days = _dynamic_window_days(req.horizon_days, req.timespan)
+
+        # Ensure prerequisite models are trained with an appropriate lookback
+        desired_lookback = DEEP_TRAIN_LOOKBACK_DAYS if mode == "deep" else QUICK_TRAIN_LOOKBACK_DAYS
+        desired_lookback = int(min(settings.lookback_days_max, desired_lookback))
+        await _ensure_trained_models(req.symbol, required_lookback=desired_lookback)
 
         # ---------- Fetch prices ----------
         historical_prices = await _fetch_cached_hist_prices(req.symbol, window_days, redis)
@@ -4512,26 +4522,42 @@ async def x_sentiment(symbol: str, handles: str = "", _api_key: str = Depends(re
     x_sent = max(-0.2, min(0.2, score)) if sample_posts else 0.0
     return {"symbol": s, "x_sentiment": float(x_sent), "sample_posts": sample_posts[:3], "handles_used": handles or "general"}
 
-#---------Train--------------------
-@app.post("/train")
-async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
-    px = await _fetch_hist_prices(req.symbol)
+#---------Train helpers--------------------
+def _parse_trained_at(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
+    if not REDIS:
+        raise HTTPException(status_code=503, detail="redis_unavailable")
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol_required")
+
+    lookback_days = int(max(30, min(lookback_days, settings.lookback_days_max)))
+    px = await _fetch_hist_prices(sym, window_days=lookback_days)
     if not px or len(px) < 10:
         raise HTTPException(status_code=400, detail="Not enough price history")
 
     os.makedirs("models", exist_ok=True)
 
-    # --- Features
-    f = await _feat_from_prices(req.symbol, px)
+    f = await _feat_from_prices(sym, px)
     feature_list = list(f.keys())
 
-    # --- Labels
     rets = np.diff(np.log(np.asarray(px, dtype=float)))
-    y = rets[req.lookback_days:] if len(rets) > req.lookback_days else rets
+    y = rets[lookback_days:] if len(rets) > lookback_days else rets
     if len(y) == 0:
         raise HTTPException(status_code=400, detail="Insufficient data")
 
-    # --- Linear first (always succeeds)
     X_df = pd.DataFrame({feat: [f[feat]] * len(y) for feat in feature_list})
     X = X_df.values
 
@@ -4540,15 +4566,19 @@ async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
     for x_row, yi in zip(X, y):
         model_linear.update(x_row, 1 if yi > 0 else 0)
 
+    trained_at = datetime.now(timezone.utc).isoformat()
     linear_data = {
         "coef": model_linear.w.tolist(),
         "features": feature_list,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "trained_at": trained_at,
         "n_samples": int(len(y)),
+        "lookback_days": int(lookback_days),
+        "symbol": sym,
     }
-    await REDIS.set(await _model_key(req.symbol + "_linear"), json.dumps(linear_data))
+    await REDIS.set(await _model_key(sym + "_linear"), json.dumps(linear_data))
 
-    # --- LSTM (best-effort)
+    models_trained = 1  # linear always trains
+
     try:
         if Sequential is None:
             raise RuntimeError("Keras not available")
@@ -4561,32 +4591,86 @@ async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
         X_reshaped = np.expand_dims(X, axis=1)
         y_binary = (y > 0).astype(int)
         model_lstm.fit(X_reshaped, y_binary, epochs=5, verbose=0)
-        model_lstm.save(f"models/{req.symbol}_lstm.keras")
+        model_lstm.save(f"models/{sym}_lstm.keras")
+        models_trained += 1
     except Exception as e:
         logger.warning(f"LSTM skipped: {e}")
 
-    # --- ARIMA (fallbacks)
     try:
         order = (5, 1, 0) if len(px) >= 30 else (1, 1, 0)
         model_arima = ARIMA(px, order=order).fit()
-        with open(f"models/{req.symbol}_arima.pkl", "wb") as file:
+        with open(f"models/{sym}_arima.pkl", "wb") as file:
             pickle.dump(model_arima, file)
+        models_trained += 1
     except Exception as e:
         logger.warning(f"ARIMA skipped: {e}")
 
-    # --- RL (best-effort; consistent window)
     try:
         if gym is None or DQN is None:
             raise RuntimeError("RL libs not available")
         env = StockEnv(px, window_len=RL_WINDOW)
         model_rl = DQN("MlpPolicy", env, verbose=0)
         model_rl.learn(total_timesteps=10_000)
-        model_rl.save(f"models/{req.symbol}_rl.zip")
+        model_rl.save(f"models/{sym}_rl.zip")
         env.close()
+        models_trained += 1
     except Exception as e:
         logger.warning(f"RL skipped: {e}")
 
-    return {"status": "ok", "models_trained": 4}
+    return {
+        "status": "ok",
+        "symbol": sym,
+        "models_trained": int(models_trained),
+        "lookback_days": int(lookback_days),
+        "trained_at": trained_at,
+        "n_samples": int(len(y)),
+    }
+
+
+async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None:
+    if not REDIS:
+        raise HTTPException(status_code=503, detail="redis_unavailable")
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol_required")
+
+    required_lookback = int(max(30, min(required_lookback, settings.lookback_days_max)))
+
+    try:
+        model_key = await _model_key(sym + "_linear")
+    except TypeError:
+        model_key = _model_key(sym + "_linear")
+
+    raw = await REDIS.get(model_key)
+    if raw:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+        stored_lookback = int(data.get("lookback_days") or 0)
+        trained_at = _parse_trained_at(data.get("trained_at"))
+
+        is_fresh = True
+        if TRAIN_REFRESH_DELTA:
+            if trained_at is None:
+                is_fresh = False
+            else:
+                age = datetime.now(timezone.utc) - trained_at
+                is_fresh = age <= TRAIN_REFRESH_DELTA
+
+        if stored_lookback >= required_lookback and is_fresh:
+            return
+
+    await _train_models(sym, lookback_days=required_lookback)
+
+
+@app.post("/train")
+async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
+    return await _train_models(req.symbol, lookback_days=req.lookback_days)
 
 if gym is not None:
     class StockEnv(gym.Env):  # type: ignore[attr-defined]
