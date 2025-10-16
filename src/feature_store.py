@@ -9,12 +9,44 @@ PathPanda DuckDB Feature Store
 
 from __future__ import annotations
 import os, json, datetime as dt
+import logging
+from pathlib import Path
 from typing import Iterable, Optional, Mapping, Any, List, Tuple
 
 import duckdb
 import numpy as np
 
-DB_PATH = os.getenv("PT_DB_PATH", "data/pathpanda.duckdb")
+
+def _default_data_root() -> Path:
+    env_root = os.getenv("PT_DATA_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    container_root = Path("/data")
+    if container_root.exists() and os.access(container_root, os.W_OK):
+        return container_root
+    fallback = Path(__file__).resolve().parents[2] / "data"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback.resolve()
+
+
+DATA_ROOT = _default_data_root()
+os.environ.setdefault("PT_DATA_ROOT", str(DATA_ROOT))
+logger = logging.getLogger(__name__)
+
+
+def _ensure_db_path(path_str: str) -> str:
+    p = Path(path_str).expanduser().resolve()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return str(p)
+    except PermissionError:
+        fallback = (DATA_ROOT / p.name).resolve()
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        logger.warning("Falling back to feature store path %s (original %s not writable)", fallback, p)
+        return str(fallback)
+
+
+DB_PATH = _ensure_db_path(os.getenv("PT_DB_PATH", str((DATA_ROOT / "pathpanda.duckdb").resolve())))
 
 # ---------- Schema ----------
 
@@ -93,6 +125,40 @@ CREATE TABLE IF NOT EXISTS mc_metrics (
 CREATE INDEX IF NOT EXISTS idx_fs_mc_metrics_symbol_time
   ON mc_metrics(symbol, as_of DESC, horizon_days);
 
+CREATE TABLE IF NOT EXISTS news_articles (
+  symbol    TEXT,
+  ts        TIMESTAMP,
+  source    TEXT,
+  title     TEXT,
+  url       TEXT,
+  summary   TEXT,
+  sentiment DOUBLE,
+  PRIMARY KEY (symbol, ts, source, url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_sym_ts
+  ON news_articles(symbol, ts);
+
+CREATE TABLE IF NOT EXISTS earnings (
+  symbol         TEXT,
+  report_date    DATE,
+  eps            DOUBLE,
+  surprise       DOUBLE,
+  revenue        DOUBLE,
+  guidance_delta DOUBLE,
+  PRIMARY KEY (symbol, report_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_earn_sym
+  ON earnings(symbol, report_date);
+
+CREATE TABLE IF NOT EXISTS macro_daily (
+  as_of    DATE PRIMARY KEY,
+  rff      DOUBLE,
+  cpi_yoy  DOUBLE,
+  u_rate   DOUBLE
+);
+
 CREATE SEQUENCE IF NOT EXISTS ingest_log_id_seq START 1;
 
 CREATE TABLE IF NOT EXISTS ingest_log (
@@ -148,6 +214,53 @@ def insert_mc_metrics(con, rows: list[tuple]) -> int:
          lookback_mu, lookback_sigma, seeded_by)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
+    return con.rowcount
+
+def insert_news(con, rows: list[tuple]) -> int:
+    """
+    rows: [(symbol, ts, source, title, url, summary, sentiment), ...]
+    """
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO news_articles
+        (symbol, ts, source, title, url, summary, sentiment)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return con.rowcount
+
+def insert_earnings(con, rows: list[tuple]) -> int:
+    """
+    rows: [(symbol, report_date, eps, surprise, revenue, guidance_delta), ...]
+    """
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO earnings
+        (symbol, report_date, eps, surprise, revenue, guidance_delta)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return con.rowcount
+
+def upsert_macro(con, rows: list[tuple]) -> int:
+    """
+    rows: [(as_of, rff, cpi_yoy, u_rate), ...]
+    """
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO macro_daily (as_of, rff, cpi_yoy, u_rate)
+        VALUES (?, ?, ?, ?)
+        """,
+        rows,
+    )
     return con.rowcount
 
 def log_ingest_event(

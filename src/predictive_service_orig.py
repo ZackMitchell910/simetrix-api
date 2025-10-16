@@ -3614,10 +3614,6 @@ async def get_sim_artifact(run_id: str, request: Request, _ok: bool = Security(r
 # ------------------ Simulate: SSE progress stream ------------------
 @app.get("/simulate/{run_id}/stream", summary="Server-sent events for progress")
 async def simulate_stream(run_id: str, request: Request, _ok: bool = Security(require_key, scopes=["simulate"])):
-    initial_state = await _ensure_run_owned(run_id, request)
-    expected_owner = initial_state.owner
-    elevated = _has_admin_access(request)
-
     async def event_generator():
         stale_ticks = 0
         last = None
@@ -3636,11 +3632,6 @@ async def simulate_stream(run_id: str, request: Request, _ok: bool = Security(re
 
                 txt = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
                 rs = RunState.model_validate_json(txt)
-                current_owner = rs.owner
-                if expected_owner and current_owner and current_owner != expected_owner and not elevated:
-                    yield 'data: {"status":"error","progress":0,"detail":"forbidden"}\n\n'
-                    log_json("error", msg="simulate_stream_err", run_id=run_id, reason="owner_mismatch")
-                    break
 
                 progress = float(rs.progress or 0.0)
                 payload = {"status": rs.status, "progress": progress}
@@ -5909,13 +5900,12 @@ async def quant_daily_history(limit: int = 14, _ok: bool = Depends(require_key))
         raise HTTPException(status_code=500, detail=f"history failed: {e}")
 
 @app.get("/runs/{run_id}/summary")
-async def get_run_summary(run_id: str, request: Request, refresh: int = 0, _ok: bool = Depends(require_key)):
+async def get_run_summary(run_id: str, refresh: int = 0):
     """
     Public: returns cached LLM summary for a completed run_id.
     - 202 while artifact isn't persisted yet
     - ?refresh=1 recomputes and overwrites cache
     """
-    await _ensure_run_owned(run_id, request)
     try:
         return await _summarize_run(run_id, force=bool(refresh))
     except HTTPException as e:

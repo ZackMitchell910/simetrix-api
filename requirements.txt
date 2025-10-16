@@ -5,11 +5,11 @@ httpx>=0.27,<0.28
 pydantic-settings>=2.3,<3
 orjson>=3.10,<4
 python-dotenv>=1.0,<2
-python-multipart>=0.0.20
-sqlmodel>=0.0.18
+python-multipart==0.0.20
+sqlmodel>=0.0.21
 passlib[bcrypt]>=1.7,<2
 python-jose[cryptography]>=3.3,<3.4
-
+pyyaml>=6.0
 # --- Numerics / data
 # Use NumPy >=2.1.0 for Python 3.13 and TF 2.20 compatibility
 numpy>=2.1.0
@@ -21,6 +21,8 @@ duckdb-engine>=0.11,<0.12
 redis>=5,<6
 nltk>=3.9,<4
 ta==0.11.0
+onnx>=1.16,<2
+onnxruntime>=1.18,<2
 
 # --- Testing (optional)
 pytest>=8.2,<9
@@ -39,6 +41,4 @@ qiskit>=1.4.1
 qiskit-aer>=0.15.0
 qiskit-ibm-runtime>=0.41.0
 prometheus-client==0.20.0
-sqlmodel>=0.0.21
 SQLAlchemy>=2.0
-python-multipart==0.0.20

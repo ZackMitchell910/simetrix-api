@@ -15,6 +15,18 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MIGRATIONS_ROOT = _REPO_ROOT / "db_migrations"
 
 
+def _default_data_root() -> Path:
+    env_root = (os.getenv("PT_DATA_ROOT") or "").strip()
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    container_root = Path("/data")
+    if container_root.exists() and os.access(container_root, os.W_OK):
+        return container_root
+    fallback = (_REPO_ROOT / "data").resolve()
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
+
+
 def _normalized_db_path(db_path: str) -> str:
     """
     Expand environment variables and ensure the parent directory exists.
@@ -24,7 +36,15 @@ def _normalized_db_path(db_path: str) -> str:
     p = Path(raw).expanduser()
     if not p.is_absolute():
         p = (_REPO_ROOT / p).resolve()
-    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        fallback_root = _default_data_root()
+        fallback_root.mkdir(parents=True, exist_ok=True)
+        fallback = (fallback_root / p.name).resolve()
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        logger.warning("Path %s not writable; using %s instead", p, fallback)
+        return str(fallback)
     return str(p)
 
 

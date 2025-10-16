@@ -1,13 +1,29 @@
 import os
 import pathlib
 import json
+import logging
 import duckdb
 from typing import Optional, Dict, Any, List, Tuple
 
-# Default: ../data/pt.duckdb relative to this file
+
+def _default_data_root() -> pathlib.Path:
+    env_root = os.getenv("PT_DATA_ROOT")
+    if env_root:
+        return pathlib.Path(env_root).expanduser().resolve()
+    container_root = pathlib.Path("/data")
+    if container_root.exists() and os.access(container_root, os.W_OK):
+        return container_root
+    return pathlib.Path(os.path.join(os.path.dirname(__file__), "..", "..", "data")).resolve()
+
+
+DATA_ROOT = _default_data_root()
+os.environ.setdefault("PT_DATA_ROOT", str(DATA_ROOT))
+logger = logging.getLogger(__name__)
+
+# Default: ../data/pt.duckdb relative to this file (or /data/pt.duckdb in containers)
 DB_PATH = os.getenv(
     "PT_DUCKDB_PATH",
-    os.path.join(os.path.dirname(__file__), "..", "..", "data", "pt.duckdb"),
+    str((DATA_ROOT / "pt.duckdb").resolve()),
 )
 
 DDL = """
@@ -79,9 +95,18 @@ _conn: Optional[duckdb.DuckDBPyConnection] = None
 
 
 def _ensure_dir() -> str:
+    global DB_PATH
     path = pathlib.Path(DB_PATH).expanduser().resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return str(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        DB_PATH = str(path)
+        return DB_PATH
+    except PermissionError:
+        fallback = (DATA_ROOT / path.name).resolve()
+        fallback.parent.mkdir(parents=True, exist_ok=True)
+        logger.warning("Falling back to DuckDB path %s (original %s not writable)", fallback, path)
+        DB_PATH = str(fallback)
+        return DB_PATH
 
 
 def get_conn() -> duckdb.DuckDBPyConnection:

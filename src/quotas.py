@@ -1,9 +1,21 @@
 # src/quotas.py
 from __future__ import annotations
-import os, time, ipaddress
-from typing import Optional, Tuple
+
+import os
+import time
+import ipaddress
+import inspect
+from typing import Optional, Tuple, Union, Any
+
 from fastapi import Request, HTTPException
 from redis import Redis
+
+try:  # pragma: no cover - optional dependency for typing
+    from redis.asyncio import Redis as AsyncRedis  # type: ignore
+except Exception:  # pragma: no cover
+    AsyncRedis = None  # type: ignore
+
+RedisLike = Union[Redis, "AsyncRedis"]  # type: ignore[name-defined]
 
 # Defaults (override via env)
 BASE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))   # baseline RPS/min per caller
@@ -52,14 +64,21 @@ def _now_minute_bucket() -> int:
 def _today_ymd() -> str:
     return time.strftime("%Y-%m-%d", time.gmtime())
 
-def _plan_for(caller: str, r: Optional[Redis]) -> str:
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value  # type: ignore[misc]
+    return value
+
+async def _plan_for(caller: str, r: Optional[RedisLike]) -> str:
     # Optional: store/override user plans in Redis: HGET plan:{caller} field "plan"
     if not r:
         return PLAN_DEFAULT
     try:
-        p = r.hget(f"plan:{caller}", "plan")
-        if p:
-            return str(p)
+        raw = await _maybe_await(r.hget(f"plan:{caller}", "plan"))
+        if raw:
+            if isinstance(raw, bytes):
+                return raw.decode("utf-8", errors="ignore")
+            return str(raw)
     except Exception:
         pass
     return PLAN_DEFAULT
@@ -71,7 +90,7 @@ def _daily_quota_for(plan: str) -> int:
         return Q_PRO
     return Q_FREE
 
-def rate_limit(r: Optional[Redis], request: Request, scope: str, limit_per_min: int) -> None:
+async def rate_limit(r: Optional[RedisLike], request: Request, scope: str, limit_per_min: int) -> None:
     """
     Fixed-window per-minute limiter. Raises 429 on exceed.
     """
@@ -81,10 +100,11 @@ def rate_limit(r: Optional[Redis], request: Request, scope: str, limit_per_min: 
     bucket = _now_minute_bucket()
     key = _k_rate(caller, scope, bucket)
     try:
-        cur = r.incr(key)
+        cur_raw = await _maybe_await(r.incr(key))
+        cur = int(cur_raw or 0)
         if cur == 1:
             # first hit this minute; set TTL ~90s to let bucket expire
-            r.expire(key, 90)
+            await _maybe_await(r.expire(key, 90))
         if cur > limit_per_min:
             raise HTTPException(status_code=429, detail=f"Rate limit exceeded for scope={scope}")
     except HTTPException:
@@ -93,26 +113,29 @@ def rate_limit(r: Optional[Redis], request: Request, scope: str, limit_per_min: 
         # fail-open on Redis issues
         return
 
-def quota_consume(r: Optional[Redis], request: Request, scope: str, units: int = 1) -> Tuple[int,int]:
+async def quota_consume(r: Optional[RedisLike], request: Request, scope: str, units: int = 1) -> Tuple[int,int]:
     """
     Per-day quota by plan (free/pro/inst). Returns (used, limit). Raises 429 on exceed.
     """
     if not r:
         return (0, 0)  # no Redis => skip
     caller = _caller_id(request)
-    plan = _state_plan(request) or _plan_for(caller, r)
+    plan = _state_plan(request) or await _plan_for(caller, r)
     limit = _daily_quota_for(plan)
     ymd = _today_ymd()
     key = _k_quota(caller, scope, ymd)
     try:
-        used = r.incrby(key, units)
+        used_raw = await _maybe_await(r.incrby(key, units))
+        used = int(used_raw or 0)
         if used == units:
             # first touch today; expire after ~27h to straddle TZ safely
-            r.expire(key, 27 * 3600)
+            await _maybe_await(r.expire(key, 27 * 3600))
         if used > limit:
             # roll back a bit (best-effort)
-            try: r.decrby(key, units)
-            except Exception: pass
+            try:
+                await _maybe_await(r.decrby(key, units))
+            except Exception:
+                pass
             raise HTTPException(status_code=429, detail=f"Daily quota exceeded (plan={plan}, scope={scope})")
         return (used, limit)
     except HTTPException:
@@ -122,50 +145,56 @@ def quota_consume(r: Optional[Redis], request: Request, scope: str, units: int =
 
 VALID_PLANS = {"free", "pro", "inst"}
 
-def set_plan_for_key(r: Optional[Redis], api_key: str, plan: str) -> str:
+async def set_plan_for_key(r: Optional[RedisLike], api_key: str, plan: str) -> str:
     if not r:
         raise RuntimeError("Redis not configured")
     plan = plan.strip().lower()
     if plan not in VALID_PLANS:
         raise ValueError(f"invalid plan '{plan}' (valid: {sorted(VALID_PLANS)})")
     caller = f"key:{api_key.strip()}"
-    r.hset(f"plan:{caller}", mapping={"plan": plan, "updated_at": str(int(time.time()))})
+    await _maybe_await(r.hset(f"plan:{caller}", mapping={"plan": plan, "updated_at": str(int(time.time()))}))
     return plan
 
-def get_plan_for_key(r: Optional[Redis], api_key: str) -> str:
+async def get_plan_for_key(r: Optional[RedisLike], api_key: str) -> str:
     if not r:
         return PLAN_DEFAULT
     caller = f"key:{api_key.strip()}"
     try:
-        p = r.hget(f"plan:{caller}", "plan")
-        return (p or PLAN_DEFAULT)
+        raw = await _maybe_await(r.hget(f"plan:{caller}", "plan"))
+        if not raw:
+            return PLAN_DEFAULT
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="ignore")
+        return str(raw)
     except Exception:
         return PLAN_DEFAULT
 
 # Usage helpers (today) for a given caller or current request
-def usage_today_for_caller(r: Optional[Redis], caller: str, scope: str) -> Tuple[int, int, str]:
+async def usage_today_for_caller(r: Optional[RedisLike], caller: str, scope: str) -> Tuple[int, int, str]:
     """
     Returns (used, limit, plan) for today's quota in 'scope' for a given caller id.
     """
     if not r:
         return (0, 0, PLAN_DEFAULT)
-    plan = _plan_for(caller, r)  # reuses Redis lookup if present
+    plan = await _plan_for(caller, r)  # reuses Redis lookup if present
     limit = _daily_quota_for(plan)
     ymd = _today_ymd()
     try:
-        used = int(r.get(_k_quota(caller, scope, ymd)) or 0)
+        used_raw = await _maybe_await(r.get(_k_quota(caller, scope, ymd)))
+        used = int(used_raw or 0)
     except Exception:
         used = 0
     return (used, limit, plan)
 
-def usage_today(r: Optional[Redis], request: Request, scope: str) -> Tuple[int, int, str, str]:
+async def usage_today(r: Optional[RedisLike], request: Request, scope: str) -> Tuple[int, int, str, str]:
     """
     Returns (used, limit, plan, caller) for today's quota in 'scope' for the current caller.
     """
     caller = _caller_id(request)
-    used, limit, plan = usage_today_for_caller(r, caller, scope)
+    used, limit, plan = await usage_today_for_caller(r, caller, scope)
     return (used, limit, plan, caller)
+
 # A tiny helper you can call at the top of “heavy” endpoints:
-def enforce_limits(r: Optional[Redis], request: Request, scope: str, per_min: int, cost_units: int = 1) -> None:
-    rate_limit(r, request, scope, per_min)
-    quota_consume(r, request, scope, cost_units)
+async def enforce_limits(r: Optional[RedisLike], request: Request, scope: str, per_min: int, cost_units: int = 1) -> None:
+    await rate_limit(r, request, scope, per_min)
+    await quota_consume(r, request, scope, cost_units)
