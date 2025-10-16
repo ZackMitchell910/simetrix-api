@@ -49,6 +49,7 @@ from src.observability import get_recent_logs
 from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.task_queue import TaskDispatcher
+from src.services.quant_daily import fetch_minimal_summary, prefill_minimal_summary
 
 try:
     from prometheus_client import Histogram, Gauge, Counter
@@ -1074,9 +1075,22 @@ def _load_price_series_with_dates(
     return out
 # DUCK utils - try db.duck first, fall back to duck
 try:
-    from .db.duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome, DB_PATH as CORE_DB_PATH
+    from .db.duck import (
+        init_schema,
+        insert_prediction,
+        matured_predictions_now,
+        insert_outcome,
+        recent_predictions,
+        DB_PATH as CORE_DB_PATH,
+    )
 except Exception:
-    from .duck import init_schema, insert_prediction, matured_predictions_now, insert_outcome  # type: ignore
+    from .duck import (  # type: ignore
+        init_schema,
+        insert_prediction,
+        matured_predictions_now,
+        insert_outcome,
+        recent_predictions,
+    )
     CORE_DB_PATH = os.getenv("PT_DUCKDB_PATH", str((DATA_ROOT / "pt.duckdb").resolve()))
 
 # -----------------------------------------------------------------------------
@@ -2014,7 +2028,7 @@ app.add_middleware(
     allow_origin_regex=r"https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept", "X-API-Key", "x-pt-key", "Authorization"],
+    allow_headers=["Content-Type", "Accept", "X-API-Key", "x-pt-key", "Authorization", "X-Polygon-Key"],
     max_age=86400,
 )
 # --- Optional static frontend
@@ -2069,8 +2083,54 @@ async def llm_summarize_async(
         # your existing fallback; keep behavior identical
         return {"list": []}  # or whatever you already return
 
+    def _coerce_json_obj(content: Any) -> dict:
+        """
+        Providers occasionally wrap JSON in code fences or prepend prose.
+        Strip common wrappers and attempt to parse; raise on failure so caller
+        can fall back cleanly.
+        """
+        if isinstance(content, dict):
+            return content
+
+        if not isinstance(content, str):
+            raise ValueError("LLM response was not JSON or string encodable")
+
+        text = content.strip()
+        if not text:
+            raise ValueError("LLM response was empty")
+
+        # Remove Markdown-style ```json fences
+        if text.startswith("```"):
+            lines = text.splitlines()
+            # drop first fence line
+            if lines:
+                lines = lines[1:]
+            # drop trailing fence line if present
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        import json as _json
+
+        try:
+            return _json.loads(text)
+        except _json.JSONDecodeError:
+            # Try to salvage by locating JSON object substring
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return _json.loads(text[start : end + 1])
+                except _json.JSONDecodeError:
+                    pass
+            raise
+
     try:
         if prefer_xai and xai_key:
+            response_format = None
+            if json_schema:
+                response_format = {"type": "json_schema", "json_schema": json_schema}
+
             data = await _post(
                 "https://api.x.ai/v1/chat/completions",
                 headers={"Authorization": f"Bearer {xai_key}"},
@@ -2080,15 +2140,19 @@ async def llm_summarize_async(
                         {"role": "system", "content": "Be factual, concise, compliance-safe."},
                         prompt_user,
                     ],
-                    # Enable when you want strict schema:
-                    # "response_format": {"type": "json_schema", "json_schema": json_schema},
                     "temperature": 0.2,
+                    **({"response_format": response_format} if response_format else {}),
                 },
             )
             content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-            return content if isinstance(content, dict) else json.loads(content)
+            return _coerce_json_obj(content)
 
         if oai_key:
+            if json_schema:
+                response_format = {"type": "json_schema", "json_schema": json_schema}
+            else:
+                response_format = {"type": "json_object"}
+
             data = await _post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {oai_key}"},
@@ -2098,16 +2162,18 @@ async def llm_summarize_async(
                         {"role": "system", "content": "Be factual, concise, compliance-safe."},
                         prompt_user,
                     ],
-                    "response_format": {"type": "json_object"},
+                    "response_format": response_format,
                     "temperature": 0.2,
                 },
             )
             content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-            return content if isinstance(content, dict) else json.loads(content)
+            return _coerce_json_obj(content)
 
         return _fallback()
 
     except Exception as e:
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("llm_summarize_async: failed to parse LLM content; using fallback", exc_info=e)
         logger.info(f"LLM summary failed; fallback used: {e}")
         return _fallback()
 # --- Lightweight online learner + exp-weights (missing classes) ---
@@ -4155,12 +4221,31 @@ async def _mc_for(symbol: str, horizon: int | None = None, paths: int = 6000) ->
 
     raw = await REDIS.get(f"artifact:{run_id}")
     art = json.loads(raw) if raw else {}
+
+    base_price = None
     try:
-        S0 = float(art.get("median_path", [[0,0]])[0][1])
-        SH = float(art.get("median_path", [[0,0]])[-1][1])
-        med_pct = float((SH / S0 - 1) * 100) if S0 else 0.0
+        median_path = art.get("median_path") or []
+        if median_path:
+            S0 = float(median_path[0][1])
+            SH = float(median_path[-1][1])
+            base_price = float(SH)
+            med_pct = float((SH / S0 - 1) * 100) if S0 else 0.0
+        else:
+            med_pct = 0.0
     except Exception:
         med_pct = 0.0
+        base_price = None
+
+    predicted_price = None
+    try:
+        predicted_val = art.get("most_likely_price")
+        if predicted_val is not None:
+            predicted_price = float(predicted_val)
+    except Exception:
+        predicted_price = None
+    if predicted_price is None:
+        predicted_price = base_price
+
     summary = {
         "symbol": symbol,
         "run_id": run_id,
@@ -4170,7 +4255,25 @@ async def _mc_for(symbol: str, horizon: int | None = None, paths: int = 6000) ->
         "var95": (art.get("var_es") or {}).get("var95"),
         "es95": (art.get("var_es") or {}).get("es95"),
         "regime": (art.get("model_info") or {}).get("regime", "neutral"),
+        "base_price": base_price,
+        "predicted_price": predicted_price,
     }
+    try:
+        term_prices = art.get("terminal_prices") or []
+        if term_prices:
+            terminal_arr = np.asarray(term_prices, dtype=float)
+            if terminal_arr.size:
+                bullish_val = float(np.percentile(terminal_arr, 95))
+                summary["bullish_price"] = bullish_val
+                summary["p95"] = bullish_val  # legacy alias
+                summary.setdefault("base_price", float(np.median(terminal_arr)))
+                if summary.get("predicted_price") is None:
+                    summary["predicted_price"] = summary.get("base_price")
+    except Exception:
+        summary.setdefault("bullish_price", None)
+        if summary.get("predicted_price") is None:
+            summary["predicted_price"] = summary.get("base_price")
+        summary.setdefault("p95", summary.get("bullish_price"))
 
     # Optional quantum refinement (once per day; Aer by default)
     try:
@@ -4640,6 +4743,61 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
             if expose_finalists:
                 await REDIS.set(f"{base}:equity_finalists", json.dumps(eq_mc_ok))
                 await REDIS.set(f"{base}:crypto_finalists", json.dumps(cr_mc_ok))
+
+            try:
+                publish_pairs: list[tuple[str, dict | None]] = []
+                for winner in (eq_win, cr_win):
+                    if isinstance(winner, dict) and winner.get("symbol"):
+                        publish_pairs.append((str(winner.get("symbol")).upper(), winner))
+                if top_n > 1:
+                    for item in eq_top + cr_top:
+                        if isinstance(item, dict) and item.get("symbol"):
+                            publish_pairs.append((str(item.get("symbol")).upper(), item))
+                if expose_finalists:
+                    for item in eq_mc_ok + cr_mc_ok:
+                        if isinstance(item, dict) and item.get("symbol"):
+                            publish_pairs.append((str(item.get("symbol")).upper(), item))
+
+                publish_tasks: list[asyncio.Task] = []
+                publish_symbols: list[str] = []
+                seen_symbols: set[str] = set()
+                for sym, doc in publish_pairs:
+                    if not sym or sym in seen_symbols:
+                        continue
+                    seen_symbols.add(sym)
+                    publish_symbols.append(sym)
+                    publish_tasks.append(asyncio.create_task(prefill_minimal_summary(sym, doc, today_str, horizon)))
+
+                extra_symbols: list[str] = []
+                try:
+                    raw_extra = os.getenv("SIMETRIX_DAILY_SYMBOLS", "")
+                    if raw_extra.strip():
+                        parsed = raw_extra.strip()
+                        if parsed.startswith(("[", "(")):
+                            from ast import literal_eval
+
+                            parsed_val = literal_eval(parsed)
+                        else:
+                            parsed_val = [parsed]
+                        if isinstance(parsed_val, (list, tuple)):
+                            extra_symbols = [str(x).strip().upper() for x in parsed_val if str(x).strip()]
+                    extra_symbols = [s for s in extra_symbols if s and s not in seen_symbols]
+                except Exception:
+                    extra_symbols = []
+
+                for sym in extra_symbols:
+                    seen_symbols.add(sym)
+                    publish_symbols.append(sym)
+                    publish_tasks.append(asyncio.create_task(prefill_minimal_summary(sym, None, today_str, horizon)))
+
+                if publish_tasks:
+                    results = await asyncio.gather(*publish_tasks, return_exceptions=True)
+                    for sym, result in zip(publish_symbols, results):
+                        if isinstance(result, Exception):
+                            logger.debug("prefill summary skipped for %s: %s", sym, result)
+            except Exception as exc:
+                logger.warning("Failed to prefill per-symbol summaries: %s", exc)
+
             await REDIS.setex(f"{base}:done", 27 * 3600, "1")
         except Exception as e:
             logger.warning("Failed to cache daily results in Redis: %s", e)
@@ -5851,37 +6009,65 @@ async def quant_daily_run(horizon: int | None = None, _ok: bool = Security(requi
         except Exception: pass
     return out
 
-@app.get("/quant/daily/today")
-async def quant_daily_today():
+@app.get(
+    "/quant/daily/today",
+    summary="Daily snapshot (dashboard) or minimal one-shot summary when symbol is provided",
+)
+async def quant_daily_today(
+    symbol: str | None = Query(None, description="Ticker, e.g., NVDA or BTC-USD"),
+    horizon_days: int = Query(30, ge=5, le=90),
+    # If you want to require an API key for the minimal branch, uncomment:
+    # _ok: bool = Security(require_key, scopes=["simulate"]),
+):
     """
-    Public: return today’s cached signal; if missing (first hit), compute on-demand.
-    Keep this open so the front-end can fetch without CORS preflight/auth.
+    - No symbol -> returns the existing daily snapshot payload (winners, finalists, etc.).
+    - With ?symbol=... -> returns a minimal marketing JSON:
+        { symbol, prob_up_30d, base_price, predicted_price, bullish_price }
+      Prefers Redis prefill, falls back to on-demand compute.
     """
     d = datetime.now(timezone.utc).date().isoformat()
+
+    # --- Minimal branch -------------------------------------------------
+    if symbol:
+        s = symbol.strip().upper()
+        if not s:
+            raise HTTPException(status_code=400, detail="Symbol cannot be blank")
+
+        try:
+            return await fetch_minimal_summary(s, horizon_days)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"compute failed for {s}: {exc}") from exc
+
+    # --- Original dashboard snapshot branch -----------------------------
     out: dict[str, object] = {"as_of": d}
     if REDIS:
         try:
             base = f"quant:daily:{d}"
             eq = await REDIS.get(f"{base}:equity")
             cr = await REDIS.get(f"{base}:crypto")
-            if eq: out["equity"] = json.loads(eq)
-            if cr: out["crypto"] = json.loads(cr)
+            if eq:
+                out["equity"] = json.loads(eq)
+            if cr:
+                out["crypto"] = json.loads(cr)
 
-            # optional extras if present
             eq_top = await REDIS.get(f"{base}:equity_top")
             cr_top = await REDIS.get(f"{base}:crypto_top")
-            if eq_top: out["equity_top"] = json.loads(eq_top)
-            if cr_top: out["crypto_top"] = json.loads(cr_top)
+            if eq_top:
+                out["equity_top"] = json.loads(eq_top)
+            if cr_top:
+                out["crypto_top"] = json.loads(cr_top)
 
             eq_all = await REDIS.get(f"{base}:equity_finalists")
             cr_all = await REDIS.get(f"{base}:crypto_finalists")
-            if eq_all: out["equity_finalists"] = json.loads(eq_all)
-            if cr_all: out["crypto_finalists"] = json.loads(cr_all)
+            if eq_all:
+                out["equity_finalists"] = json.loads(eq_all)
+            if cr_all:
+                out["crypto_finalists"] = json.loads(cr_all)
         except Exception:
-            # fall through to compute
             pass
 
-    # If either winner is missing, compute-on-demand (writes winners and extras if enabled)
     if not out.get("equity") or not out.get("crypto"):
         out = await _run_daily_quant()
 
@@ -5922,6 +6108,62 @@ async def get_run_summary(run_id: str, request: Request, refresh: int = 0, _ok: 
         if e.status_code == 404:
             return JSONResponse({"status": "pending"}, status_code=202)
         raise
+
+@app.get("/runs/recent", summary="Recent simulation runs")
+async def runs_recent(
+    limit: int = Query(8, ge=1, le=50),
+    symbol: str | None = Query(None),
+    _ok: bool = Depends(require_key),
+) -> dict:
+    try:
+        rows = recent_predictions(symbol=symbol, limit=int(limit))
+    except Exception as exc:
+        log_json("error", msg="runs_recent_fail", error=str(exc))
+        raise HTTPException(status_code=500, detail="failed_to_fetch_recent_runs") from exc
+
+    items: list[dict] = []
+    for row in rows:
+        ctx_raw = row.get("user_ctx")
+        ctx_obj: dict | None = None
+        if isinstance(ctx_raw, str):
+            try:
+                ctx_obj = json.loads(ctx_raw)
+            except Exception:
+                ctx_obj = None
+        elif isinstance(ctx_raw, dict):
+            ctx_obj = ctx_raw
+
+        n_paths: int | None = None
+        if isinstance(ctx_obj, dict):
+            maybe_paths = ctx_obj.get("n_paths") or ctx_obj.get("paths")
+            if isinstance(maybe_paths, (int, float)) and math.isfinite(maybe_paths):
+                n_paths = int(maybe_paths)
+
+        prob_up = row.get("prob_up_next")
+        if isinstance(prob_up, (int, float)) and not math.isfinite(prob_up):
+            prob_up = None
+
+        items.append(
+            {
+                "id": row.get("run_id") or row.get("pred_id"),
+                "run_id": row.get("run_id"),
+                "pred_id": row.get("pred_id"),
+                "symbol": row.get("symbol"),
+                "horizon_days": row.get("horizon_d"),
+                "model_id": row.get("model_id"),
+                "prob_up_end": prob_up,
+                "prob_up_next": prob_up,
+                "p05": row.get("p05"),
+                "p50": row.get("p50"),
+                "p95": row.get("p95"),
+                "spot0": row.get("spot0"),
+                "n_paths": n_paths,
+                "ts": row.get("ts"),
+                "finished_at": row.get("ts"),
+                "finishedAt": row.get("ts"),
+            }
+        )
+    return {"items": items}
 
 @app.post("/outcomes/label")
 async def outcomes_label(limit: int = 5000, _ok: bool = Depends(require_key)):
