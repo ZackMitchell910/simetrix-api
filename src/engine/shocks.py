@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Sequence
 
 import numpy as np
 
-from ..scenarios.models import EventShock
+from src.scenarios.models import EventShock
+from .types import StateVector
 
 
 @dataclass(slots=True)
-class ShockOverrides:
-    drift_bump: np.ndarray
+class ShockSchedule:
+    times: np.ndarray
+    drift: np.ndarray
     vol_multiplier: np.ndarray
     jump_intensity: np.ndarray
     jump_mean: np.ndarray
@@ -18,64 +21,62 @@ class ShockOverrides:
 
 
 class ShockScheduler:
-    """Translate ``EventShock`` definitions into per-step overrides."""
+    """Translate scenario windows into per-step overrides."""
 
-    def build(self, time_grid: np.ndarray, shocks: Sequence[EventShock]) -> ShockOverrides:
-        n_steps = len(time_grid) - 1
-        drift_bump = np.zeros(n_steps, dtype=float)
-        vol_multiplier = np.ones(n_steps, dtype=float)
+    def __init__(self, schedule: ShockSchedule):
+        self.schedule = schedule
+
+    @classmethod
+    def from_scenarios(
+        cls,
+        scenarios: Sequence[EventShock],
+        state: StateVector,
+        times: np.ndarray,
+    ) -> "ShockScheduler":
+        n_steps = len(times) - 1
+        drift = np.zeros(n_steps, dtype=float)
+        vol = np.ones(n_steps, dtype=float)
         jump_intensity = np.zeros(n_steps, dtype=float)
         jump_mean = np.zeros(n_steps, dtype=float)
         jump_std = np.zeros(n_steps, dtype=float)
 
-        if not shocks:
-            return ShockOverrides(drift_bump, vol_multiplier, jump_intensity, jump_mean, jump_std)
+        for shock in scenarios:
+            start_idx, end_idx = _window_to_index(shock, state.asof, times)
+            if start_idx >= end_idx:
+                continue
+            override = shock.override
+            drift[start_idx:end_idx] += override.drift_bump
+            vol[start_idx:end_idx] *= override.vol_multiplier
+            jump_intensity[start_idx:end_idx] += override.jump_intensity
+            jump_mean[start_idx:end_idx] += override.jump_mean
+            jump_std[start_idx:end_idx] = np.maximum(
+                jump_std[start_idx:end_idx], override.jump_std
+            )
 
-        step_midpoints = time_grid[:-1]
-        for shock in shocks:
-            start = float(shock.window_start)
-            end = float(shock.window_end)
-            mask = (step_midpoints >= start) & (step_midpoints <= end)
-            indices = np.where(mask)[0]
-            for idx in indices:
-                drift_bump[idx] += shock.drift
-                vol_multiplier[idx] *= max(shock.vol_multiplier, 0.0)
-                base_intensity = jump_intensity[idx]
-                new_intensity = base_intensity + max(shock.jump_intensity, 0.0)
-                if new_intensity > 0.0:
-                    jump_mean[idx] = self._combine_means(
-                        base_intensity,
-                        jump_mean[idx],
-                        shock.jump_intensity,
-                        shock.jump_mean,
-                    )
-                    jump_std[idx] = self._combine_std(
-                        base_intensity,
-                        jump_std[idx],
-                        shock.jump_intensity,
-                        shock.jump_std,
-                    )
-                    jump_intensity[idx] = new_intensity
-        return ShockOverrides(drift_bump, vol_multiplier, jump_intensity, jump_mean, jump_std)
+        schedule = ShockSchedule(
+            times=np.asarray(times, dtype=float),
+            drift=drift,
+            vol_multiplier=vol,
+            jump_intensity=jump_intensity,
+            jump_mean=jump_mean,
+            jump_std=jump_std,
+        )
+        return cls(schedule)
 
-    @staticmethod
-    def _combine_means(w1: float, m1: float, w2: float, m2: float) -> float:
-        total = w1 + w2
-        if total == 0:
-            return 0.0
-        return (w1 * m1 + w2 * m2) / total
-
-    @staticmethod
-    def _combine_std(w1: float, s1: float, w2: float, s2: float) -> float:
-        total = w1 + w2
-        if total == 0:
-            return 0.0
-        variance = 0.0
-        if w1 > 0:
-            variance += w1 * (s1 ** 2)
-        if w2 > 0:
-            variance += w2 * (s2 ** 2)
-        return np.sqrt(variance / total)
+    def overrides(self) -> ShockSchedule:
+        return self.schedule
 
 
-__all__ = ["ShockScheduler", "ShockOverrides"]
+def _window_to_index(shock: EventShock, asof: datetime, times: np.ndarray) -> tuple[int, int]:
+    start = max(0.0, _days_between(asof, shock.window_start))
+    end = max(0.0, _days_between(asof, shock.window_end))
+    idx_start = int(np.searchsorted(times, start, side="left"))
+    idx_end = int(np.searchsorted(times, end, side="right"))
+    idx_start = min(idx_start, len(times) - 1)
+    idx_end = min(max(idx_end, idx_start + 1), len(times) - 1)
+    return idx_start, idx_end
+
+
+def _days_between(asof: datetime, ts: datetime) -> float:
+    delta = ts - asof
+    return delta.total_seconds() / 86400.0

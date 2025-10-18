@@ -1,13 +1,12 @@
-"""Scenario generation and calibration utilities."""
+"""Scenario generation utilities for event-driven simulations."""
 
-from .models import EventShock, ScenarioDiagnostics
-from .generator import ScenarioGenerator, ScenarioPromptBuilder
+from .models import EventShock, ShockOverride
+from .generator import ScenarioGenerator
 from .book import ScenarioBook
 
 __all__ = [
     "EventShock",
-    "ScenarioDiagnostics",
+    "ShockOverride",
     "ScenarioGenerator",
-    "ScenarioPromptBuilder",
     "ScenarioBook",
 ]

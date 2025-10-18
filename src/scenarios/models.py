@@ -1,96 +1,62 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from typing import Any, Mapping
 
 
-@dataclass
-class EventShock:
-    """Represents a discrete scenario shock applied during simulation.
+@dataclass(frozen=True, slots=True)
+class ShockOverride:
+    """Quantitative overrides applied by an :class:`EventShock`.
 
     Attributes
     ----------
-    shock_id:
-        Stable identifier for the scenario (e.g. ``"earnings-beat"``).
-    label:
-        Human readable description for diagnostics and UI surfaces.
-    prior:
-        Prior probability weight assigned to the scenario. The generator and
-        scenario book guarantee that mutually exclusive variants sum to less
-        than or equal to one.
-    window_start:
-        Start of the event window expressed in trading days offset from the
-        pricing ``as_of`` date used in the simulation.
-    window_end:
-        End of the event window expressed in trading days offset from the
-        pricing ``as_of`` date.
-    drift:
-        Annualised drift override added to the baseline process while the shock
-        is active.
-    vol_multiplier:
-        Multiplicative factor applied to the baseline volatility during the
-        event window.
-    jump_intensity:
-        Annualised Poisson intensity governing the arrival of jumps.
-    jump_mean:
-        Average log jump size applied when a jump arrives.
-    jump_std:
-        Standard deviation of the log jump size distribution.
-    mutually_exclusive_group:
-        Identifier used to ensure prior weights are normalised across
-        alternatives that cannot co-occur.
-    metadata:
-        Auxiliary diagnostics and rationale for analytics consumers.
+    drift_bump : float
+        Annualised drift adjustment applied additively.
+    vol_multiplier : float
+        Multiplicative factor applied to the instantaneous volatility.
+    jump_intensity : float
+        Additional jump arrival intensity (lambda) expressed in annualised units.
+    jump_mean : float
+        Mean jump size in log space.
+    jump_std : float
+        Standard deviation of the jump size in log space.
     """
 
-    shock_id: str
-    label: str
-    prior: float
-    window_start: float
-    window_end: float
-    drift: float = 0.0
+    drift_bump: float = 0.0
     vol_multiplier: float = 1.0
     jump_intensity: float = 0.0
     jump_mean: float = 0.0
     jump_std: float = 0.0
-    mutually_exclusive_group: Optional[str] = None
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def is_active(self, offset_days: float) -> bool:
-        """Return ``True`` if the supplied offset lies within the event window."""
-
-        return self.window_start <= offset_days <= self.window_end
-
-    def copy_with_prior(self, prior: float) -> "EventShock":
-        """Clone the shock with an updated prior while preserving metadata."""
-
-        return EventShock(
-            shock_id=self.shock_id,
-            label=self.label,
-            prior=prior,
-            window_start=self.window_start,
-            window_end=self.window_end,
-            drift=self.drift,
-            vol_multiplier=self.vol_multiplier,
-            jump_intensity=self.jump_intensity,
-            jump_mean=self.jump_mean,
-            jump_std=self.jump_std,
-            mutually_exclusive_group=self.mutually_exclusive_group,
-            metadata=dict(self.metadata),
+    def merge(self, other: "ShockOverride") -> "ShockOverride":
+        """Combine overrides sequentially."""
+        return ShockOverride(
+            drift_bump=self.drift_bump + other.drift_bump,
+            vol_multiplier=self.vol_multiplier * other.vol_multiplier,
+            jump_intensity=self.jump_intensity + other.jump_intensity,
+            jump_mean=self.jump_mean + other.jump_mean,
+            jump_std=max(self.jump_std, other.jump_std),
         )
 
 
-@dataclass
-class ScenarioDiagnostics:
-    """Container for quality metrics used to assess scenario calibration."""
+@dataclass(frozen=True, slots=True)
+class EventShock:
+    """Structured representation of a hypothetical event outcome."""
 
-    confusion_matrix: Dict[str, Dict[str, int]] = field(default_factory=dict)
-    sample_size: int = 0
+    symbol: str
+    name: str
+    variant: str
+    prior: float
+    window_start: datetime
+    window_end: datetime
+    override: ShockOverride = field(default_factory=ShockOverride)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
-    def add(self, predicted: str, actual: str) -> None:
-        group = self.confusion_matrix.setdefault(predicted, {})
-        group[actual] = group.get(actual, 0) + 1
-        self.sample_size += 1
+    def with_prior(self, prior: float) -> "EventShock":
+        return replace(self, prior=max(0.0, float(prior)))
 
-    def as_dict(self) -> Dict[str, Any]:
-        return {"confusion_matrix": self.confusion_matrix, "sample_size": self.sample_size}
+    def with_metadata(self, **metadata: Any) -> "EventShock":
+        merged = dict(self.metadata)
+        merged.update(metadata)
+        return replace(self, metadata=merged)

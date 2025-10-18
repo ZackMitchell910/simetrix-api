@@ -1,94 +1,118 @@
 from __future__ import annotations
 
-from collections import defaultdict
+from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import List, Mapping, MutableMapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from .generator import ScenarioGenerator
-from .models import EventShock, ScenarioDiagnostics
-from ..engine.types import StateVector
+from .models import EventShock
 
 
 class ScenarioBook:
-    """Assembles a curated list of ``EventShock`` instances for a symbol."""
+    """Assemble a calibrated set of :class:`EventShock` objects for simulation."""
 
-    def __init__(self, generator: ScenarioGenerator | None = None):
+    def __init__(self, generator: ScenarioGenerator | None = None, lookback_days: int = 365):
         self.generator = generator or ScenarioGenerator()
+        self.lookback_days = lookback_days
 
     def build(
         self,
         symbol: str,
         asof: datetime,
-        feeds: Mapping[str, object],
-        state: StateVector,
-    ) -> List[EventShock]:
-        headlines: Sequence[str] = feeds.get("headlines", [])  # type: ignore[assignment]
-        calendar_item: Mapping[str, object] = feeds.get("calendar", {})  # type: ignore[assignment]
-        history: Sequence[Mapping[str, object]] = feeds.get("history", [])  # type: ignore[assignment]
-
-        shocks = self.generator.generate(symbol=symbol, as_of=asof, headlines=headlines, calendar_item=calendar_item)
-        return self.calibrate_priors(shocks, history)
+        feeds: Mapping[str, Any],
+        state: Any,
+    ) -> list[EventShock]:
+        earnings = self._select_earnings(symbol, feeds)
+        if not earnings:
+            return []
+        event_time = earnings.get("window_start") or earnings.get("datetime")
+        if not isinstance(event_time, datetime):
+            event_time = asof
+        headlines = list(feeds.get("headlines", []))
+        shocks = self.generator.generate(symbol, event_time, headlines, earnings)
+        history = feeds.get("history") or feeds.get("scenario_history")
+        if history:
+            shocks = self.calibrate_priors(shocks, history)
+        return shocks
 
     def calibrate_priors(
         self,
         shocks: Sequence[EventShock],
-        history: Sequence[Mapping[str, object]],
-    ) -> List[EventShock]:
-        if not history:
-            return list(shocks)
+        history: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    ) -> list[EventShock]:
+        shocks = list(shocks)
+        if not shocks:
+            return []
+        records, asof = self._extract_history(history)
+        if not records:
+            return shocks
+        cutoff = asof - timedelta(days=self.lookback_days)
+        filtered = [rec for rec in records if rec.get("timestamp") and rec["timestamp"] >= cutoff]
+        if not filtered:
+            return shocks
 
-        diagnostics = ScenarioDiagnostics()
-        hit_rates: MutableMapping[str, float] = defaultdict(float)
-        counts: MutableMapping[str, int] = defaultdict(int)
+        variants = {shock.variant for shock in shocks}
+        stats: dict[str, dict[str, int]] = {
+            variant: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for variant in variants
+        }
+        for rec in filtered:
+            predicted = rec.get("predicted") or rec.get("variant")
+            realised = rec.get("realised") or rec.get("actual")
+            for variant in variants:
+                if predicted == variant and realised == variant:
+                    stats[variant]["tp"] += 1
+                elif predicted == variant and realised != variant:
+                    stats[variant]["fp"] += 1
+                elif predicted != variant and realised == variant:
+                    stats[variant]["fn"] += 1
+                else:
+                    stats[variant]["tn"] += 1
 
-        cutoff = datetime.utcnow() - timedelta(days=365)
-        for record in history:
-            timestamp = record.get("timestamp") or record.get("as_of")
-            if isinstance(timestamp, datetime) and timestamp < cutoff:
-                continue
-            elif isinstance(timestamp, str):
-                try:
-                    parsed = datetime.fromisoformat(timestamp)
-                except ValueError:
-                    parsed = None
-                if parsed and parsed < cutoff:
-                    continue
-            predicted = str(record.get("predicted"))
-            actual = str(record.get("actual"))
-            diagnostics.add(predicted, actual)
-            counts[predicted] += 1
-            if predicted == actual:
-                hit_rates[predicted] += 1
+        adjustments: dict[str, float] = {}
+        for variant, cm in stats.items():
+            tp = cm["tp"]
+            fp = cm["fp"]
+            denom = tp + fp
+            hit_rate = tp / denom if denom > 0 else 0.5
+            adjustments[variant] = 0.5 + 0.5 * hit_rate
 
-        normalised_hit_rates: dict[str, float] = {}
-        for key, total in counts.items():
-            hits = hit_rates.get(key, 0.0)
-            normalised_hit_rates[key] = hits / total if total else 0.5
+        adjusted = [
+            replace(shock, prior=shock.prior * adjustments.get(shock.variant, 1.0))
+            for shock in shocks
+        ]
+        normalised = self._normalise(adjusted)
+        diagnostics = {
+            "asof": asof,
+            "confusion_matrix": stats,
+            "records": len(filtered),
+        }
+        return [shock.with_metadata(diagnostics=diagnostics) for shock in normalised]
 
-        by_group: MutableMapping[str | None, List[EventShock]] = defaultdict(list)
-        for shock in shocks:
-            by_group[shock.mutually_exclusive_group].append(shock)
+    def _normalise(self, shocks: Iterable[EventShock]) -> list[EventShock]:
+        shocks = list(shocks)
+        total = sum(shock.prior for shock in shocks)
+        if total <= 0:
+            equal = 1.0 / len(shocks)
+            return [replace(shock, prior=equal) for shock in shocks]
+        inv_total = 1.0 / total
+        return [replace(shock, prior=min(1.0, shock.prior * inv_total)) for shock in shocks]
 
-        calibrated: List[EventShock] = []
-        for group, members in by_group.items():
-            weighted_members: List[EventShock] = []
-            for member in members:
-                rate = normalised_hit_rates.get(member.shock_id, normalised_hit_rates.get(member.label, 0.5))
-                adjusted_prior = member.prior * (0.5 + 0.5 * rate)
-                enriched = member.copy_with_prior(adjusted_prior)
-                enriched.metadata.setdefault("diagnostics", {})
-                enriched.metadata["diagnostics"].update(diagnostics.as_dict())
-                enriched.metadata["diagnostics"]["hit_rate"] = rate
-                weighted_members.append(enriched)
+    @staticmethod
+    def _select_earnings(symbol: str, feeds: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        items = feeds.get("earnings_calendar") or []
+        for item in items:
+            if item.get("symbol", symbol) == symbol:
+                return item
+        return None
 
-            total = sum(max(member.prior, 0.0) for member in weighted_members)
-            if total > 1.0:
-                scale = 1.0 / total
-            else:
-                scale = 1.0
-            calibrated.extend(member.copy_with_prior(member.prior * scale) for member in weighted_members)
-
-        return calibrated
-
-
-__all__ = ["ScenarioBook"]
+    @staticmethod
+    def _extract_history(
+        history: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    ) -> tuple[list[Mapping[str, Any]], datetime]:
+        if isinstance(history, Mapping):
+            asof = history.get("asof") or datetime.utcnow()
+            records = history.get("records") or []
+        else:
+            asof = max((rec.get("timestamp") for rec in history if rec.get("timestamp")), default=datetime.utcnow())
+            records = list(history)
+        return list(records), asof
