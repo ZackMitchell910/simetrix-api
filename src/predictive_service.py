@@ -1,6 +1,6 @@
 # --- stdlib
 from __future__ import annotations
-import os, json, asyncio, logging, math, pickle, shutil
+import os, json, asyncio, logging, math, pickle, shutil, io, csv
 from datetime import datetime, timedelta, date, timezone
 from zoneinfo import ZoneInfo
 from uuid import uuid4
@@ -12,9 +12,9 @@ import hmac, hashlib, base64
 # --- third-party
 from dotenv import load_dotenv; load_dotenv()
 import numpy as np
-import pandas as pd
 import random
 import httpx
+from scipy import stats
 from pathlib import Path
 from fastapi import (
     FastAPI, Depends, HTTPException, WebSocket, Query, Header, Body,
@@ -36,20 +36,39 @@ from src.observability import install_observability, log_json, job_ok, job_fail
 from src.quotas import (
     enforce_limits,
     rate_limit,
-    usage_today,
-    usage_today_for_caller,
-    set_plan_for_key,
-    get_plan_for_key,
     BASE_LIMIT_PER_MIN,
     SIM_LIMIT_PER_MIN,
-    CRON_LIMIT_PER_MIN,
     PLAN_DEFAULT,
 )
-from src.observability import get_recent_logs
 from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.task_queue import TaskDispatcher
+from src.services import admin as admin_service
+from src.services import context as context_service
+from src.services import ingestion as ingestion_service
+from src.services import usage as usage_service
+from src.services import analytics as analytics_service
 from src.services.quant_daily import fetch_minimal_summary, prefill_minimal_summary
+from src.services.validation import (
+    VALIDATION_BARS_PER_YEAR,
+    VALIDATION_LOOKBACKS,
+    VALIDATION_MAX_SAMPLES,
+    VALIDATION_TARGET_MAPE,
+)
+from src.services.watchlists import (
+    TOP_CRYPTOS,
+    TOP_STOCKS,
+    get_crypto_watchlist,
+    get_equity_watchlist,
+    get_retrain_daily_symbols,
+    get_retrain_weekly_symbols,
+)
+from src.model_registry import (
+    register_model_version,
+    get_active_model_version,
+    list_model_versions,
+    promote_model_version,
+)
 
 try:
     from prometheus_client import Histogram, Gauge, Counter
@@ -63,31 +82,31 @@ try:
         "simetrix_simulation_active_tasks",
         "Number of simulations currently running",
     )
-    NEWS_INGESTED_COUNTER = Counter(
-        "news_ingested_total",
-        "Count of news rows ingested into feature store",
+    INFERENCE_LATENCY_SECONDS = Histogram(
+        "simetrix_inference_latency_seconds",
+        "Latency of inference requests",
+        ["endpoint"],
     )
-    NEWS_SCORED_COUNTER = Counter(
-        "news_scored_total",
-        "Count of news rows sentiment-scored",
+    MODEL_USAGE_COUNTER = Counter(
+        "simetrix_model_usage_total",
+        "Count of model head invocations during inference",
+        ["model"],
     )
-    EARNINGS_INGESTED_COUNTER = Counter(
-        "earnings_ingested_total",
-        "Count of earnings rows ingested",
-    )
-    MACRO_UPSERTS_COUNTER = Counter(
-        "macro_upserts_total",
-        "Count of macro snapshot upserts",
+    CALIBRATION_ERROR_GAUGE = Gauge(
+        "simetrix_calibration_error",
+        "Difference between calibrated and fallback quantile bands; -1 indicates fallback only",
+        ["symbol", "horizon_days"],
     )
 except Exception:  # pragma: no cover - metrics optional
     SIM_DURATION_SECONDS = None  # type: ignore
     SIM_ACTIVE_GAUGE = None  # type: ignore
-    NEWS_INGESTED_COUNTER = None  # type: ignore
-    NEWS_SCORED_COUNTER = None  # type: ignore
-    EARNINGS_INGESTED_COUNTER = None  # type: ignore
-    MACRO_UPSERTS_COUNTER = None  # type: ignore
+    INFERENCE_LATENCY_SECONDS = None  # type: ignore
+    MODEL_USAGE_COUNTER = None  # type: ignore
+    CALIBRATION_ERROR_GAUGE = None  # type: ignore
 
 try:
+    if os.getenv("PT_SKIP_ONNX", "0") == "1":
+        raise ImportError("ONNX disabled via PT_SKIP_ONNX")
     import onnx  # type: ignore
     from onnx import helper as onnx_helper, TensorProto
 except Exception:  # pragma: no cover
@@ -96,6 +115,8 @@ except Exception:  # pragma: no cover
     TensorProto = None  # type: ignore
 
 try:
+    if os.getenv("PT_SKIP_ONNXRUNTIME", "0") == "1":
+        raise ImportError("onnxruntime disabled via PT_SKIP_ONNXRUNTIME")
     import onnxruntime as ort  # type: ignore
 except Exception:  # pragma: no cover
     ort = None  # type: ignore
@@ -121,15 +142,395 @@ def _default_data_root() -> Path:
 DATA_ROOT = _default_data_root()
 os.environ.setdefault("PT_DATA_ROOT", str(DATA_ROOT))
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _resolve_artifact_path(path: str | Path) -> Path:
+    p = Path(path)
+    if not p.is_absolute():
+        p = (_REPO_ROOT / p).resolve()
+    return p
+
+
 START_TIME = datetime.now(timezone.utc)
 BACKUP_DIR = DATA_ROOT / "backups"
+EXPORT_ROOT = DATA_ROOT / "exports"
+try:
+    EXPORT_ROOT.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+ARROW_ROOT = DATA_ROOT / "arrow_store"
+ARROW_PREDICTIONS_DIR = ARROW_ROOT / "predictions"
+ARROW_OUTCOMES_DIR = ARROW_ROOT / "outcomes"
+for _dir in (ARROW_ROOT, ARROW_PREDICTIONS_DIR, ARROW_OUTCOMES_DIR):
+    try:
+        _dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 JWT_ALGORITHM = "HS256"
 
 _ONNX_SESSION_CACHE: dict[str, Any] = {}
+_LSTM_MODEL_CACHE: dict[str, Any] = {}
+_LSTM_INFER_CACHE: dict[str, Callable[[np.ndarray], float]] = {}
+_ARIMA_MODEL_CACHE: dict[str, Any] = {}
+_RL_MODEL_CACHE: dict[str, Any] = {}
+_MODEL_META_CACHE: dict[str, dict[str, Any]] = {}
+
+CALIBRATION_SAMPLE_LIMIT = 500
+CALIBRATION_SAMPLE_MIN = 40
+CALIBRATION_TTL_SECONDS = int(os.getenv("PT_CALIBRATION_TTL", "21600"))
+CALIBRATION_DB_MAX_AGE = timedelta(hours=int(os.getenv("PT_CALIBRATION_MAX_AGE_HOURS", "24")))
+CALIBRATION_GRID_SIZE = 2048
+IV_CACHE_TTL = timedelta(hours=6)
+_IV_CACHE: dict[str, tuple[float, datetime]] = {}
+
+
+def _calibration_key(symbol: str, horizon_days: int) -> str:
+    return f"calib:{symbol.upper()}:{int(horizon_days)}"
+
+
+def _fit_residual_distribution(sample: Sequence[float], horizon_days: int) -> dict[str, Any]:
+    arr = np.asarray(sample, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size < CALIBRATION_SAMPLE_MIN:
+        raise ValueError("insufficient residual samples for calibration")
+
+    horizon = max(1, int(horizon_days))
+    try:
+        df, loc, scale = stats.t.fit(arr)
+        if not np.isfinite(df) or not np.isfinite(loc) or not np.isfinite(scale) or scale <= 0:
+            raise ValueError
+    except Exception:
+        df = 7.0
+        loc = float(np.median(arr))
+        scale = float(np.std(arr, ddof=1) or 1e-3)
+
+    try:
+        kde = stats.gaussian_kde(arr)
+        span = float(np.std(arr, ddof=1))
+        if not np.isfinite(span) or span <= 1e-6:
+            span = max(1e-4, float(np.max(np.abs(arr))))
+        grid_lo = float(arr.min() - 4.0 * span)
+        grid_hi = float(arr.max() + 4.0 * span)
+        if not np.isfinite(grid_lo) or not np.isfinite(grid_hi) or grid_hi <= grid_lo:
+            grid_lo, grid_hi = float(arr.min() - 0.05), float(arr.max() + 0.05)
+        grid = np.linspace(grid_lo, grid_hi, CALIBRATION_GRID_SIZE)
+        pdf = kde(grid)
+        dx = float(grid[1] - grid[0]) if grid.size > 1 else 1.0
+        cdf = np.cumsum(pdf) * dx
+        if cdf[-1] <= 0:
+            raise ValueError
+        cdf /= cdf[-1]
+        quantiles = [float(np.interp(p, cdf, grid)) for p in (0.05, 0.50, 0.95)]
+    except Exception:
+        quantiles = [float(np.percentile(arr, q)) for q in (5, 50, 95)]
+
+    sample_std = float(np.std(arr, ddof=1))
+    sigma_ann = float(sample_std * math.sqrt(252.0 / horizon))
+
+    return {
+        "df": float(df),
+        "loc": float(loc),
+        "scale": float(scale),
+        "q05": float(quantiles[0]),
+        "q50": float(quantiles[1]),
+        "q95": float(quantiles[2]),
+        "sample_std": sample_std,
+        "sigma_ann": sigma_ann,
+    }
+
+
+def _sigma_from_calibration(cal: Mapping[str, Any]) -> float | None:
+    sigma = cal.get("sigma_ann")
+    if sigma is not None:
+        try:
+            val = float(sigma)
+            if math.isfinite(val) and val > 0:
+                return val
+        except Exception:
+            pass
+    df = cal.get("df")
+    scale = cal.get("scale")
+    try:
+        df_val = float(df)
+        scale_val = float(scale)
+        if df_val > 2 and scale_val > 0:
+            return float(scale_val * math.sqrt(df_val / (df_val - 2)))
+    except Exception:
+        return None
+    return None
+
+
+def _export_daily_snapshots(day: date) -> dict[str, str]:
+    """
+    Write Parquet snapshots for predictions, outcomes, and metrics for the given day.
+    Returns a mapping of artifact type to file path.
+    """
+    outputs: dict[str, str] = {}
+    if export_metrics_parquet is not None:
+        try:
+            metrics_path = EXPORT_ROOT / "metrics_daily" / f"metrics_{day.isoformat()}.parquet"
+            export_metrics_parquet(metrics_path, day=day)
+            outputs["metrics"] = str(metrics_path)
+        except RuntimeError as exc:
+            logger.debug("metrics export skipped (runtime): %s", exc)
+        except Exception as exc:
+            logger.warning("Metrics export failed for %s: %s", day, exc)
+    if export_predictions_parquet is not None:
+        try:
+            preds_path = EXPORT_ROOT / "predictions_daily" / f"predictions_{day.isoformat()}.parquet"
+            export_predictions_parquet(
+                preds_path,
+                day=day,
+                limit=100_000,
+            )
+            outputs["predictions"] = str(preds_path)
+        except RuntimeError as exc:
+            logger.debug("predictions export skipped (runtime): %s", exc)
+        except Exception as exc:
+            logger.warning("Predictions export failed for %s: %s", day, exc)
+    if export_outcomes_parquet is not None:
+        try:
+            outcomes_path = EXPORT_ROOT / "outcomes_daily" / f"outcomes_{day.isoformat()}.parquet"
+            export_outcomes_parquet(
+                outcomes_path,
+                day=day,
+                limit=100_000,
+            )
+            outputs["outcomes"] = str(outcomes_path)
+        except RuntimeError as exc:
+            logger.debug("outcomes export skipped (runtime): %s", exc)
+        except Exception as exc:
+            logger.warning("Outcomes export failed for %s: %s", day, exc)
+    return outputs
+
+
+def _prune_arrow_partitions(base_dir: Path, cutoff_date: date) -> None:
+    try:
+        for child in base_dir.iterdir():
+            if not child.is_dir():
+                continue
+            name = child.name
+            if "=" in name:
+                _, value = name.split("=", 1)
+            else:
+                value = name
+            try:
+                part_date = date.fromisoformat(value)
+            except ValueError:
+                continue
+            if part_date < cutoff_date:
+                shutil.rmtree(child, ignore_errors=True)
+    except Exception as exc:
+        logger.debug("Arrow partition prune failed for %s: %s", base_dir, exc)
+
+
+def _calibration_from_store(symbol: str, horizon_days: int) -> dict[str, Any] | None:
+    if fs_connect is None or get_calibration_params is None:
+        return None
+    try:
+        con = fs_connect()
+        row = get_calibration_params(con, symbol, horizon_days)
+        con.close()
+        if not row:
+            return None
+        updated_at = row.get("updated_at")
+        if isinstance(updated_at, str):
+            try:
+                updated_dt = datetime.fromisoformat(updated_at)
+            except Exception:
+                updated_dt = None
+        else:
+            updated_dt = updated_at
+        iso_ts: str | None = None
+        if isinstance(updated_dt, datetime):
+            if updated_dt.tzinfo is None:
+                updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - updated_dt
+            if age > CALIBRATION_DB_MAX_AGE:
+                return None
+            iso_ts = updated_dt.isoformat()
+        elif isinstance(updated_at, str):
+            iso_ts = updated_at
+        return {**row, "updated_at": iso_ts}
+    except Exception as exc:
+        logger.debug("calibration store lookup failed for %s H=%s: %s", symbol, horizon_days, exc)
+        return None
+
+
+def _compute_calibration_params(symbol: str, horizon_days: int) -> dict[str, Any] | None:
+    if fs_connect is None:
+        return None
+    symbol_norm = symbol.upper()
+    try:
+        con = fs_connect()
+        rows = con.execute(
+            """
+            SELECT p.spot0, o.y
+            FROM predictions p
+            JOIN outcomes o ON o.run_id = p.run_id
+            WHERE p.symbol = ? AND p.horizon_days = ?
+              AND p.spot0 IS NOT NULL AND o.y IS NOT NULL
+            ORDER BY o.realized_at DESC
+            LIMIT ?
+            """,
+            [symbol_norm, int(horizon_days), CALIBRATION_SAMPLE_LIMIT],
+        ).fetchall()
+        con.close()
+    except Exception as exc:
+        logger.debug("calibration residual fetch failed for %s H=%s: %s", symbol_norm, horizon_days, exc)
+        return None
+
+    residuals: list[float] = []
+    for spot0, realized in rows:
+        try:
+            s0 = float(spot0)
+            y = float(realized)
+            if s0 > 0 and y > 0 and math.isfinite(s0) and math.isfinite(y):
+                residuals.append(math.log(y / s0))
+        except Exception:
+            continue
+
+    if len(residuals) < CALIBRATION_SAMPLE_MIN:
+        return None
+
+    try:
+        fit = _fit_residual_distribution(residuals, horizon_days=horizon_days)
+    except Exception as exc:
+        logger.debug("calibration fit failed for %s H=%s: %s", symbol_norm, horizon_days, exc)
+        return None
+
+    fit.update(
+        {
+            "sample_n": len(residuals),
+            "symbol": symbol_norm,
+            "horizon_days": int(horizon_days),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    if fs_connect is not None and upsert_calibration_params is not None:
+        try:
+            con2 = fs_connect()
+            upsert_calibration_params(
+                con2,
+                [
+                    (
+                        symbol_norm,
+                        int(horizon_days),
+                        fit["df"],
+                        fit["loc"],
+                        fit["scale"],
+                        fit["q05"],
+                        fit["q50"],
+                        fit["q95"],
+                        fit["sample_n"],
+                        fit["sigma_ann"],
+                        datetime.now(timezone.utc),
+                    )
+                ],
+            )
+            con2.close()
+        except Exception as exc:
+            logger.debug("calibration store upsert failed for %s H=%s: %s", symbol_norm, horizon_days, exc)
+
+    return fit
+
+
+async def _get_calibration_params(symbol: str, horizon_days: int) -> dict[str, Any] | None:
+    symbol_norm = symbol.upper()
+    key = _calibration_key(symbol_norm, horizon_days)
+    if REDIS:
+        try:
+            cached = await REDIS.get(key)
+            if cached:
+                try:
+                    return json.loads(cached)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    cal = _calibration_from_store(symbol_norm, horizon_days)
+    if cal is None:
+        cal = await asyncio.to_thread(_compute_calibration_params, symbol_norm, horizon_days)
+    if cal and REDIS:
+        try:
+            await REDIS.setex(key, CALIBRATION_TTL_SECONDS, json.dumps(cal))
+        except Exception:
+            pass
+    return cal
+
+
+def _compute_fallback_quantiles(
+    px: Sequence[float],
+    prob_up: float,
+    horizon_days: int,
+) -> tuple[float, float, float] | None:
+    try:
+        arr_px = np.asarray(px, dtype=float)
+        if arr_px.size < 2:
+            return None
+        spot0 = float(arr_px[-1])
+        if not math.isfinite(spot0) or spot0 <= 0:
+            return None
+        log_rets = np.diff(np.log(arr_px))
+        log_rets = log_rets[np.isfinite(log_rets)]
+        if log_rets.size < 5:
+            return None
+        log_rets = _winsorize(log_rets)
+        mu_d = float(np.mean(log_rets))
+        sig_d = float(np.std(log_rets, ddof=1))
+        if not math.isfinite(sig_d) or sig_d <= 1e-8:
+            return None
+        horizon = max(1, int(horizon_days))
+        df = 7
+        sigma_h = sig_d * math.sqrt(horizon)
+        scale = sigma_h
+        if df > 2:
+            scale = sigma_h / math.sqrt(df / (df - 2))
+        scale = max(scale, 1e-6)
+        prob_clip = float(np.clip(prob_up, 1e-4, 1 - 1e-4))
+        loc_prob = scale * float(stats.t.ppf(prob_clip, df))
+        loc_hist = mu_d * horizon
+        loc = 0.7 * loc_prob + 0.3 * loc_hist
+        rv = stats.t(df=df, loc=loc, scale=scale)
+        q05 = float(spot0 * math.exp(float(rv.ppf(0.05))))
+        q50 = float(spot0 * math.exp(float(rv.ppf(0.50))))
+        q95 = float(spot0 * math.exp(float(rv.ppf(0.95))))
+        return q05, q50, q95
+    except Exception:
+        return None
+
+
+async def _get_model_meta(symbol: str) -> dict[str, Any] | None:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return None
+    cached = _MODEL_META_CACHE.get(sym)
+    if cached is not None:
+        return cached
+    if not REDIS:
+        return None
+    try:
+        raw = await REDIS.get(f"model_meta:{sym}")
+        if not raw:
+            return None
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        _MODEL_META_CACHE[sym] = data
+        return data
+    except Exception:
+        return None
 
 _loader_lock = asyncio.Lock()
 REDIS: Redis | None = None
-LS_WEBHOOK_SECRET = (os.getenv("LS_WEBHOOK_SECRET") or "").encode("utf-8")
 os.environ.setdefault("SERVICE_NAME", "simetrix-api")
 
 app = FastAPI(
@@ -199,6 +600,31 @@ def _decode_token(token: str) -> dict:
     except JWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid access token") from exc
 
+
+_admin_credentials_configured = admin_service.credentials_configured
+_verify_admin_password = admin_service.verify_admin_password
+_encode_admin_session = admin_service.encode_admin_session
+_set_admin_session_cookie = admin_service.set_admin_cookie
+_clear_admin_session_cookie = admin_service.clear_admin_cookie
+_decode_admin_session = admin_service.decode_admin_session
+_get_admin_session = admin_service.get_admin_session
+_admin_actor = admin_service.admin_actor
+AdminLoginRequest = admin_service.AdminLoginRequest
+_ls_valid_sig = admin_service.ls_valid_signature
+_grant_plan = admin_service.grant_plan
+_revoke_or_downgrade = admin_service.revoke_or_downgrade
+credentials_configured = admin_service.credentials_configured
+verify_admin_password = admin_service.verify_admin_password
+encode_admin_session = admin_service.encode_admin_session
+set_admin_cookie = admin_service.set_admin_cookie
+clear_admin_cookie = admin_service.clear_admin_cookie
+decode_admin_session = admin_service.decode_admin_session
+get_admin_session = admin_service.get_admin_session
+admin_actor = admin_service.admin_actor
+ls_valid_signature = admin_service.ls_valid_signature
+grant_plan = admin_service.grant_plan
+revoke_or_downgrade = admin_service.revoke_or_downgrade
+billing_webhook = admin_service.billing_webhook
 async def _authenticate_bearer(request: Request, required_scopes: Sequence[str], token: str | None) -> UserKey:
     if not token:
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -242,6 +668,25 @@ async def require_key(
     api_key: str | None   = Query(default=None),
 ) -> bool:
     required_scopes = security_scopes.scopes or ["simulate"]
+    requires_admin = any(scope == "admin" for scope in required_scopes)
+
+    if requires_admin:
+        session_payload = _get_admin_session(
+            request,
+            required=bool(request.cookies.get(settings.admin_session_cookie)),
+        )
+        if session_payload:
+            actor = str(session_payload.get("sub") or "admin")
+            request.state.caller_id = f"admin:{actor}"
+            request.state.plan = "inst"
+            request.state.scopes = list(sorted(set(session_payload.get("scopes", []) or ["admin"])))
+            request.state.user = None
+            request.state.auth_source = "admin_session"
+            return True
+
+    if requires_admin and request.cookies.get(settings.admin_session_cookie):
+        # Cookie present but no valid session (decode would have raised earlier)
+        raise HTTPException(status_code=401, detail="admin_session_invalid")
 
     if token:
         await _authenticate_bearer(request, required_scopes, token)
@@ -335,12 +780,30 @@ async def ensure_arima():
         await asyncio.to_thread(load_arima)
 @app.post("/admin/warm")
 async def warm(_ok: bool = Security(require_key, scopes=["admin"])):
-    await asyncio.gather(
-        ensure_tf(),
-        ensure_arima(),
-        # ensure_sb3(),  # include if you actually need RL on web node
-    )
-    return {"ok": True, "tf": TF_AVAILABLE, "arima": ARIMA_AVAILABLE, "sb3": SB3_AVAILABLE}
+    return await admin_service.warm()
+
+
+@app.post("/admin/login")
+async def admin_login(
+    request: Request,
+    response: Response,
+    payload: dict = Body(...),
+):
+    return await admin_service.login(request, response, payload)
+
+
+@app.post("/admin/logout")
+async def admin_logout(request: Request, response: Response):
+    return await admin_service.logout(request, response)
+
+
+@app.post("/admin/refresh")
+async def admin_refresh(
+    request: Request,
+    response: Response,
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.refresh(request, response)
     
 @app.get("/models")
 async def models(_ok: bool = Depends(require_key)):
@@ -483,6 +946,13 @@ try:
         insert_news,
         insert_earnings,
         upsert_macro,
+        compute_and_upsert_metrics_daily as _rollup,
+        upsert_calibration_params,
+        get_calibration_params,
+        export_predictions_parquet,
+        export_outcomes_parquet,
+        export_metrics_parquet,
+        fetch_metrics_daily_arrow,
     )
     try:
         from .feature_store import insert_prediction as _fs_ins  # type: ignore
@@ -503,6 +973,13 @@ except Exception:
             insert_news,
             insert_earnings,
             upsert_macro,
+            compute_and_upsert_metrics_daily as _rollup,
+            upsert_calibration_params,
+            get_calibration_params,
+            export_predictions_parquet,
+            export_outcomes_parquet,
+            export_metrics_parquet,
+            fetch_metrics_daily_arrow,
         )
         try:
             from feature_store import insert_prediction as _fs_ins  # type: ignore
@@ -522,6 +999,10 @@ except Exception:
         upsert_macro = None  # type: ignore
         _fs_ins = None
         _fs_log = None
+        _rollup = None
+        export_predictions_parquet = None  # type: ignore
+        export_outcomes_parquet = None  # type: ignore
+        export_metrics_parquet = None  # type: ignore
         FS_DB_PATH = None  # type: ignore
         logger.warning("feature_store unavailable; logging to FS disabled")
 
@@ -532,6 +1013,14 @@ elif _fs_log is not None:
     _FS_LOG_IMPL = _fs_log
 else:
     _FS_LOG_IMPL = None  # feature store not wired for this build
+
+try:
+    from .labeler import label_mature_predictions
+except Exception:
+    try:
+        from labeler import label_mature_predictions  # type: ignore
+    except Exception:
+        label_mature_predictions = None  # type: ignore
 
 def fs_log_prediction(con, row: dict) -> None:
     """
@@ -553,167 +1042,6 @@ def fs_log_prediction(con, row: dict) -> None:
         return _FS_LOG_IMPL(row)
 
 
-def _determine_news_provider() -> str:
-    provider = (os.getenv("PT_NEWS_PROVIDER") or "").strip().lower()
-    if provider:
-        return provider
-    if settings.news_api_key:
-        return "newsapi"
-    return "polygon"
-
-
-def _as_utc_datetime(value: datetime | date | None) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        if value.tzinfo is None:
-            return value.replace(tzinfo=timezone.utc)
-        return value.astimezone(timezone.utc)
-    if isinstance(value, date):
-        return datetime.combine(value, datetime.min.time(), tzinfo=timezone.utc)
-    return None
-
-
-async def get_sentiment_features(symbol: str, days: int = 7) -> dict:
-    base = {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
-    if not fs_connect:
-        return base
-    symbol = (symbol or "").strip().upper()
-    if not symbol:
-        return base
-    window_days = int(max(1, days))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_sentiment_features: fs_connect failed: %s", exc)
-        return base
-    try:
-        rows = con.execute(
-            """
-            SELECT ts, sentiment
-            FROM news_articles
-            WHERE symbol = ? AND ts >= ?
-            ORDER BY ts DESC
-            """,
-            [symbol, cutoff],
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("get_sentiment_features: query failed for %s: %s", symbol, exc)
-        rows = []
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-    if not rows:
-        return base
-
-    now = datetime.now(timezone.utc)
-    vals = []
-    last24_vals = []
-    for ts, sentiment in rows:
-        val = float(sentiment or 0.0)
-        vals.append(val)
-        ts_dt = _as_utc_datetime(ts)
-        if ts_dt is None:
-            continue
-        if (now - ts_dt).total_seconds() <= 86400:
-            last24_vals.append(val)
-
-    base["avg_sent_7d"] = float(np.mean(vals)) if vals else 0.0
-    base["last24h"] = float(np.mean(last24_vals)) if last24_vals else 0.0
-    base["n_news"] = len(vals)
-    return base
-
-
-async def get_earnings_features(symbol: str) -> dict:
-    out = {
-        "surprise_last": 0.0,
-        "guidance_delta": 0.0,
-        "days_since_earn": None,
-        "days_to_next": None,
-    }
-    if not fs_connect:
-        return out
-    symbol = (symbol or "").strip().upper()
-    if not symbol:
-        return out
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_earnings_features: fs_connect failed: %s", exc)
-        return out
-    try:
-        last = con.execute(
-            """
-            SELECT report_date, surprise, guidance_delta
-            FROM earnings
-            WHERE symbol = ?
-            ORDER BY report_date DESC
-            LIMIT 1
-            """,
-            [symbol],
-        ).fetchone()
-    except Exception as exc:
-        logger.debug("get_earnings_features: query failed for %s: %s", symbol, exc)
-        last = None
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-    if last:
-        report_date = last[0]
-        surprise = last[1]
-        guidance_delta = last[2]
-        if surprise is not None:
-            out["surprise_last"] = float(surprise)
-        if guidance_delta is not None:
-            out["guidance_delta"] = float(guidance_delta)
-        rd = report_date
-        if isinstance(rd, datetime):
-            rd = rd.date()
-        if isinstance(rd, date):
-            out["days_since_earn"] = (datetime.now(timezone.utc).date() - rd).days
-    return out
-
-
-async def get_macro_features() -> dict:
-    base = {"rff": None, "cpi_yoy": None, "u_rate": None}
-    if not fs_connect:
-        return base
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_macro_features: fs_connect failed: %s", exc)
-        return base
-    try:
-        row = con.execute(
-            """
-            SELECT rff, cpi_yoy, u_rate
-            FROM macro_daily
-            ORDER BY as_of DESC
-            LIMIT 1
-            """
-        ).fetchone()
-    except Exception as exc:
-        logger.debug("get_macro_features: query failed: %s", exc)
-        row = None
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-    if not row:
-        return base
-    return {
-        "rff": float(row[0]) if row[0] is not None else None,
-        "cpi_yoy": float(row[1]) if row[1] is not None else None,
-        "u_rate": float(row[2]) if row[2] is not None else None,
-    }
-
 
 def _normalize_store_symbol(symbol: str) -> str:
     s = (symbol or "").strip().upper()
@@ -724,289 +1052,6 @@ def _normalize_store_symbol(symbol: str) -> str:
     if s.endswith("USD") and "-" not in s and not s.startswith("X:"):
         return f"{s[:-3]}-USD"
     return s
-
-
-def _first_number(values: Iterable[Any]) -> float | None:
-    for value in values:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            val = value.strip()
-            if not val or val == ".":
-                continue
-            try:
-                return float(val)
-            except Exception:
-                continue
-    return None
-
-
-def _news_ts(value: Any, default: datetime) -> datetime:
-    if isinstance(value, datetime):
-        return _as_utc_datetime(value) or default
-    if isinstance(value, str):
-        txt = value.strip()
-        if not txt:
-            return default
-        if txt.endswith("Z"):
-            txt = txt[:-1] + "+00:00"
-        try:
-            return _as_utc_datetime(datetime.fromisoformat(txt)) or default
-        except Exception:
-            pass
-    return default
-
-
-async def _news_rows_from_newsapi(symbol: str, since: datetime, limit: int, api_key: str) -> list[tuple]:
-    url = "https://newsapi.org/v2/everything"
-    params = {
-        "q": symbol,
-        "from": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "sortBy": "publishedAt",
-        "language": "en",
-        "pageSize": int(max(1, min(limit, 100))),
-    }
-    headers = {"X-Api-Key": api_key}
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        resp = await client.get(url, params=params, headers=headers)
-        resp.raise_for_status()
-        data = resp.json() or {}
-    items = data.get("articles", []) or []
-    rows: list[tuple] = []
-    seen: set[tuple] = set()
-    for item in items:
-        ts = _news_ts(item.get("publishedAt"), since)
-        if ts < since:
-            continue
-        url_item = (item.get("url") or "").strip()
-        dedupe_key = (ts.isoformat(), url_item)
-        if dedupe_key in seen:
-            continue
-        seen.add(dedupe_key)
-        source_name = ""
-        src_obj = item.get("source") or {}
-        if isinstance(src_obj, dict):
-            source_name = (src_obj.get("name") or "").strip()
-        title = (item.get("title") or "").strip()
-        summary = (item.get("description") or item.get("content") or "").strip()
-        rows.append((symbol, ts, source_name or "NewsAPI", title, url_item, summary, None))
-        if len(rows) >= limit:
-            break
-    return rows
-
-
-async def _news_rows_from_polygon(symbol: str, since: datetime, limit: int, api_key: str) -> list[tuple]:
-    url = "https://api.polygon.io/v2/reference/news"
-    params = {
-        "ticker": symbol,
-        "limit": int(max(1, min(limit, 100))),
-        "order": "desc",
-        "published_utc.gte": since.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "apiKey": api_key,
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json() or {}
-    items = data.get("results", []) or []
-    rows: list[tuple] = []
-    for item in items:
-        try:
-            tickers = [str(t).upper() for t in (item.get("tickers") or [])]
-        except Exception:
-            tickers = []
-        if symbol.upper() not in tickers:
-            continue
-        ts = _news_ts(item.get("published_utc"), since)
-        if ts < since:
-            continue
-        publisher = ""
-        pub_obj = item.get("publisher")
-        if isinstance(pub_obj, dict):
-            publisher = (pub_obj.get("name") or "").strip()
-        title = (item.get("title") or "").strip()
-        url_item = (item.get("article_url") or item.get("url") or "").strip()
-        summary = (item.get("description") or item.get("excerpt") or "").strip()
-        rows.append((symbol, ts, publisher or "Polygon", title, url_item, summary, None))
-        if len(rows) >= limit:
-            break
-    return rows
-
-
-async def _fetch_news_articles(symbol: str, since: datetime, provider: str, limit: int = 100) -> list[tuple]:
-    provider = (provider or "polygon").strip().lower()
-    limit = int(max(1, min(limit, 200)))
-    if provider == "newsapi":
-        api_key = settings.news_api_key or os.getenv("NEWS_API_KEY", "").strip()
-        if not api_key:
-            raise HTTPException(status_code=400, detail="NewsAPI key missing (set PT_NEWS_API_KEY).")
-        return await _news_rows_from_newsapi(symbol, since, limit, api_key)
-    if provider == "polygon":
-        key = _poly_key()
-        if not key:
-            raise HTTPException(status_code=400, detail="Polygon key missing for news ingest.")
-        return await _news_rows_from_polygon(symbol, since, limit, key)
-    raise HTTPException(status_code=400, detail=f"Unsupported news provider '{provider}'.")
-
-
-def _determine_earnings_provider() -> str:
-    provider = (settings.earnings_source or os.getenv("PT_EARNINGS_PROVIDER", "polygon")).strip().lower()
-    return provider or "polygon"
-
-
-async def _fetch_earnings_polygon(symbol: str, lookback_days: int, limit: int = 16) -> list[tuple]:
-    key = _poly_key()
-    if not key:
-        raise HTTPException(status_code=400, detail="Polygon key missing for earnings ingest.")
-    url = "https://api.polygon.io/v3/reference/financials"
-    params = {
-        "ticker": symbol,
-        "timeframe": "quarterly",
-        "limit": int(max(1, min(limit, 50))),
-        "order": "desc",
-        "sort": "reportPeriod",
-        "apiKey": key,
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json() or {}
-    results = data.get("results", []) or []
-    since_date = datetime.now(timezone.utc).date() - timedelta(days=int(max(1, lookback_days)))
-    rows: list[tuple] = []
-    for item in results:
-        rep_raw = item.get("reportPeriod") or item.get("calendarDate")
-        try:
-            rep_date = date.fromisoformat(str(rep_raw))
-        except Exception:
-            continue
-        if rep_date < since_date:
-            continue
-        eps_val = _first_number([
-            item.get("eps"),
-            item.get("epsDiluted"),
-            (item.get("earnings") or {}).get("eps"),
-            (item.get("incomeStatement") or {}).get("basicEPS"),
-            (item.get("incomeStatement") or {}).get("dilutedEPS"),
-        ])
-        est_val = _first_number([
-            item.get("estimateEPS"),
-            (item.get("earnings") or {}).get("epsEstimate"),
-            (item.get("analystEstimates") or {}).get("epsEstimate"),
-        ])
-        surprise = None
-        if eps_val is not None and est_val not in (None, 0.0):
-            denom = abs(est_val)
-            if denom > 1e-9:
-                surprise = (eps_val - est_val) / denom
-        revenue_val = _first_number([
-            item.get("revenue"),
-            (item.get("incomeStatement") or {}).get("revenue"),
-            (item.get("incomeStatement") or {}).get("totalRevenue"),
-        ])
-        guidance_val = _first_number([
-            (item.get("guidance") or {}).get("revenue"),
-            item.get("guidanceRevenue"),
-        ])
-        guidance_delta = None
-        if guidance_val is not None and revenue_val is not None:
-            try:
-                guidance_delta = float(guidance_val) - float(revenue_val)
-            except Exception:
-                guidance_delta = None
-        rows.append((
-            symbol,
-            rep_date,
-            eps_val,
-            surprise,
-            revenue_val,
-            guidance_delta,
-        ))
-        if len(rows) >= limit:
-            break
-    return rows
-
-
-async def _fetch_earnings_rows(symbol: str, lookback_days: int, provider: str, limit: int = 16) -> list[tuple]:
-    provider = provider.strip().lower()
-    if provider == "polygon":
-        return await _fetch_earnings_polygon(symbol, lookback_days, limit=limit)
-    raise HTTPException(status_code=400, detail=f"Unsupported earnings provider '{provider}'.")
-
-
-async def _fred_fetch_series(series_id: str, api_key: str, limit: int) -> list[tuple[date, float]]:
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": int(max(1, limit)),
-    }
-    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-        resp = await client.get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json() or {}
-    obs = data.get("observations", []) or []
-    rows: list[tuple[date, float]] = []
-    for item in obs:
-        val = (item.get("value") or "").strip()
-        if not val or val == ".":
-            continue
-        try:
-            value = float(val)
-        except Exception:
-            continue
-        try:
-            d = date.fromisoformat(str(item.get("date")))
-        except Exception:
-            continue
-        rows.append((d, value))
-    return rows
-
-
-async def _fetch_macro_rows(provider: str) -> list[tuple]:
-    provider = (provider or "fred").strip().lower()
-    if provider != "fred":
-        raise HTTPException(status_code=400, detail=f"Unsupported macro provider '{provider}'.")
-    api_key = (os.getenv("PT_FRED_API_KEY") or os.getenv("FRED_API_KEY") or "").strip()
-    if not api_key:
-        raise HTTPException(status_code=400, detail="FRED API key missing (set PT_FRED_API_KEY).")
-    rff_series, cpi_series, u_series = await asyncio.gather(
-        _fred_fetch_series("DGS3MO", api_key, limit=15),
-        _fred_fetch_series("CPIAUCSL", api_key, limit=30),
-        _fred_fetch_series("UNRATE", api_key, limit=15),
-    )
-
-    def _latest(series: list[tuple[date, float]]) -> tuple[date | None, float | None]:
-        series_sorted = sorted(series, key=lambda x: x[0], reverse=True)
-        for d, v in series_sorted:
-            return d, v
-        return (None, None)
-
-    rff_date, rff_val = _latest(rff_series)
-    u_date, u_val = _latest(u_series)
-
-    cpi_sorted = sorted(cpi_series, key=lambda x: x[0], reverse=True)
-    cpi_date, cpi_val = _latest(cpi_sorted)
-    prev_val = None
-    if cpi_date:
-        for d, v in cpi_sorted[1:]:
-            delta_months = (cpi_date.year - d.year) * 12 + (cpi_date.month - d.month)
-            if delta_months >= 12:
-                prev_val = v
-                break
-    cpi_yoy = None
-    if cpi_val is not None and prev_val not in (None, 0.0):
-        denom = abs(prev_val)
-        if denom > 1e-9:
-            cpi_yoy = ((cpi_val - prev_val) / denom) * 100.0
-
-    candidates = [d for d in (rff_date, cpi_date, u_date) if d is not None]
-    if not candidates:
-        return []
-    as_of = max(candidates)
-    return [(as_of, rff_val, cpi_yoy, u_val)]
 
 
 def _load_price_series_with_dates(
@@ -1136,6 +1181,64 @@ class Settings(BaseSettings):
         le=90,
         description="Number of DuckDB backups to keep per database",
     )
+    labeling_interval_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("PT_LABEL_INTERVAL_SECONDS", "900")),
+        ge=60,
+        le=86400,
+        description="Interval between background labeling passes (seconds).",
+    )
+    labeling_batch_limit: int = Field(
+        default_factory=lambda: int(os.getenv("PT_LABEL_BATCH_LIMIT", "5000")),
+        ge=100,
+        le=50000,
+        description="Maximum matured predictions processed per labeling pass.",
+    )
+    metrics_rollup_interval_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("PT_METRICS_ROLLUP_SECONDS", "3600")),
+        ge=300,
+        le=86400,
+        description="Interval between background metrics rollups (seconds).",
+    )
+    model_retrain_poll_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("PT_MODEL_RETRAIN_POLL_SECONDS", "1800")),
+        ge=300,
+        le=86400,
+        description="Interval between checks for scheduled model retraining (seconds).",
+    )
+    model_retrain_daily_hours: int = Field(
+        default_factory=lambda: int(os.getenv("PT_MODEL_RETRAIN_DAILY_HOURS", "24")),
+        ge=1,
+        le=168,
+        description="Age threshold in hours before daily-tier symbols are retrained.",
+    )
+    model_retrain_weekly_hours: int = Field(
+        default_factory=lambda: int(os.getenv("PT_MODEL_RETRAIN_WEEKLY_HOURS", str(24 * 7))),
+        ge=24,
+        le=24 * 30,
+        description="Age threshold in hours before weekly-tier symbols are retrained.",
+    )
+    data_retention_days: int = Field(
+        default_factory=lambda: int(os.getenv("PT_DATA_RETENTION_DAYS", "180")),
+        ge=30,
+        le=3650,
+        description="Number of days of prediction/outcome history to retain in DuckDB.",
+    )
+    data_retention_poll_seconds: int = Field(
+        default_factory=lambda: int(os.getenv("PT_DATA_RETENTION_POLL_SECONDS", str(24 * 3600))),
+        ge=3600,
+        le=7 * 24 * 3600,
+        description="Interval between data-retention cleanup passes (seconds).",
+    )
+    retrain_daily_symbols: str = Field(
+        default="",
+        validation_alias="PT_RETRAIN_DAILY_SYMBOLS",
+        description="Comma-separated symbols retrained on the daily cadence.",
+    )
+    retrain_weekly_symbols: str = Field(
+        default="",
+        validation_alias="PT_RETRAIN_WEEKLY_SYMBOLS",
+        description="Comma-separated symbols retrained on the weekly cadence.",
+    )
     backup_interval_minutes: int = Field(
         default_factory=lambda: int(os.getenv("PT_BACKUP_INTERVAL_MINUTES", "1440")),
         ge=60,
@@ -1166,6 +1269,28 @@ class Settings(BaseSettings):
     cookie_name: str = Field("pt_app", validation_alias="PT_COOKIE_NAME")
     cookie_max_age: int = Field(60 * 60 * 24, validation_alias="PT_COOKIE_MAX_AGE")  # 1 day
     cookie_secure: bool = Field(default_factory=lambda: bool(os.getenv("RENDER")) or os.getenv("ENV","dev") == "prod")
+    admin_username: Optional[str] = Field(default_factory=lambda: os.getenv("PT_ADMIN_USERNAME"))
+    admin_password_hash: Optional[str] = Field(default_factory=lambda: os.getenv("PT_ADMIN_PASSWORD_HASH"))
+    admin_session_secret: str = Field(
+        default_factory=lambda: os.getenv("PT_ADMIN_SESSION_SECRET") or os.getenv("PT_JWT_SECRET", "dev-secret")
+    )
+    admin_session_cookie: str = Field("pt_admin_session", validation_alias="PT_ADMIN_SESSION_COOKIE")
+    admin_session_ttl_minutes: int = Field(
+        default_factory=lambda: int(os.getenv("PT_ADMIN_SESSION_TTL_MINUTES", "30")),
+        ge=5,
+        le=24 * 60,
+    )
+    admin_login_rpm: int = Field(
+        default_factory=lambda: int(os.getenv("PT_ADMIN_LOGIN_RPM", "6")),
+        ge=1,
+        le=120,
+    )
+    admin_cookie_secure: bool = Field(
+        default_factory=lambda: _env_flag(
+            "PT_ADMIN_COOKIE_SECURE",
+            bool(os.getenv("RENDER")) or os.getenv("ENV", "dev") == "prod",
+        )
+    )
 
     # Limits / budgets
     n_paths_max: int = Field(default_factory=lambda: int(os.getenv("PT_N_PATHS_MAX", "10000")))
@@ -1239,26 +1364,6 @@ try:
 except Exception:
     logger.exception("Failed to execute startup migrations")
 
-# Validation tuning knobs (parsed from settings; fall back to sane defaults)
-def _parse_int_list(raw: str) -> list[int]:
-    vals: list[int] = []
-    for token in str(raw or "").split(","):
-        token = token.strip()
-        if not token:
-            continue
-        try:
-            v = int(token)
-        except ValueError:
-            continue
-        if v > 0:
-            vals.append(v)
-    return vals
-
-VALIDATION_LOOKBACKS = _parse_int_list(settings.validation_lookbacks) or [20, 60, 120]
-VALIDATION_TARGET_MAPE = float(settings.validation_target_mape or 5.0)
-VALIDATION_MAX_SAMPLES = int(max(20, min(settings.validation_max_samples, 500)))
-VALIDATION_BARS_PER_YEAR = 252.0
-
 def _parse_hhmm(value: str) -> tuple[int, int]:
     try:
         hh, mm = value.strip().split(":")
@@ -1307,132 +1412,8 @@ def _latest_mc_metric(symbol: str, horizon_days: int) -> dict | None:
     finally:
         con.close()
 
-# -----------------------------------------------------------------------------
-# Helpers / config (independent)
-# -----------------------------------------------------------------------------
-# --- validator core ---
-async def _validate_mc_paths(symbols: list[str], days: int, n_paths: int) -> dict:
-    """
-    Run roll-forward Monte Carlo validation for each symbol and persist tuning artifacts.
-    """
-    try:
-        from .feature_store import upsert_mc_params, insert_mc_metrics  # type: ignore
-    except Exception:
-        from feature_store import upsert_mc_params, insert_mc_metrics  # type: ignore
-
-    today = datetime.now(timezone.utc).date()
-    as_of = today.isoformat()
-    seeded_by = "symbol|horizon"
-
-    results: list[dict[str, Any]] = []
-    params_rows: list[tuple[str, float, float, int, int]] = []
-    metric_rows: list[tuple[Any, ...]] = []
-
-    for sym in [s.strip().upper() for s in symbols if s.strip()]:
-        try:
-            window_days = max(400, days + max(VALIDATION_LOOKBACKS) + 50)
-            px = await _fetch_cached_hist_prices(sym, window_days=window_days, redis=REDIS)
-            arr = np.asarray([p for p in px if isinstance(p, (int, float)) and math.isfinite(p)], float)
-        except Exception as exc:
-            results.append({"symbol": sym, "skipped": True, "reason": f"history_fetch_failed:{exc}"})
-            continue
-
-        if arr.size < (days + min(VALIDATION_LOOKBACKS) + 5):
-            results.append({"symbol": sym, "skipped": True, "reason": "insufficient_history"})
-            continue
-
-        try:
-            tune = rollforward_validation(
-                arr,
-                horizon_days=days,
-                lookbacks=VALIDATION_LOOKBACKS,
-                n_paths=n_paths,
-                target_mape=VALIDATION_TARGET_MAPE,
-                max_samples=VALIDATION_MAX_SAMPLES,
-                bars_per_year=VALIDATION_BARS_PER_YEAR,
-            )
-        except ValueError as exc:
-            results.append({"symbol": sym, "skipped": True, "reason": str(exc)})
-            continue
-
-        best = tune.best
-        mu_daily = float(best.mu_ann / VALIDATION_BARS_PER_YEAR)
-        sigma_daily = float(best.sigma_ann / math.sqrt(VALIDATION_BARS_PER_YEAR))
-
-        params_rows.append((sym, mu_daily, sigma_daily, int(best.lookback), int(best.lookback)))
-
-        variants = [
-            {
-                "lookback": r.lookback,
-                "samples": r.samples,
-                "mape": r.mape,
-                "mdape": r.mdape,
-                "mu_ann": r.mu_ann,
-                "sigma_ann": r.sigma_ann,
-            }
-            for r in tune.results
-        ]
-
-        results.append({
-            "symbol": sym,
-            "horizon_days": int(days),
-            "mape": best.mape,
-            "mdape": best.mdape,
-            "n": int(best.samples),
-            "mu": mu_daily,
-            "sigma": sigma_daily,
-            "mu_ann": best.mu_ann,
-            "sigma_ann": best.sigma_ann,
-            "lookback": int(best.lookback),
-            "recommended_n_paths": int(tune.recommended_n_paths),
-            "target_mape": VALIDATION_TARGET_MAPE,
-            "candidates": variants,
-        })
-
-        metric_rows.append((
-            as_of,
-            sym,
-            int(days),
-            float(best.mape),
-            float(best.mdape),
-            int(best.samples),
-            mu_daily,
-            sigma_daily,
-            int(tune.recommended_n_paths),
-            int(best.lookback),
-            int(best.lookback),
-            seeded_by,
-        ))
-
-    con = fs_connect()
-    try:
-        for (sym, mu_final, sig_final, lb_mu, lb_sig) in params_rows:
-            upsert_mc_params(con, sym, mu_final, sig_final, lb_mu, lb_sig)
-        if metric_rows:
-            insert_mc_metrics(con, metric_rows)
-    finally:
-        con.close()
-
-    return {
-        "as_of": as_of,
-        "horizon_days": int(days),
-        "n_paths": int(n_paths),
-        "target_mape": VALIDATION_TARGET_MAPE,
-        "lookbacks": VALIDATION_LOOKBACKS,
-        "items": results,
-    }
-
 async def _backup_once() -> None:
-    if not BACKUP_TARGETS:
-        return
-    for name, db_path in BACKUP_TARGETS:
-        try:
-            dest = await asyncio.to_thread(create_duckdb_backup, db_path, BACKUP_DIR, keep=BACKUP_KEEP)
-            log_json("info", msg="duckdb_backup_ok", db=name, dest=str(dest))
-        except FileNotFoundError:
-            log_json("warning", msg="duckdb_backup_missing", db=name, path=str(db_path))
-        except Exception as exc:
-            log_json("error", msg="duckdb_backup_fail", db=name, error=str(exc))
+    await admin_service.backup_once()
 
 async def _backup_loop() -> None:
     if not BACKUP_TARGETS or BACKUP_INTERVAL_SECONDS <= 0:
@@ -1446,8 +1427,11 @@ async def _backup_loop() -> None:
 # --- routes ---
 @app.post("/admin/backup", summary="Trigger an immediate DuckDB backup")
 async def admin_backup(_ok: bool = Security(require_key, scopes=["admin"])):
-    await _backup_once()
-    return {"ok": True, "targets": [name for name, _ in BACKUP_TARGETS]}
+    results = await admin_service.backup_once()
+    targets = [item.get("db") for item in results if isinstance(item, dict) and item.get("db")]
+    if not targets:
+        targets = [name for name, _ in BACKUP_TARGETS]
+    return {"ok": True, "targets": targets, "results": results}
 
 @app.post("/admin/validate/mc")
 async def admin_validate_mc(
@@ -1458,7 +1442,7 @@ async def admin_validate_mc(
 ):
     # default universe: any list you keep in env/redis; fallback to a small set
     syms = [s.strip() for s in (symbols.split(",") if symbols else ["SPY","QQQ","BTC-USD","ETH-USD"])]
-    out = await _validate_mc_paths(syms, days=days, n_paths=n_paths)
+    out = await admin_service.validate_mc_paths(syms, days=days, n_paths=n_paths)
     return {"ok": True, "data": out}
 
 @app.get("/v1/metrics/mc")
@@ -1483,13 +1467,6 @@ def _env_list(name: str, default: List[str] | None = None) -> List[str]:
         return default or []
     return [x.strip() for x in s.split(",") if x.strip()]
 
-def _poly_crypto_to_app(sym: str) -> str:
-    # "X:BTCUSD" -> "BTC-USD"
-    s = (sym or "").upper()
-    if s.startswith("X:") and s.endswith("USD"):
-        return f"{s[2:-3]}-USD"
-    return s
-
 def require_tf() -> None:
     if not TF_AVAILABLE:
         raise HTTPException(status_code=503, detail="TensorFlow is not installed on the server.")
@@ -1505,7 +1482,7 @@ async def _model_key(symbol: str) -> str:
     return f"model:{symbol.upper()}"
 
 TOP_STOCKS = [
-    'NVDA', 'MSFT', 'AAPL', 'AMZN', 'GOOGL', 'META', 'BRK.B', '2222.SR', 'TSM', 'AVGO',
+    'NVDA', 'MSFT', 'AAPL', 'AMZN', 'GOOGL', 'META', 'RIOT', 'KR', 'TSM', 'AVGO',
     'TSLA', 'WMT', 'JPM', 'V', 'UNH', 'XOM', 'MA', 'PG', 'JNJ', 'COST',
     'HD', 'ASML', 'CVX', 'ABBV', 'TMUS', 'MRK', 'LLY', 'WFC', 'NFLX', 'AMD',
     'KO', 'BAC', 'CRM', 'ABT', 'DHR', 'TXN', 'LIN', 'ACN', 'QCOM', 'PM',
@@ -1551,42 +1528,10 @@ if not settings.watchlist_cryptos:
     settings.watchlist_cryptos = ",".join(TOP_CRYPTOS)
 
 
-def _dedupe_upper(seq: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in seq:
-        s = str(raw or "").strip().upper()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _dedupe_crypto(seq: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for raw in seq:
-        sym = _norm_crypto_symbol(raw)
-        if not sym or sym in seen:
-            continue
-        seen.add(sym)
-        out.append(sym)
-    return out
-
-
-equity_items = settings.watchlist_equities.split(",") if settings.watchlist_equities else list(TOP_STOCKS)
-crypto_items = settings.watchlist_cryptos.split(",") if settings.watchlist_cryptos else list(TOP_CRYPTOS)
-
-# Canonical watchlist sets derived from settings (preserve declared order)
-WL_EQ = _dedupe_upper(equity_items)[:200]
-WL_CR = _dedupe_crypto(crypto_items)[:200]
-
-# Derived arrays for daily quant and other jobs
-if not getattr(settings, "equity_watch", None):
-    settings.equity_watch = WL_EQ.copy()
-if not getattr(settings, "crypto_watch", None):
-    settings.crypto_watch = WL_CR.copy()
+WL_EQ = get_equity_watchlist()
+WL_CR = get_crypto_watchlist()
+RETRAIN_DAILY = get_retrain_daily_symbols()
+RETRAIN_WEEKLY = get_retrain_weekly_symbols()
 
 # Config knobs (reasonable defaults)
 STAT_BARS_QUICK = 252          # ~1y worth of bars to estimate μ/σ
@@ -1669,6 +1614,9 @@ async def _on_startup():
     # Background loops (observable)
     _run_bg("gc_loop", _gc_loop())
     _run_bg("labeling_daemon", _labeling_daemon())
+    _run_bg("metrics_rollup", _metrics_rollup_loop())
+    _run_bg("data_retention", _data_retention_loop())
+    _run_bg("model_retrain", _model_retrain_loop())
     _run_bg("warm_start", _warm_start())  # warm but gentle
     _run_bg("duckdb_backup", _backup_loop())
     _run_bg("quant_scheduler", _daily_quant_scheduler())
@@ -1736,7 +1684,7 @@ async def _warm_start():
             if _poly_key_present() and not _is_weekend(y):
                 try:
                     t_ing = time.perf_counter()
-                    await ingest_grouped_daily(y)
+                    await ingestion_service.ingest_grouped_daily(y, log_tag="warm")
                     log_json("info", msg="warm_ingest_ok", job=job, day=y.isoformat(),
                              duration_s=round(time.perf_counter() - t_ing, 3))
                 except Exception as e:
@@ -1851,12 +1799,58 @@ def _student_t_noise(df: int, size: tuple[int,...], rng: np.random.Generator) ->
     return z / scale
 
 def _iv30_or_none(symbol: str) -> float | None:
-    """Hook for 30d ATM IV if you have it. Return None to skip anchoring."""
+    """Estimate a 30-day annualized volatility using Polygon data (fallback to realized vol)."""
+    symbol_norm = (symbol or "").upper().strip()
+    if not symbol_norm:
+        return None
+    cached = _IV_CACHE.get(symbol_norm)
+    if cached:
+        value, ts = cached
+        if datetime.now(timezone.utc) - ts < IV_CACHE_TTL:
+            return value
+
+    key = _poly_key()
+    if not key:
+        return None
+
+    poly_symbol = _to_polygon_ticker(symbol_norm)
+    end_date = datetime.now(timezone.utc).date()
+    start_date = end_date - timedelta(days=60)
+    url = f"https://api.polygon.io/v2/aggs/ticker/{poly_symbol}/range/1/day/{start_date}/{end_date}"
+    params = {"adjusted": "true", "sort": "desc", "limit": "120"}
+    headers = {"Authorization": f"Bearer {key}"}
+
     try:
-        # TODO: wire to your options cache if available
-        return None
-    except Exception:
-        return None
+        resp = httpx.get(url, params=params, headers=headers, timeout=5.0)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        results = data.get("results") or []
+        closes = [
+            float(item.get("c"))
+            for item in results
+            if isinstance(item, dict) and item.get("c") is not None
+        ]
+        closes = closes[:60]
+        if len(closes) < 30:
+            return None
+        closes = closes[::-1]
+        arr = np.asarray(closes, dtype=float)
+        rets = np.diff(np.log(arr))
+        rets = rets[np.isfinite(rets)]
+        if rets.size < 20:
+            return None
+        sigma_daily = float(np.std(rets, ddof=1))
+        if not math.isfinite(sigma_daily) or sigma_daily <= 0:
+            return None
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 5.0))
+        _IV_CACHE[symbol_norm] = (sigma_ann, datetime.now(timezone.utc))
+        return sigma_ann
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response else "?"
+        logger.debug("Polygon IV fetch error %s for %s: %s", status, symbol_norm, exc)
+    except Exception as exc:
+        logger.debug("IV fetch failed for %s: %s", symbol_norm, exc)
+    return None
 
 def simulate_gbm_student_t(
     S0: float,
@@ -1889,12 +1883,39 @@ def simulate_gbm_student_t(
     paths = S0 * np.exp(np.hstack([np.zeros((n_paths, 1)), log_paths]))
     return paths
 
+
+def _instrument_kind(symbol: str | None, S0: float) -> str:
+    s = (symbol or "").upper()
+    if s.startswith("X:") or s.endswith("-USD") or (s.endswith("USD") and "-" not in s):
+        return "crypto"
+    if S0 >= 100000 and s.startswith("BTC"):
+        return "crypto"
+    return "equity"
+
+
+def rel_levels_from_expected_move(expected_move: float, *, kind: str = "equity") -> list[float]:
+    em = float(max(0.005, expected_move))
+    if kind == "crypto":
+        multipliers = [-3.5, -2.5, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.5, 3.5]
+    else:
+        multipliers = [-2.5, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.5]
+    levels = [float(round(m * em, 6)) for m in multipliers]
+    # ensure 0 present
+    if 0.0 not in levels:
+        levels.insert(len(levels) // 2, 0.0)
+    return levels
+
+
 def compute_targets_block(
     paths: np.ndarray,
     S0: float,
     horizon_days: int,
     bars_per_day: int,
     rel_levels: Optional[Sequence[float]] = None,
+    *,
+    symbol: str | None = None,
+    sigma_hint: float | None = None,
+    calibration_hint: Optional[Mapping[str, Any]] = None,
 ) -> dict:
     """
     Build the artifact.targets block the UI expects.
@@ -1914,17 +1935,17 @@ def compute_targets_block(
     # Determine default ladder if not provided
     # NOTE: You can pass the regime/kind from your symbol or request.
     if rel_levels is None:
-        kind = "crypto" if str(S0) and isinstance(S0, (int, float)) else "equity"  # trivial default
-        # TODO (optional): infer 'kind' from symbol (e.g., X:BTCUSD -> crypto).
-        rel_levels = auto_rel_levels(sigma_ann=None, horizon_days=horizon_days, kind=kind)
-
-        # --- (optional, commented) Use expected-move ladder if IV is available ---
-        # iv_annual = None
-        # if hasattr(globals(), "options_summary"):  # or bring your IV in scope
-        #     iv_annual = options_summary.get("atm_iv_annual")  # define your source
-        # em = iv_expected_move(iv_annual, horizon_days)
-        # if em is not None:
-        #     rel_levels = rel_levels_from_expected_move(em)
+        kind = _instrument_kind(symbol, S0)
+        sigma_cal = _sigma_from_calibration(calibration_hint) if calibration_hint else None
+        sigma_for_levels = sigma_hint
+        if sigma_for_levels is not None and sigma_cal is not None:
+            sigma_for_levels = float(np.clip(0.5 * (sigma_for_levels + sigma_cal), 1e-4, 3.0))
+        elif sigma_for_levels is None:
+            sigma_for_levels = sigma_cal
+        if sigma_for_levels is None:
+            sigma_for_levels = 0.35 if kind == "crypto" else 0.20
+        expected_move = float(np.clip(sigma_for_levels * math.sqrt(max(1, horizon_days) / 252.0), 0.01, 3.0))
+        rel_levels = rel_levels_from_expected_move(expected_move, kind=kind)
 
     # Ensure Spot row (0.0) is present exactly once and in the middle-ish
     levels = list(dict.fromkeys([float(x) for x in rel_levels]))  # de-dup but keep order
@@ -2028,7 +2049,7 @@ app.add_middleware(
     allow_origin_regex=r"https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept", "X-API-Key", "x-pt-key", "Authorization", "X-Polygon-Key"],
+    allow_headers=["Content-Type", "Accept", "X-API-Key", "x-pt-key", "Authorization", "X-Requested-With", "X-Polygon-Key"],
     max_age=86400,
 )
 # --- Optional static frontend
@@ -2144,7 +2165,8 @@ async def llm_summarize_async(
                     **({"response_format": response_format} if response_format else {}),
                 },
             )
-            content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            content = raw_content.strip() if isinstance(raw_content, str) else raw_content
             return _coerce_json_obj(content)
 
         if oai_key:
@@ -2166,7 +2188,8 @@ async def llm_summarize_async(
                     "temperature": 0.2,
                 },
             )
-            content = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+            raw_content = data.get("choices", [{}])[0].get("message", {}).get("content")
+            content = raw_content.strip() if isinstance(raw_content, str) else raw_content
             return _coerce_json_obj(content)
 
         return _fallback()
@@ -2195,6 +2218,18 @@ class SGDOnline:
     def _sigmoid(z: float) -> float:
         z = float(np.clip(z, -60.0, 60.0))
         return 1.0 / (1.0 + math.exp(-z))
+
+    def proba(self, x) -> float:
+        if self.w is None:
+            raise RuntimeError("Call init(d) before proba()")
+        xb = np.concatenate([[1.0], np.asarray(x, dtype=float)])
+        if xb.size != self.w.size:
+            if xb.size < self.w.size:
+                xb = np.pad(xb, (0, self.w.size - xb.size))
+            else:
+                xb = xb[: self.w.size]
+        z = float(np.dot(self.w, xb))
+        return self._sigmoid(z)
 
     def update(self, x, y):
         if self.w is None:
@@ -2232,146 +2267,6 @@ class EW:
         self.w = (w_new / s) if s > 0 else (np.ones_like(w_new) / w_new.size)
         return self.w
 
-async def ingest_grouped_daily(d: date):
-    """
-    Ingest Polygon grouped daily bars for US stocks and global crypto for a given UTC date.
-    Creates/updates DuckDB table `bars_daily` (PRIMARY KEY: symbol, ts).
-    Returns: {"ok": True, "upserted": <int>}
-    """
-    t_start = time.perf_counter()
-    key = _poly_key()
-    day = d.isoformat()
-    async def _fetch_json(cli: httpx.AsyncClient, url: str, params: dict) -> dict:
-        base_delays = (0.8, 1.6, 3.2, 6.4)  # gentle backoff
-        for i, delay in enumerate((*base_delays, None)):
-            try:
-                r = await cli.get(url, params=params, timeout=30.0)
-                r.raise_for_status()
-                return r.json() or {}
-            except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                if status in (429, 500, 502, 503, 504) and delay is not None:
-                    # Honor Retry-After or rate-limit reset if present
-                    ra = e.response.headers.get("Retry-After")
-                    reset = e.response.headers.get("X-RateLimit-Reset")
-                    sleep_s = None
-                    if ra:
-                        try: sleep_s = float(ra)
-                        except: sleep_s = None
-                    if (sleep_s is None) and reset:
-                        try:
-                            # reset is epoch seconds on many APIs
-                            sleep_s = max(0.0, float(reset) - time.time())
-                        except:
-                            pass
-                    if sleep_s is None:
-                        # final fallback: jittered fixed delay
-                        sleep_s = delay + random.random()
-                    await asyncio.sleep(min(15.0, max(0.5, sleep_s)))
-                    continue
-                raise
-            except httpx.HTTPError:
-                if delay is not None:
-                    await asyncio.sleep(delay)
-                    continue
-                raise
-    # --- Fetch Polygon grouped aggs ---
-    params = {"adjusted": "true", "apiKey": key}
-    async with httpx.AsyncClient() as cli:
-        stocks = await _fetch_json(
-            cli, f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{day}", params
-        )
-        crypto = await _fetch_json(
-            cli, f"https://api.polygon.io/v2/aggs/grouped/locale/global/market/crypto/{day}", params
-        )
-
-    rows1 = stocks.get("results") or []
-    rows2 = crypto.get("results") or []
-
-    # --- Transform -> upsert payloads ---
-    to_upsert = []
-
-    # US stocks (tickers like "AAPL")
-    for r in rows1:
-        tkr = (r.get("T") or "").upper()
-        if not tkr:
-            continue
-        to_upsert.append((
-            tkr,
-            day,
-            float(r.get("o") or 0.0),
-            float(r.get("h") or 0.0),
-            float(r.get("l") or 0.0),
-            float(r.get("c") or 0.0),
-            float(r.get("v") or 0.0),
-        ))
-
-    # Crypto (tickers like "X:BTCUSD" -> "BTC-USD")
-    for r in rows2:
-        raw = r.get("T") or ""
-        tkr = _poly_crypto_to_app(raw)  # e.g., "X:BTCUSD" -> "BTC-USD"
-        if not tkr or "-USD" not in tkr:
-            continue
-        to_upsert.append((
-            tkr,
-            day,
-            float(r.get("o") or 0.0),
-            float(r.get("h") or 0.0),
-            float(r.get("l") or 0.0),
-            float(r.get("c") or 0.0),
-            float(r.get("v") or 0.0),
-        ))
-
-    if not to_upsert:
-        return {"ok": True, "upserted": 0}
-
-    payload_hash = hashlib.sha256(json.dumps(to_upsert, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()
-
-    # --- DuckDB upsert ---
-    con = fs_connect()
-    try:
-        con.execute("BEGIN")
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS bars_daily (
-                symbol TEXT,
-                ts DATE,
-                open DOUBLE,
-                high DOUBLE,
-                low DOUBLE,
-                close DOUBLE,
-                volume DOUBLE,
-                PRIMARY KEY(symbol, ts)
-            )
-        """)
-
-        con.executemany(
-            """
-            INSERT OR REPLACE INTO bars_daily
-            (symbol, ts, open, high, low, close, volume)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            to_upsert,
-        )
-        con.execute("COMMIT")
-        if log_ingest_event:
-            try:
-                duration_ms = int((time.perf_counter() - t_start) * 1000)
-                log_ingest_event(con, as_of=day, source="polygon_grouped", row_count=len(to_upsert), sha256=payload_hash, duration_ms=duration_ms, ok=True)
-            except Exception as exc:
-                logger.debug(f"log_ingest_event_failed: {exc}")
-    except Exception as e:
-        con.execute("ROLLBACK")
-        if log_ingest_event:
-            try:
-                duration_ms = int((time.perf_counter() - t_start) * 1000)
-                log_ingest_event(con, as_of=day, source="polygon_grouped", row_count=len(to_upsert), sha256=payload_hash, duration_ms=duration_ms, ok=False, error=str(e))
-            except Exception:
-                pass
-        raise
-    finally:
-        con.close()
-
-    return {"ok": True, "upserted": len(to_upsert)}
 
 def _ensure_redis() -> Redis:
     if REDIS is None:
@@ -2428,6 +2323,11 @@ class TrainRequest(BaseModel):
     symbol: str
     lookback_days: int = Field(default=365, ge=30, le=3650)
 
+
+class PromoteModelRequest(BaseModel):
+    version: str = Field(..., min_length=1, max_length=128)
+
+
 class PredictRequest(BaseModel):
     symbol: str
     horizon_days: int = Field(default=30, ge=1, le=365)
@@ -2462,83 +2362,9 @@ class RunState(BaseModel):
     error: str | None = None
     status_detail: str | None = None
     owner: str | None = None
-#------------Lemon Squezzy checkout------------
-def _ls_valid_sig(raw: bytes, sig_b64: str) -> bool:
-    if not LS_WEBHOOK_SECRET or not sig_b64:
-        return False
-    mac = hmac.new(LS_WEBHOOK_SECRET, msg=raw, digestmod=hashlib.sha256).digest()
-    expected = base64.b64encode(mac).decode("utf-8")
-    return hmac.compare_digest(expected, sig_b64)
-
-async def _grant_plan(email: str, plan: str, ttl_days: int | None = 365) -> None:
-    if not REDIS or not email: return
-    key = f"user:{email.lower()}:plan"
-    if ttl_days:
-        await REDIS.set(key, plan, ex=ttl_days*24*3600)
-    else:
-        await REDIS.set(key, plan)
-
-async def _revoke_or_downgrade(email: str) -> None:
-    if not REDIS or not email: return
-    key = f"user:{email.lower()}:plan"
-    await REDIS.set(key, "free", ex=30*24*3600)  # keep a short TTL
-
-def _norm_plan_name(s: str | None) -> str:
-    s = (s or "").strip().lower()
-    if "enterprise" in s: return "enterprise"
-    if "pro" in s: return "pro"
-    return "free"
-
-def _payload_email(attrs: dict) -> str:
-    return (
-        attrs.get("user_email") or
-        attrs.get("customer_email") or
-        attrs.get("email") or
-        ""
-    )
-
 @app.post("/billing/webhook")
 async def lemon_webhook(request: Request):
-    raw = await request.body()
-    sig = request.headers.get("X-Signature", "")
-    if not _ls_valid_sig(raw, sig):
-        raise HTTPException(status_code=401, detail="invalid signature")
-
-    payload = json.loads(raw.decode("utf-8") or "{}")
-    meta = payload.get("meta") or {}
-    event = (meta.get("event_name") or "").strip().lower()
-    data  = payload.get("data") or {}
-    attrs = (data.get("attributes") or {})
-
-    # --- Idempotency guard: skip if we've seen this event id ---
-    evt_id = meta.get("event_id") or data.get("id")
-    if REDIS and evt_id:
-        if await REDIS.sismember("ls:events:seen", evt_id):
-            return {"ok": True, "idempotent": True}
-        await REDIS.sadd("ls:events:seen", evt_id)
-        await REDIS.expire("ls:events:seen", 14*24*3600)
-
-    email = (_payload_email(attrs) or "").lower()
-    variant_name = _norm_plan_name(attrs.get("variant_name") or attrs.get("name"))
-
-    # Handle events
-    if event in {
-        "order_created",
-        "subscription_created",
-        "subscription_updated",
-    }:
-        await _grant_plan(email, variant_name, ttl_days=365)
-    elif event in {
-        "subscription_cancelled",
-        "subscription_expired",
-        "order_refunded",
-    }:
-        await _revoke_or_downgrade(email)
-    else:
-        # ignore others
-        pass
-
-    return {"ok": True, "event": event, "email": email, "plan": variant_name}
+    return await admin_service.billing_webhook(request)
 
 # Simple plan lookup (use with real auth later)
 @app.get("/me")
@@ -2567,39 +2393,7 @@ async def _list_models() -> List[str]:
     return out
 
 
-async def _fetch_hist_prices(symbol: str, window_days: int | None = None) -> List[float]:
-    symbol = (symbol or "").upper().strip()
-    key = _poly_key()
-    if not key:
-        raise HTTPException(status_code=400, detail="Polygon key missing")
-
-    wd = settings.lookback_days_max if window_days is None else max(1, int(window_days))
-    end = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=wd)
-
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start}/{end}"
-    params = {"adjusted": "true", "sort": "asc", "limit": "50000"}
-    headers = {"Authorization": f"Bearer {key}"}
-
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            r = await client.get(url, params=params, headers=headers)
-            r.raise_for_status()
-            data = r.json() or {}
-            results = data.get("results") or []
-            closes = [float(x.get("c")) for x in results if isinstance(x, dict) and "c" in x]
-            return closes
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 429:
-            raise HTTPException(status_code=429, detail="Rate limited by Polygon")
-        logger.exception(f"Polygon aggs fetch failed for {symbol}: {e}")
-        return []
-    except Exception as e:
-        logger.exception(f"Failed to fetch prices for {symbol}: {e}")
-        return []
-
-async def _feat_from_prices(symbol: str, px: List[float]) -> Dict[str, float]:
-    arr = np.asarray([v for v in px if isinstance(v, (int, float)) and math.isfinite(v)], dtype=float)
+def _basic_features_from_array(arr: np.ndarray) -> Dict[str, float]:
     out: Dict[str, float] = {"mom_20": 0.0, "rvol_20": 0.0, "autocorr_5": 0.0}
     if arr.size < 3:
         return out
@@ -2629,54 +2423,143 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict[str, float]:
 
     return out
 
-async def _fetch_cached_hist_prices(symbol: str, window_days: int, redis: Redis | None) -> List[float]:
-    today_str = _today_utc_date().isoformat()
 
-    def _to_app_symbol(s: str) -> str:
-        s = (s or "").strip().upper()
-        if s.startswith("X:") and s.endswith("USD"):
-            return f"{s[2:-3]}-USD"
-        if s.endswith("USD") and "-" not in s and not s.startswith("X:"):
-            return f"{s[:-3]}-USD"
-        return s
+async def _feat_from_prices(symbol: str, px: List[float]) -> Dict[str, float]:
+    arr = np.asarray([v for v in px if isinstance(v, (int, float)) and math.isfinite(v)], dtype=float)
+    return _basic_features_from_array(arr)
 
-    app_sym = _to_app_symbol(symbol)
-    cache_key = f"hist_prices:{app_sym}:{window_days}:{today_str}"
-
-    if redis:
-        cached = await redis.get(cache_key)
-        if cached:
-            try:
-                js = json.loads(cached)
-                if isinstance(js, list) and js and all(isinstance(x, (int, float)) for x in js):
-                    return js[-int(window_days):]
-            except Exception:
-                pass
-
-    closes: List[float] = []
-    try:
-        con = fs_connect()
-        rows = con.execute(
-            "SELECT ts, close FROM bars_daily WHERE symbol = ? ORDER BY ts ASC",
-            [app_sym]
-        ).fetchall()
-        con.close()
-        if rows:
-            closes = [float(r[1]) for r in rows][-int(window_days):]
-    except Exception as e:
-        logger.info(f"DuckDB bars_daily lookup failed for {app_sym}: {e}")
-
-    free_mode = os.getenv("PT_FREE_MODE","0") == "1"
-    if not closes or len(closes) < min(30, int(window_days) // 2 or 1):
-        if not free_mode:
-            closes = await _fetch_hist_prices(symbol, window_days)
-    if redis:
+async def _polygon_close_for_day(
+    client: httpx.AsyncClient,
+    poly_symbol: str,
+    day_iso: str,
+    key: str,
+) -> float | None:
+    cache_key = f"polygon:close:{poly_symbol}:{day_iso}"
+    if REDIS:
         try:
-            await redis.setex(cache_key, 1800, json.dumps(closes))
+            cached = await REDIS.get(cache_key)
+            if cached:
+                txt = cached.decode("utf-8", errors="ignore") if isinstance(cached, (bytes, bytearray)) else str(cached)
+                if txt == "NA":
+                    return None
+                try:
+                    return float(txt)
+                except Exception:
+                    pass
         except Exception:
             pass
-    return closes
 
+    url = f"https://api.polygon.io/v1/open-close/{poly_symbol}/{day_iso}"
+    headers = {"Authorization": f"Bearer {key}"}
+    params = {"adjusted": "true"}
+    try:
+        resp = await client.get(url, params=params, headers=headers)
+        resp.raise_for_status()
+        data = resp.json() or {}
+        close = data.get("close")
+        if close is None:
+            close = data.get("afterHours") or data.get("preMarket")
+        if close is None:
+            close = data.get("lastTrade") or data.get("last")  # fallback keys
+        if close is None:
+            if REDIS:
+                try:
+                    await REDIS.setex(cache_key, 3600, "NA")
+                except Exception:
+                    pass
+            return None
+        price = float(close)
+        if REDIS:
+            try:
+                await REDIS.setex(cache_key, 12 * 3600, str(price))
+            except Exception:
+                pass
+        return price
+    except httpx.HTTPStatusError as e:
+        status = e.response.status_code if e.response else "?"
+        if status in (404, 422):  # market closed / no data
+            if REDIS:
+                try:
+                    await REDIS.setex(cache_key, 3600, "NA")
+                except Exception:
+                    pass
+            return None
+        if status == 429:
+            raise
+        logger.warning(f"Polygon open-close error {status} for {poly_symbol} on {day_iso}: {e}")
+    except Exception as exc:
+        logger.warning(f"Failed to fetch open-close for {poly_symbol} {day_iso}: {exc}")
+    return None
+
+
+async def _fetch_realized_price(symbol: str, target_ts: datetime, *, max_back_days: int = 4) -> float | None:
+    """
+    Resolve a realized close near target_ts (UTC). Falls back up to `max_back_days`
+    prior sessions to accommodate weekends/holidays.
+    """
+    key = _poly_key()
+    if not key:
+        logger.debug("Polygon key missing; realized price fetch skipped for %s", symbol)
+        return None
+
+    poly_symbol = _to_polygon_ticker(symbol)
+    if not poly_symbol:
+        return None
+
+    dt_utc = target_ts.astimezone(timezone.utc)
+    base_day = dt_utc.date()
+
+    timeout = httpx.Timeout(10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            for offset in range(max_back_days + 1):
+                day_iso = (base_day - timedelta(days=offset)).isoformat()
+                try:
+                    price = await _polygon_close_for_day(client, poly_symbol, day_iso, key)
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code if e.response else "?"
+                    if status == 429:
+                        logger.warning("Polygon rate limited fetching close for %s %s", poly_symbol, day_iso)
+                        break
+                    logger.warning("Polygon HTTP error %s for %s %s: %s", status, poly_symbol, day_iso, e)
+                    continue
+                except Exception as exc:
+                    logger.warning("Realized price lookup failed for %s %s: %s", poly_symbol, day_iso, exc)
+                    continue
+                if price is not None:
+                    return float(price)
+    except Exception as exc:
+        logger.warning("Realized price fetch failed for %s: %s", symbol, exc)
+    return None
+
+def _labeler_pass(limit: int) -> dict[str, int]:
+    if label_mature_predictions is None:
+        return {"processed": 0, "labeled": 0}
+    rows = matured_predictions_now(limit=limit)
+    processed = len(rows)
+    if processed == 0:
+        return {"processed": 0, "labeled": 0}
+
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+
+        def _fetch(symbol: str, target: datetime) -> float | None:
+            try:
+                return loop.run_until_complete(_fetch_realized_price(symbol, target))
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("labeler fetch failed for %s: %s", symbol, exc)
+                return None
+
+        labeled = label_mature_predictions(_fetch, limit=limit, rows=rows)
+        return {"processed": processed, "labeled": int(labeled)}
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        asyncio.set_event_loop(None)
+        loop.close()
 
 def _dynamic_window_days(horizon_days: int, timespan: str) -> int:
     try:
@@ -2723,39 +2606,257 @@ async def _ensure_run_owned(run_id: str, request: Request) -> "RunState":
         raise HTTPException(status_code=403, detail="Forbidden for this run")
     return rs
 
+async def _run_labeling_pass(limit: int) -> dict[str, int]:
+    return await asyncio.to_thread(_labeler_pass, limit)
+
+
 async def _labeling_daemon():
+    if label_mature_predictions is None:
+        logger.info("Labeler module unavailable; background labeling disabled.")
+        return
+
+    interval = max(60, int(settings.labeling_interval_seconds))
+    limit = max(100, int(settings.labeling_batch_limit))
+    backoff = interval
+
+    # tiny jitter so parallel replicas don't hammer providers simultaneously
+    await asyncio.sleep(random.uniform(5.0, 15.0))
+
     while True:
         try:
-            # TODO: hook your labeler here (e.g., await label_recent_runs(...))
-            pass
+            stats = await _run_labeling_pass(limit)
+            processed = int(stats.get("processed", 0))
+            labeled = int(stats.get("labeled", 0))
+            log_json(
+                "info",
+                msg="labeling_pass",
+                processed=processed,
+                labeled=labeled,
+                limit=limit,
+            )
+            job_ok("labeling_pass", processed=processed, labeled=labeled)
+            if labeled > 0:
+                day = datetime.now(timezone.utc).date()
+                artifacts = await asyncio.to_thread(_export_daily_snapshots, day)
+                if artifacts:
+                    log_json(
+                        "info",
+                        msg="labeling_exports",
+                        day=day.isoformat(),
+                        artifacts=artifacts,
+                    )
+            # If nothing to do, stretch the next run slightly (up to 2x interval)
+            if processed == 0 or labeled == 0:
+                backoff = min(interval * 2, interval + 600)
+            else:
+                backoff = interval
         except asyncio.CancelledError:
             break
         except Exception as e:
+            job_fail("labeling_pass", err=str(e))
             logger.warning(f"Labeling pass failed: {e}")
-        await asyncio.sleep(900)
+            backoff = min(interval * 2, interval + 900)
+        await asyncio.sleep(backoff)
+
+
+async def _metrics_rollup_loop():
+    if fs_connect is None or _rollup is None:
+        logger.info("Feature store unavailable; metrics rollup disabled.")
+        return
+
+    interval = max(300, int(settings.metrics_rollup_interval_seconds))
+    await asyncio.sleep(random.uniform(30.0, 90.0))
+
+    while True:
+        day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+        try:
+            con = fs_connect()
+            rows = _rollup(con, day=day)
+            artifacts = await asyncio.to_thread(_export_daily_snapshots, day)
+            log_json("info", msg="metrics_rollup_pass", day=day.isoformat(), rows=rows, artifacts=artifacts)
+            job_ok("metrics_rollup", day=day.isoformat(), rows=rows, artifacts=artifacts)
+        except Exception as e:
+            job_fail("metrics_rollup", err=str(e), day=day.isoformat())
+            logger.warning(f"Metrics rollup failed for {day}: {e}")
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+        await asyncio.sleep(interval)
+
+
+async def _maybe_retrain_symbol(sym: str, *, max_age: timedelta, lookback_days: int, tier: str) -> None:
+    try:
+        meta = await _get_model_meta(sym)
+    except Exception:
+        meta = None
+
+    should_retrain = False
+    if not meta:
+        should_retrain = True
+    else:
+        trained_at = _parse_trained_at(meta.get("trained_at"))
+        if trained_at is None:
+            should_retrain = True
+        else:
+            age = datetime.now(timezone.utc) - trained_at
+            if age >= max_age:
+                should_retrain = True
+
+    if not should_retrain:
+        return
+
+    try:
+        await _train_models(sym, lookback_days=lookback_days)
+        log_json("info", msg="model_retrain_ok", symbol=sym, tier=tier, lookback_days=lookback_days)
+    except HTTPException as exc:
+        log_json("warning", msg="model_retrain_http_fail", symbol=sym, tier=tier, error=exc.detail)
+    except Exception as exc:
+        log_json("error", msg="model_retrain_fail", symbol=sym, tier=tier, error=str(exc))
+
+
+async def _model_retrain_loop():
+    if not REDIS:
+        logger.info("Redis unavailable; model retraining disabled.")
+        return
+
+    poll = max(300, int(settings.model_retrain_poll_seconds))
+    daily_age = timedelta(hours=int(settings.model_retrain_daily_hours))
+    weekly_age = timedelta(hours=int(settings.model_retrain_weekly_hours))
+    daily_lookback = min(settings.lookback_days_max, 540)
+    weekly_lookback = min(settings.lookback_days_max, 720)
+
+    await asyncio.sleep(random.uniform(60.0, 180.0))
+
+    while True:
+        try:
+            for sym in RETRAIN_DAILY:
+                await _maybe_retrain_symbol(sym, max_age=daily_age, lookback_days=daily_lookback, tier="daily")
+                await asyncio.sleep(0.1)
+            for sym in RETRAIN_WEEKLY:
+                await _maybe_retrain_symbol(sym, max_age=weekly_age, lookback_days=weekly_lookback, tier="weekly")
+                await asyncio.sleep(0.1)
+        except Exception as exc:
+            logger.warning(f"Model retrain loop error: {exc}")
+        await asyncio.sleep(poll)
+
+
+async def _data_retention_loop():
+    if fs_connect is None:
+        logger.info("Feature store unavailable; data retention disabled.")
+        return
+    days = int(getattr(settings, "data_retention_days", 0))
+    if days <= 0:
+        logger.info("Data retention disabled (data_retention_days <= 0).")
+        return
+    interval = max(3600, int(settings.data_retention_poll_seconds))
+    retention_delta = timedelta(days=days)
+
+    await asyncio.sleep(random.uniform(600.0, 1800.0))
+
+    while True:
+        cutoff_ts = datetime.now(timezone.utc) - retention_delta
+        cutoff_iso = cutoff_ts.isoformat()
+        cutoff_date = cutoff_ts.date()
+        try:
+            con = fs_connect()
+            con.execute("DELETE FROM predictions WHERE issued_at < ?", [cutoff_iso])
+            con.execute("DELETE FROM outcomes WHERE realized_at < ?", [cutoff_iso])
+            con.execute("DELETE FROM metrics_daily WHERE date < ?", [cutoff_date.isoformat()])
+            con.close()
+            _prune_arrow_partitions(ARROW_PREDICTIONS_DIR, cutoff_date)
+            _prune_arrow_partitions(ARROW_OUTCOMES_DIR, cutoff_date)
+            log_json("info", msg="data_retention_ok", cutoff=cutoff_iso, days=days)
+        except Exception as exc:
+            logger.warning(f"Data retention pass failed: {exc}")
+        await asyncio.sleep(interval)
 
 # --------- Optional model loaders (only if missing up top) ----------
 if "load_lstm_model" not in globals():
     def load_lstm_model(symbol: str):
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            raise HTTPException(status_code=400, detail="symbol_required")
+        cached = _LSTM_MODEL_CACHE.get(sym)
+        if cached is not None:
+            return cached
         require_tf()
-        for path in (f"models/{symbol}_lstm.keras", f"models/{symbol}_lstm.h5"):
+        candidates: list[Path] = []
+        try:
+            entry = get_active_model_version("lstm", sym)
+        except Exception as exc:
+            logger.debug("Model registry lookup failed for lstm %s: %s", sym, exc)
+            entry = None
+        if entry and entry.get("artifact_path"):
             try:
-                # use the alias if available
+                candidates.append(_resolve_artifact_path(entry["artifact_path"]))
+            except Exception as exc:
+                logger.debug("Unable to resolve LSTM registry artifact for %s: %s", sym, exc)
+        candidates.extend(
+            [
+                _lstm_saved_model_dir(sym),
+                Path("models") / f"{sym}_lstm.keras",
+                Path("models") / f"{sym}_lstm.h5",
+            ]
+        )
+        for path in candidates:
+            try:
+                if not path.exists():
+                    continue
                 if "_tf_load_model" in globals() and _tf_load_model:
-                    return _tf_load_model(path)
-                from tensorflow.keras.models import load_model as _lm  # late import fallback
-                return _lm(path)
+                    model = _tf_load_model(path.as_posix())
+                else:
+                    from tensorflow.keras.models import load_model as _lm  # late import fallback
+                    model = _lm(path.as_posix())
+                _LSTM_MODEL_CACHE[sym] = model
+                return model
             except Exception:
                 continue
         raise HTTPException(status_code=404, detail="LSTM model not found; train first")
 
 if "load_arima_model" not in globals():
     def load_arima_model(symbol: str):
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            raise HTTPException(status_code=400, detail="symbol_required")
+        cached = _ARIMA_MODEL_CACHE.get(sym)
+        if cached is not None:
+            return cached
         try:
-            with open(f"models/{symbol}_arima.pkl", "rb") as file:
-                return pickle.load(file)
+            with open(f"models/{sym}_arima.pkl", "rb") as file:
+                model = pickle.load(file)
+                _ARIMA_MODEL_CACHE[sym] = model
+                return model
         except Exception:
             raise HTTPException(status_code=404, detail="ARIMA model not found; train first")
+
+
+def load_rl_model(symbol: str):
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise HTTPException(status_code=400, detail="symbol_required")
+    if gym is None:
+        raise HTTPException(status_code=503, detail="rl_unavailable")
+    if DQN is None:
+        try:
+            load_stable_baselines3()
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=f"rl_unavailable:{exc}") from exc
+    if DQN is None:
+        raise HTTPException(status_code=503, detail="rl_unavailable")
+    cached = _RL_MODEL_CACHE.get(sym)
+    if cached is not None:
+        return cached
+    path = Path("models") / f"{sym}_rl.zip"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="RL model not found; train first")
+    try:
+        model = DQN.load(path.as_posix(), print_system_info=False)
+        _RL_MODEL_CACHE[sym] = model
+        return model
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"failed to load rl model: {exc}") from exc
 
 # --------- Ensemble (linear + optional lstm/arima + optional RL) ----------
 if "get_ensemble_prob_light" not in globals():
@@ -2775,7 +2876,7 @@ if "get_ensemble_prob_light" not in globals():
             feats = list(model_linear.get("features", []))
             coef  = list(model_linear.get("coef", []))
 
-            px = await _fetch_hist_prices(symbol)
+            px = await ingestion_service.fetch_hist_prices(symbol)
             if not px or len(px) < 10:
                 return 0.5
             if not feats:
@@ -2830,20 +2931,19 @@ async def get_ensemble_prob(symbol: str, redis: 'Redis', horizon_days: int = 1) 
         feature_list = list(model_linear.get("features", ["mom_20", "rvol_20", "autocorr_5"]))
 
         # Build X from recent prices → features
-        px = await _fetch_hist_prices(symbol)
+        px = await ingestion_service.fetch_hist_prices(symbol)
         if not px or len(px) < 10:
             return 0.5
         f = await _feat_from_prices(symbol, px)
-        X = np.array([float(f.get(feat, 0.0)) for feat in feature_list], dtype=float)
+        feature_vector = [float(f.get(feat, 0.0)) for feat in feature_list]
+        X = np.array(feature_vector, dtype=float)
 
         preds: Dict[str, float] = {}
 
         # --- Linear head (supports ONNX or intercept if present)
-        onnx_prob = None
-        if model_linear.get("onnx_path"):
-            onnx_prob = _run_linear_onnx(symbol, X.tolist())
-            if onnx_prob is not None:
-                preds["linear"] = float(np.clip(onnx_prob, 0.0, 1.0))
+        onnx_prob = _run_linear_onnx(symbol, feature_vector)
+        if onnx_prob is not None:
+            preds["linear"] = float(np.clip(onnx_prob, 0.0, 1.0))
 
         if "linear" not in preds and "coef" in model_linear:
             w = np.array([float(c) for c in model_linear["coef"]], dtype=float)
@@ -2853,14 +2953,18 @@ async def get_ensemble_prob(symbol: str, redis: 'Redis', horizon_days: int = 1) 
             preds["linear"] = _sigmoid(float(np.clip(score, -60.0, 60.0)))
 
         # --- LSTM (optional)
-        try:
-            model_lstm = load_lstm_model(symbol)  # you already guard import elsewhere
-            X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)
-            lstm_p = float(model_lstm.predict(X_lstm, verbose=0)[0][0])
-            preds["lstm"] = float(np.clip(lstm_p, 0.0, 1.0))
-        except Exception:
-            # logger.debug("LSTM unavailable; skipping", exc_info=True)
-            pass
+        lstm_prob = _run_lstm_savedmodel(symbol, feature_vector)
+        if lstm_prob is not None:
+            preds["lstm"] = float(np.clip(lstm_prob, 0.0, 1.0))
+        else:
+            try:
+                model_lstm = load_lstm_model(symbol)  # you already guard import elsewhere
+                X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)
+                lstm_p = float(model_lstm.predict(X_lstm, verbose=0)[0][0])
+                preds["lstm"] = float(np.clip(lstm_p, 0.0, 1.0))
+            except Exception:
+                # logger.debug("LSTM unavailable; skipping", exc_info=True)
+                pass
 
         # --- ARIMA (optional)
         try:
@@ -3059,7 +3163,7 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             # ---------- Fetch prices ----------
             await _update_run_state(redis, run_id, rs, progress=10.0, detail="Fetching historical prices")
-            historical_prices = await _fetch_cached_hist_prices(req.symbol, window_days, redis)
+            historical_prices = await ingestion_service.fetch_cached_hist_prices(req.symbol, window_days, redis)
             if not historical_prices or len(historical_prices) < 2:
                 raise ValueError("Insufficient history")
 
@@ -3124,17 +3228,17 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     return {"rff": None, "cpi_yoy": None, "u_rate": None}
 
                 try:
-                    sent = await get_sentiment_features(req.symbol)
+                    sent = await context_service.get_sentiment_features(req.symbol)
                 except Exception as exc:
                     logger.debug("sim_bias: sentiment fetch failed for %s: %s", req.symbol, exc)
                     sent = _safe_sent_dict()
                 try:
-                    earn = await get_earnings_features(req.symbol)
+                    earn = await context_service.get_earnings_features(req.symbol)
                 except Exception as exc:
                     logger.debug("sim_bias: earnings fetch failed for %s: %s", req.symbol, exc)
                     earn = _safe_earn_dict()
                 try:
-                    macr = await get_macro_features()
+                    macr = await context_service.get_macro_features()
                 except Exception as exc:
                     logger.debug("sim_bias: macro fetch failed: %s", exc)
                     macr = _safe_macro_dict()
@@ -3300,13 +3404,16 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             horizon_days_ui = int(H) if bpd == 1 else int(math.ceil(H / float(bpd)))
 
+            calibration_hint = await _get_calibration_params(req.symbol, horizon_days_ui)
+
             targets_block = compute_targets_block(
                 paths=paths_mat,
                 S0=S0,
                 horizon_days=horizon_days_ui,
                 bars_per_day=bpd,
-                # Optional: customize rungs
-                rel_levels=(-0.30, -0.20, -0.10, 0.0, 0.10, 0.20, 0.30, 0.40),
+                symbol=req.symbol,
+                sigma_hint=sigma_adj,
+                calibration_hint=calibration_hint,
             )
 
             # ---------- Bands / summary from paths_mat ----------
@@ -3506,7 +3613,7 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     "q50":          float(term_q50),
                     "q95":          float(term_q95),
                     "uncertainty":  float(np.std(terminal)),
-                    "features_ref": {
+                    "features_ref": json.dumps({
                         "window_days":  int(window_days),
                         "paths":        int(req.paths),
                         "S0":           float(S0),
@@ -3515,7 +3622,7 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                         "timespan":     req.timespan,
                         "seed_hint":    int(seed),
                         "mode":         mode,
-                    },
+                    }),
                 })
                 con.close()
             except Exception as e:
@@ -4142,7 +4249,7 @@ async def _quick_score(symbol: str) -> dict:
     """Fast prescreen: small history fetch + simple features + light tilt."""
     try:
         sym_fetch = _to_polygon_ticker(symbol)
-        px = await _fetch_cached_hist_prices(sym_fetch, 180, REDIS)
+        px = await ingestion_service.fetch_cached_hist_prices(sym_fetch, 180, REDIS)
         if not px or len(px) < 30:
             return {"symbol": symbol, "ok": False}
         f = await _feat_from_prices(symbol, px)
@@ -4475,7 +4582,7 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
         logger.warning("Watchlists are empty or missing; equity=%d crypto=%d",
                        len(eq_watch or []), len(cr_watch or []))
 
-    macro_ctx = await get_macro_features()
+    macro_ctx = await context_service.get_macro_features()
     context_cache: dict[str, dict] = {}
 
     def _safe_sentiments() -> dict:
@@ -4491,12 +4598,12 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
         if key in context_cache:
             return context_cache[key]
         try:
-            sent = await get_sentiment_features(key)
+            sent = await context_service.get_sentiment_features(key)
         except Exception as exc:
             logger.debug("daily_quant_sentiment_fail %s: %s", key, exc)
             sent = _safe_sentiments()
         try:
-            earn = await get_earnings_features(key)
+            earn = await context_service.get_earnings_features(key)
         except Exception as exc:
             logger.debug("daily_quant_earnings_fail %s: %s", key, exc)
             earn = _safe_earnings()
@@ -4919,7 +5026,7 @@ async def _macro_scheduler_loop() -> None:
     interval = max(6 * 3600, int(os.getenv("PT_MACRO_SCHED_SECONDS", str(24 * 3600))))
     while True:
         try:
-            res = await _ingest_macro(log_tag="scheduler")
+            res = await ingestion_service.ingest_macro(log_tag="scheduler")
             rows = int(res.get("rows", 0))
             job_ok("macro_scheduler", rows=rows, source=res.get("source"))
             log_json("info", msg="macro_scheduler_ok", rows=rows, source=res.get("source"), interval_s=interval)
@@ -4946,7 +5053,13 @@ async def _earnings_scheduler_loop() -> None:
         else:
             for sym in default_symbols:
                 try:
-                    res = await _ingest_earnings(sym, lookback_days=370, limit=16, provider=None, log_tag="scheduler")
+                    res = await ingestion_service.ingest_earnings(
+                        sym,
+                        lookback_days=370,
+                        limit=16,
+                        provider=None,
+                        log_tag="scheduler",
+                    )
                     rows_total += int(res.get("rows", 0))
                 except HTTPException as exc:
                     errors.append(f"{sym}:{exc.detail}")
@@ -4972,14 +5085,14 @@ async def _news_scheduler_loop() -> None:
         if syms:
             for sym in syms:
                 try:
-                    res_ing = await _ingest_news(sym, days=2, limit=40, provider=None, log_tag="scheduler")
+                    res_ing = await ingestion_service.ingest_news(sym, days=2, limit=40, provider=None, log_tag="scheduler")
                     ingested_total += int(res_ing.get("rows", 0))
                 except HTTPException as exc:
                     errors.append(f"ingest:{sym}:{exc.detail}")
                 except Exception as exc:
                     errors.append(f"ingest:{sym}:{exc}")
                 try:
-                    res_score = await _score_news(sym, days=7, batch=24, log_tag="scheduler")
+                    res_score = await ingestion_service.score_news(sym, days=7, batch=24, log_tag="scheduler")
                     scored_total += int(res_score.get("rows", 0))
                 except HTTPException as exc:
                     errors.append(f"score:{sym}:{exc.detail}")
@@ -5017,87 +5130,7 @@ async def admin_cron_daily(
     batch: int = 32,          # minibatch size
     _ok: bool = Depends(require_key),
 ):
-    job = "cron_daily"
-    t0 = time.perf_counter()
-    started_at = datetime.now(timezone.utc).isoformat()
-    await enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
-
-    try:
-        # -------- Start --------
-        log_json("info", msg="cron_start", job=job, n=n, steps=steps, batch=batch)
-
-        # 1) Label anything matured
-        label_t0 = time.perf_counter()
-        lab = await outcomes_label(limit=20000, _api_key=True)  # reuse route logic
-        label_sec = round(time.perf_counter() - label_t0, 3)
-        log_json("info", msg="cron_labeled", job=job, labeled=lab, duration_s=label_sec)
-
-        # 2) Build symbol set (equity + crypto)
-        syms = list(dict.fromkeys(list(WL_EQ)[:n] + list(WL_CR)[:n]))
-        log_json("info", msg="cron_symbols_prepared", job=job, n_symbols=len(syms))
-
-        # 3) Online learn with small retry loop per symbol
-        learned: list[dict] = []
-        ok_count = 0
-        err_count = 0
-
-        async def learn_one(sym: str) -> dict:
-            sym_t0 = time.perf_counter()
-            last_err = None
-            for attempt in (1, 2):  # 2 attempts
-                try:
-                    res = await learn_online(
-                        OnlineLearnRequest(symbol=sym, steps=steps, batch=batch),
-                        _api_key=True,
-                    )
-                    dur = round(time.perf_counter() - sym_t0, 3)
-                    log_json("info", msg="learn_ok", job=job, symbol=sym, attempt=attempt, duration_s=dur)
-                    return {"symbol": sym, "status": res.get("status", "ok"), "attempt": attempt, "duration_s": dur}
-                except Exception as e:
-                    last_err = str(e)
-                    log_json("error", msg="learn_err", job=job, symbol=sym, attempt=attempt, error=last_err)
-                    # brief backoff on first failure
-                    if attempt == 1:
-                        await asyncio.sleep(0.5)
-            dur = round(time.perf_counter() - sym_t0, 3)
-            return {"symbol": sym, "status": "error", "error": last_err or "unknown", "attempt": 2, "duration_s": dur}
-
-        # sequential to avoid hammering providers; flip to gather() if desired
-        for s in syms:
-            item = await learn_one(s)
-            learned.append(item)
-            if item.get("status") == "ok":
-                ok_count += 1
-            else:
-                err_count += 1
-
-        # -------- Finish --------
-        total_sec = round(time.perf_counter() - t0, 3)
-        summary = {
-            "ok": True,
-            "job": job,
-            "started_at": started_at,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "duration_s": total_sec,
-            "labeled": lab,
-            "n_symbols": len(syms),
-            "learn_ok": ok_count,
-            "learn_err": err_count,
-            "learned": learned,
-            "params": {"n": n, "steps": steps, "batch": batch},
-        }
-
-        # increment success counter + structured log
-        job_ok(job, n=n, steps=steps, batch=batch, duration_s=total_sec, learn_ok=ok_count, learn_err=err_count)
-        log_json("info", msg="cron_done", **summary)
-        return summary
-
-    except Exception as e:
-        # increment fail counter + structured log + HTTP 500
-        err_msg = str(e)
-        job_fail(job, err=err_msg, n=n, steps=steps, batch=batch)
-        log_json("error", msg="cron_failed", job=job, error=err_msg)
-        raise HTTPException(status_code=500, detail=f"{job} failed: {err_msg}")
+    return await admin_service.cron_daily(request, n=n, steps=steps, batch=batch)
 
 # --- IBM Quantum / Qiskit diagnostics ---
 @app.get("/quant/aer/diag")
@@ -5212,416 +5245,6 @@ async def _quant_consume(redis: Redis) -> None:
         pass
 # --- Backfill with politeness pause between days ---
 #------------ADMIN -----------------------
-async def _ingest_news(
-    symbol: str,
-    *,
-    days: int,
-    limit: int,
-    provider: str | None = None,
-    log_tag: str = "manual",
-) -> dict:
-    if not fs_connect or insert_news is None:
-        raise HTTPException(status_code=503, detail="Feature store unavailable for news ingest.")
-
-    symbol_norm = symbol.strip().upper()
-    provider_eff = provider or _determine_news_provider()
-    since = datetime.now(timezone.utc) - timedelta(days=int(days))
-    try:
-        rows = await _fetch_news_articles(symbol_norm, since, provider_eff, limit=limit)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("admin_fetch_news_failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"news fetch failed: {exc}") from exc
-
-    if not rows:
-        log_json("info", msg="news_ingest_empty", symbol=symbol_norm, source=provider_eff, tag=log_tag)
-        return {"rows": 0, "source": provider_eff, "symbol": symbol_norm}
-
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Feature store connect failed: {exc}") from exc
-
-    t0 = time.perf_counter()
-    hash_lines: list[str] = []
-    for r in rows:
-        ts_norm = _as_utc_datetime(r[1]) or datetime.now(timezone.utc)
-        hash_lines.append(f"{r[0]}|{ts_norm.isoformat()}|{r[2]}|{r[3]}|{r[4]}")
-    payload_hash = hashlib.sha256("\n".join(hash_lines).encode("utf-8", errors="ignore")).hexdigest()
-
-    inserted = 0
-    duration_ms = 0
-    try:
-        inserted = insert_news(con, rows)
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=datetime.now(timezone.utc).date(),
-                    source=f"news:{provider_eff}:{log_tag}",
-                    row_count=int(inserted),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=True,
-                )
-            except Exception as exc:
-                logger.debug("log_ingest_event news ok failed: %s", exc)
-        if NEWS_INGESTED_COUNTER is not None:
-            NEWS_INGESTED_COUNTER.inc(max(0, int(inserted)))
-        log_json(
-            "info",
-            msg="news_ingest_ok",
-            symbol=symbol_norm,
-            source=provider_eff,
-            rows=int(inserted),
-            duration_ms=duration_ms,
-            tag=log_tag,
-        )
-        return {"rows": int(inserted), "source": provider_eff, "symbol": symbol_norm}
-    except Exception as exc:
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=datetime.now(timezone.utc).date(),
-                    source=f"news:{provider_eff}:{log_tag}",
-                    row_count=len(rows),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=False,
-                    error=str(exc),
-                )
-            except Exception:
-                pass
-        log_json(
-            "error",
-            msg="news_ingest_fail",
-            symbol=symbol_norm,
-            source=provider_eff,
-            error=str(exc),
-            tag=log_tag,
-        )
-        raise HTTPException(status_code=500, detail=f"failed to insert news: {exc}") from exc
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-async def _score_news(
-    symbol: str,
-    *,
-    days: int,
-    batch: int,
-    log_tag: str = "manual",
-) -> dict:
-    if not fs_connect:
-        raise HTTPException(status_code=503, detail="Feature store unavailable for scoring.")
-
-    symbol_norm = symbol.strip().upper()
-    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days))
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Feature store connect failed: {exc}") from exc
-
-    try:
-        rows = con.execute(
-            """
-            SELECT ts, source, title, url, summary
-            FROM news_articles
-            WHERE symbol = ? AND ts >= ? AND (sentiment IS NULL OR sentiment = 0)
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            [symbol_norm, cutoff, int(batch)],
-        ).fetchall()
-    except Exception as exc:
-        try:
-            con.close()
-        except Exception:
-            pass
-        raise HTTPException(status_code=500, detail=f"failed to load news: {exc}") from exc
-
-    if not rows:
-        try:
-            con.close()
-        except Exception:
-            pass
-        log_json("info", msg="news_score_empty", symbol=symbol_norm, tag=log_tag)
-        return {"rows": 0, "symbol": symbol_norm}
-
-    oai_key = os.getenv("OPENAI_API_KEY", "").strip()
-    xai_key = os.getenv("XAI_API_KEY", "").strip()
-    provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
-    prefer_xai = (provider == "xai") or (not oai_key and bool(xai_key))
-
-    json_schema = {
-        "name": "NewsSentimentScore",
-        "schema": {
-            "type": "object",
-            "properties": {
-                "summary": {"type": "string", "minLength": 20, "maxLength": 240},
-                "sentiment": {"type": "number", "minimum": -1.0, "maximum": 1.0},
-            },
-            "required": ["summary", "sentiment"],
-            "additionalProperties": False,
-        },
-    }
-
-    updates: list[tuple] = []
-    for ts, source, title, url_item, summary in rows:
-        prompt_user = {
-            "role": "user",
-            "content": (
-                "You are a financial analyst assistant. Analyze the following news headline for symbol "
-                f"{symbol_norm} and respond with JSON containing 'summary' (one sentence, <=200 chars) and "
-                "'sentiment' (float in [-1,1], where -1 is very negative for the symbol and 1 is very positive).\n\n"
-                f"Source: {source}\n"
-                f"Title: {title}\n"
-                f"URL: {url_item}\n"
-                f"Existing summary: {summary or ''}\n"
-            ),
-        }
-        try:
-            out = await llm_summarize_async(
-                prompt_user,
-                prefer_xai=prefer_xai,
-                xai_key=xai_key or None,
-                oai_key=oai_key or None,
-                json_schema=json_schema,
-            )
-        except Exception as exc:
-            logger.debug("admin_score_news llm failed for %s: %s", symbol_norm, exc)
-            out = {}
-        cleaned_summary = (out.get("summary") if isinstance(out, dict) else "") if out else ""
-        if not cleaned_summary:
-            cleaned_summary = summary or title or ""
-        cleaned_summary = cleaned_summary.strip()
-        if len(cleaned_summary) > 240:
-            cleaned_summary = cleaned_summary[:237].rstrip() + "..."
-        sentiment_val = _first_number([out.get("sentiment")]) if isinstance(out, dict) else None
-        if sentiment_val is None:
-            sentiment_val = 0.0
-        sentiment_val = float(np.clip(float(sentiment_val), -1.0, 1.0))
-        ts_norm = _as_utc_datetime(ts) or datetime.now(timezone.utc)
-        updates.append((
-            cleaned_summary.strip(),
-            sentiment_val,
-            symbol_norm,
-            ts_norm,
-            (source or "").strip(),
-            (url_item or "").strip(),
-        ))
-
-    try:
-        con.executemany(
-            """
-            UPDATE news_articles
-            SET summary = ?, sentiment = ?
-            WHERE symbol = ? AND ts = ? AND source = ? AND url = ?
-            """,
-            updates,
-        )
-        updated = len(updates)
-        con.close()
-        if NEWS_SCORED_COUNTER is not None:
-            NEWS_SCORED_COUNTER.inc(max(0, updated))
-        log_json("info", msg="news_score_ok", symbol=symbol_norm, rows=updated, tag=log_tag)
-        return {"rows": updated, "symbol": symbol_norm}
-    except Exception as exc:
-        try:
-            con.close()
-        except Exception:
-            pass
-        log_json("error", msg="news_score_fail", symbol=symbol_norm, error=str(exc), tag=log_tag)
-        raise HTTPException(status_code=500, detail=f"failed to update news sentiment: {exc}") from exc
-
-
-async def _ingest_earnings(
-    symbol: str,
-    *,
-    lookback_days: int,
-    limit: int,
-    provider: str | None = None,
-    log_tag: str = "manual",
-) -> dict:
-    if not fs_connect or insert_earnings is None:
-        raise HTTPException(status_code=503, detail="Feature store unavailable for earnings ingest.")
-
-    symbol_norm = symbol.strip().upper()
-    provider_eff = provider or _determine_earnings_provider()
-    try:
-        rows = await _fetch_earnings_rows(symbol_norm, int(lookback_days), provider_eff, limit=limit)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("admin_fetch_earnings_failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"earnings fetch failed: {exc}") from exc
-
-    if not rows:
-        log_json("info", msg="earnings_ingest_empty", symbol=symbol_norm, source=provider_eff, tag=log_tag)
-        return {"rows": 0, "source": provider_eff, "symbol": symbol_norm}
-
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Feature store connect failed: {exc}") from exc
-
-    t0 = time.perf_counter()
-    payload_hash = hashlib.sha256(
-        "\n".join(f"{r[0]}|{r[1]}|{r[2]}|{r[3]}|{r[4]}|{r[5]}" for r in rows).encode("utf-8", errors="ignore")
-    ).hexdigest()
-
-    duration_ms = 0
-    try:
-        inserted = insert_earnings(con, rows)
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=datetime.now(timezone.utc).date(),
-                    source=f"earnings:{provider_eff}:{log_tag}",
-                    row_count=int(inserted),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=True,
-                )
-            except Exception as exc:
-                logger.debug("log_ingest_event earnings ok failed: %s", exc)
-        if EARNINGS_INGESTED_COUNTER is not None:
-            EARNINGS_INGESTED_COUNTER.inc(max(0, int(inserted)))
-        log_json(
-            "info",
-            msg="earnings_ingest_ok",
-            symbol=symbol_norm,
-            source=provider_eff,
-            rows=int(inserted),
-            duration_ms=duration_ms,
-            tag=log_tag,
-        )
-        return {"rows": int(inserted), "source": provider_eff, "symbol": symbol_norm}
-    except Exception as exc:
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=datetime.now(timezone.utc).date(),
-                    source=f"earnings:{provider_eff}:{log_tag}",
-                    row_count=len(rows),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=False,
-                    error=str(exc),
-                )
-            except Exception:
-                pass
-        log_json(
-            "error",
-            msg="earnings_ingest_fail",
-            symbol=symbol_norm,
-            source=provider_eff,
-            error=str(exc),
-            tag=log_tag,
-        )
-        raise HTTPException(status_code=500, detail=f"failed to insert earnings: {exc}") from exc
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
-async def _ingest_macro(
-    provider: Optional[str] = None,
-    *,
-    log_tag: str = "manual",
-) -> dict:
-    if not fs_connect or upsert_macro is None:
-        raise HTTPException(status_code=503, detail="Feature store unavailable for macro ingest.")
-
-    provider_eff = (provider or settings.macro_source or "fred").strip().lower()
-    try:
-        rows = await _fetch_macro_rows(provider_eff)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        logger.exception("admin_fetch_macro_failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"macro fetch failed: {exc}") from exc
-
-    if not rows:
-        log_json("info", msg="macro_ingest_empty", source=provider_eff, tag=log_tag)
-        return {"rows": 0, "source": provider_eff}
-
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Feature store connect failed: {exc}") from exc
-
-    t0 = time.perf_counter()
-    payload_hash = hashlib.sha256(
-        "\n".join(f"{r[0]}|{r[1]}|{r[2]}|{r[3]}" for r in rows).encode("utf-8", errors="ignore")
-    ).hexdigest()
-
-    duration_ms = 0
-    try:
-        inserted = upsert_macro(con, rows)
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=rows[0][0],
-                    source=f"macro:{provider_eff}:{log_tag}",
-                    row_count=int(inserted),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=True,
-                )
-            except Exception as exc:
-                logger.debug("log_ingest_event macro ok failed: %s", exc)
-        if MACRO_UPSERTS_COUNTER is not None:
-            MACRO_UPSERTS_COUNTER.inc(max(0, int(inserted)))
-        log_json(
-            "info",
-            msg="macro_ingest_ok",
-            source=provider_eff,
-            rows=int(inserted),
-            duration_ms=duration_ms,
-            tag=log_tag,
-        )
-        return {"rows": int(inserted), "source": provider_eff}
-    except Exception as exc:
-        duration_ms = int((time.perf_counter() - t0) * 1000)
-        if log_ingest_event:
-            try:
-                log_ingest_event(
-                    con,
-                    as_of=rows[0][0],
-                    source=f"macro:{provider_eff}:{log_tag}",
-                    row_count=len(rows),
-                    sha256=payload_hash,
-                    duration_ms=duration_ms,
-                    ok=False,
-                    error=str(exc),
-                )
-            except Exception:
-                pass
-        log_json("error", msg="macro_ingest_fail", source=provider_eff, error=str(exc), tag=log_tag)
-        raise HTTPException(status_code=500, detail=f"failed to upsert macro snapshot: {exc}") from exc
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-
 @app.post("/admin/fetch/news", summary="Fetch recent news and upsert into feature store")
 async def admin_fetch_news(
     request: Request,
@@ -5630,9 +5253,7 @@ async def admin_fetch_news(
     limit: int = Query(60, ge=1, le=200),
     _ok: bool = Security(require_key, scopes=["admin"]),
 ):
-    await enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
-    result = await _ingest_news(symbol, days=int(days), limit=int(limit), provider=None, log_tag="admin")
-    return {"ok": True, **result}
+    return await admin_service.fetch_news(request, symbol=symbol, days=days, limit=limit)
 
 
 @app.post("/admin/score/news", summary="LLM-score recent news sentiment")
@@ -5643,9 +5264,7 @@ async def admin_score_news(
     batch: int = Query(16, ge=1, le=64),
     _ok: bool = Security(require_key, scopes=["admin"]),
 ):
-    await enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
-    result = await _score_news(symbol, days=int(days), batch=int(batch), log_tag="admin")
-    return {"ok": True, **result}
+    return await admin_service.score_news(request, symbol=symbol, days=days, batch=batch)
 
 
 @app.post("/admin/fetch/earnings", summary="Fetch earnings data and upsert into feature store")
@@ -5656,15 +5275,12 @@ async def admin_fetch_earnings(
     limit: int = Query(12, ge=1, le=40),
     _ok: bool = Security(require_key, scopes=["admin"]),
 ):
-    await enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
-    result = await _ingest_earnings(
-        symbol,
-        lookback_days=int(lookback_days),
-        limit=int(limit),
-        provider=None,
-        log_tag="admin",
+    return await admin_service.fetch_earnings(
+        request,
+        symbol=symbol,
+        lookback_days=lookback_days,
+        limit=limit,
     )
-    return {"ok": True, **result}
 
 
 @app.post("/admin/fetch/macro", summary="Fetch macro snapshot and upsert into feature store")
@@ -5673,29 +5289,15 @@ async def admin_fetch_macro(
     provider: Optional[str] = Query(None, description="Override macro provider (default from settings)"),
     _ok: bool = Security(require_key, scopes=["admin"]),
 ):
-    await enforce_limits(REDIS, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
-    result = await _ingest_macro(provider, log_tag="admin")
-    return {"ok": True, **result}
+    return await admin_service.fetch_macro(request, provider=provider)
 
 @app.post("/admin/ingest/backfill")
 async def admin_ingest_backfill(days: int = 7, _ok: bool = Security(require_key, scopes=["admin"])):
-    base = datetime.now(timezone.utc).date()
-    total = 0
-    pause_s = float(os.getenv("PT_BACKFILL_PAUSE_S", "2.5"))  # <— NEW
-    for i in range(int(max(1, days))):
-        out = await ingest_grouped_daily(base - timedelta(days=i))
-        total += int(out.get("upserted", 0))
-        await asyncio.sleep(pause_s)  # <— NEW
-    return {"ok": True, "days": int(days), "rows": total}
+    return await admin_service.ingest_backfill(days=days)
 
 @app.get("/admin/logs/latest", summary="Fetch recent service logs (in-memory buffer)")
 async def admin_logs_latest(n: int = 200, _ok: bool = Security(require_key, scopes=["admin"])):
-    try:
-        items = get_recent_logs(n=n)
-        return {"ok": True, "count": len(items), "logs": items}
-    except Exception as e:
-        log_json("error", msg="admin_logs_latest_fail", error=str(e))
-        raise HTTPException(status_code=500, detail="failed to fetch logs")
+    return await admin_service.logs_latest(n=n)
 
 @app.post("/admin/plan/set", summary="Set subscription plan for an API key (free|pro|inst)")
 async def admin_plan_set(
@@ -5703,59 +5305,15 @@ async def admin_plan_set(
     plan: str = Body(..., embed=True),
     _ok: bool = Security(require_key, scopes=["admin"]),
 ):
-    try:
-        new_plan = await set_plan_for_key(REDIS, api_key, plan)
-        log_json("info", msg="admin_plan_set", target_key=f"...{api_key[-6:]}", plan=new_plan)
-        return {"ok": True, "api_key_tail": api_key[-6:], "plan": new_plan}
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-    except Exception as e:
-        log_json("error", msg="admin_plan_set_fail", error=str(e))
-        raise HTTPException(status_code=500, detail="failed_to_set_plan")
+    return await admin_service.plan_set(api_key, plan)
 
 @app.get("/admin/plan/get", summary="Get subscription plan for an API key")
 async def admin_plan_get(api_key: str = Query(...), _ok: bool = Security(require_key, scopes=["admin"])):
-    try:
-        plan = await get_plan_for_key(REDIS, api_key)
-        return {"ok": True, "api_key_tail": api_key[-6:], "plan": plan}
-    except Exception as e:
-        log_json("error", msg="admin_plan_get_fail", error=str(e))
-        raise HTTPException(status_code=500, detail="failed_to_get_plan")
+    return await admin_service.plan_get(api_key)
 
 @app.get("/me/limits", summary="Return caller plan and usage/limits for key scopes")
 async def me_limits(request: Request, _ok: bool = Depends(require_key)):
-    try:
-        used_sim, limit_sim, plan_sim, caller = await usage_today(REDIS, request, scope="simulate")
-        used_cron, limit_cron, plan_cron = await usage_today_for_caller(REDIS, caller, scope="cron")
-        # Both scopes use the same plan; prefer simulate’s read
-        plan = plan_sim or plan_cron
-
-        # seconds until UTC midnight (quota reset hint)
-        now = datetime.now(timezone.utc)
-        tomorrow = (now + timedelta(days=1)).date()
-        reset_at = datetime.combine(tomorrow, datetime.min.time(), tzinfo=timezone.utc)
-        seconds_to_reset = int((reset_at - now).total_seconds())
-
-        payload = {
-            "ok": True,
-            "plan": plan,
-            "caller": caller,
-            "reset_secs": seconds_to_reset,
-            "per_min_caps": {
-                "base": BASE_LIMIT_PER_MIN,
-                "simulate": SIM_LIMIT_PER_MIN,
-                "cron": CRON_LIMIT_PER_MIN,
-            },
-            "daily": {
-                "simulate": {"used": used_sim, "limit": limit_sim, "remaining": max(0, limit_sim - used_sim)},
-                "cron": {"used": used_cron, "limit": limit_cron, "remaining": max(0, limit_cron - used_cron)},
-            },
-        }
-        log_json("info", msg="me_limits", plan=plan, caller_tail=caller[-8:])
-        return payload
-    except Exception as e:
-        log_json("error", msg="me_limits_fail", error=str(e))
-        raise HTTPException(status_code=500, detail="failed_to_get_limits")
+    return await usage_service.me_limits(request)
 
 @app.post("/admin/ingest/daily")
 async def admin_ingest_daily(
@@ -5771,36 +5329,14 @@ async def admin_ingest_daily(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid 'd' format; expected YYYY-MM-DD")
 
-    await ingest_grouped_daily(as_of)
-    return {"ok": True, "date": as_of.isoformat()}
+    return await admin_service.ingest_daily(as_of)
 
 # ===== DAILY QUANT routes =====================================================
 
 
 @app.get("/context/{symbol}", summary="Return fused context for symbol (regime, sentiment, earnings, macro)")
 async def context(symbol: str):
-    sym = (symbol or "").strip().upper()
-    if not sym:
-        raise HTTPException(status_code=400, detail="Symbol required")
-
-    try:
-        px = await _fetch_cached_hist_prices(sym, 220, REDIS)
-        reg = _detect_regime(np.asarray(px, dtype=float))
-    except Exception as exc:
-        logger.debug("context_regime_failed for %s: %s", sym, exc)
-        reg = {"name": "neutral", "score": 0.0}
-
-    sent = await get_sentiment_features(sym)
-    earn = await get_earnings_features(sym)
-    macr = await get_macro_features()
-
-    return {
-        "symbol": sym,
-        "regime": reg,
-        "sentiment": sent,
-        "earnings": earn,
-        "macro": macr,
-    }
+    return await context_service.build_context(symbol)
 
 
 @app.post("/compare/backtest", response_model=BacktestResp, summary="Compare baseline vs enriched simulations (admin)")
@@ -5870,12 +5406,12 @@ async def compare_backtest(
             continue
 
         try:
-            sent_ctx = await get_sentiment_features(sym)
+            sent_ctx = await context_service.get_sentiment_features(sym)
         except Exception as exc:
             logger.debug("backtest: sentiment fetch failed for %s: %s", sym, exc)
             sent_ctx = {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
         try:
-            earn_ctx = await get_earnings_features(sym)
+            earn_ctx = await context_service.get_earnings_features(sym)
         except Exception as exc:
             logger.debug("backtest: earnings fetch failed for %s: %s", sym, exc)
             earn_ctx = {"surprise_last": 0.0, "guidance_delta": 0.0, "days_since_earn": None, "days_to_next": None}
@@ -6172,86 +5708,19 @@ async def outcomes_label(limit: int = 5000, _ok: bool = Depends(require_key)):
     Writes to src.db.duck.outcomes and (optionally) mirrors each label into PathPanda FS
     so daily metrics rollups can see realized prices.
     """
-    # clamp the batch size
-    limit = max(100, min(int(limit), 20000))
+    if label_mature_predictions is None:
+        raise HTTPException(status_code=503, detail="Labeler not configured")
 
-    # 1) Load matured-but-unlabeled predictions from the Predictions/Outcomes store
-    try:
-        # [(pred_id, ts, symbol, horizon_d, spot0), ...]
-        matured = matured_predictions_now(limit=limit)
-    except Exception as e:
-        logger.exception(f"matured_predictions_now failed: {e}")
-        raise HTTPException(status_code=500, detail="Failed to query matured predictions")
+    # clamp the batch size within configured bounds
+    limit = max(100, min(int(limit), int(settings.labeling_batch_limit)))
 
-    processed = 0
-    labeled = 0
+    stats = await _run_labeling_pass(limit)
+    processed = int(stats.get("processed", 0))
+    labeled = int(stats.get("labeled", 0))
 
-    # Prepare optional Feature Store mirror (single connection reused)
-    fs_con = None
-    fs_insert_out = None
-    try:  # pragma: no cover - optional dependency
-        from .feature_store import connect as _pfs_connect, insert_outcome as _pfs_insert_out  # type: ignore
-        fs_con = _pfs_connect()
-        fs_insert_out = _pfs_insert_out
-    except Exception:
-        fs_con = None
-        fs_insert_out = None
+    log_json("info", msg="outcomes_label", processed=processed, labeled=labeled, limit=limit)
 
-    # 2) Label each matured row
-    for pred_id, ts, symbol, horizon_d, spot0 in matured:
-        processed += 1
-        try:
-            # compute target date/time for the realized close
-            when = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
-            if when.tzinfo is None:
-                when = when.replace(tzinfo=timezone.utc)
-            else:
-                when = when.astimezone(timezone.utc)
-            target_ts = when + timedelta(days=int(horizon_d))
-
-            # fetch realized close (handles weekends/holidays internally)
-            realized_price = await _fetch_realized_price(symbol, target_ts)
-            if realized_price is None or not np.isfinite(realized_price) or not spot0:
-                continue
-
-            ret = (float(realized_price) / float(spot0)) - 1.0
-            label_up = bool(ret > 0.0)
-
-            # 2a) Write to Outcomes table (DuckDB via src.db.duck)
-            try:
-                insert_outcome(pred_id, target_ts, float(realized_price), float(ret), label_up)
-            except Exception as e:
-                logger.warning(f"insert_outcome failed for {pred_id}: {e}")
-                continue
-
-            labeled += 1
-
-            # 2b) (Optional) Mirror into PathPanda Feature Store for metrics
-            #     If FS not available, skip quietly.
-            if fs_con and fs_insert_out:
-                try:
-                    fs_insert_out(
-                        fs_con,
-                        {
-                            "run_id": pred_id,
-                            "symbol": symbol,
-                            "realized_at": target_ts,
-                            "y": float(realized_price),
-                        },
-                    )
-                except Exception as e:
-                    logger.warning(f"feature_store outcome mirror failed for {pred_id}: {e}")
-
-        except Exception as e:
-            logger.warning(f"labeling failed for pred_id={pred_id}: {e}")
-
-    if fs_con:
-        try:
-            fs_con.close()
-        except Exception:
-            pass
-
-    return {"status": "ok", "processed": processed, "labeled": labeled}
+    return {"status": "ok", "processed": processed, "labeled": labeled, "limit": limit}
 
 # --- Metrics rollup (daily) ---
 @app.post("/metrics/rollup")
@@ -6277,17 +5746,99 @@ def get_accuracy_statements(
     limit: int = Query(50, ge=1, le=200),
     _ok: bool = Depends(require_key),
 ):
-    try:
-        from .feature_store import generate_accuracy_statements  # expects a connection + limit
-    except Exception:
-        raise HTTPException(status_code=500, detail="feature_store.generate_accuracy_statements missing")
+    return analytics_service.accuracy_statements(limit=limit)
 
-    con = fs_connect()
-    try:
-        statements = generate_accuracy_statements(con, limit=limit)
-    finally:
-        con.close()
-    return {"statements": statements}
+
+@app.post("/analytics/export/predictions")
+async def analytics_export_predictions(
+    day: Optional[str] = Query(None, description="Date YYYY-MM-DD; defaults to today"),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(50_000, ge=100, le=500_000),
+    push_to_s3: bool = Query(False),
+    _ok: bool = Depends(require_key),
+):
+    return analytics_service.export_predictions(
+        day=day,
+        symbol=symbol,
+        limit=limit,
+        push_to_s3=push_to_s3,
+    )
+
+
+@app.post("/analytics/export/outcomes")
+async def analytics_export_outcomes(
+    day: Optional[str] = Query(None, description="Date YYYY-MM-DD; defaults to today"),
+    symbol: Optional[str] = Query(None),
+    limit: int = Query(50_000, ge=100, le=500_000),
+    push_to_s3: bool = Query(False),
+    _ok: bool = Depends(require_key),
+):
+    return analytics_service.export_outcomes(
+        day=day,
+        symbol=symbol,
+        limit=limit,
+        push_to_s3=push_to_s3,
+    )
+
+
+@app.get("/analytics/metrics/summary")
+async def analytics_metrics_summary(
+    symbol: Optional[str] = Query(None),
+    horizon_days: Optional[int] = Query(None),
+    limit: int = Query(90, ge=1, le=365),
+    _ok: bool = Depends(require_key),
+):
+    return analytics_service.metrics_summary(
+        symbol=symbol,
+        horizon_days=horizon_days,
+        limit=limit,
+    )
+
+
+@app.get("/admin/reports/system-health")
+async def admin_report_system_health(
+    request: Request,
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.report_system_health(request)
+
+
+@app.get("/admin/reports/simulations")
+async def admin_report_simulations(
+    request: Request,
+    limit: int = Query(50, ge=1, le=500),
+    symbol: Optional[str] = Query(None),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.report_simulations(request, limit=limit, symbol=symbol)
+
+
+@app.get("/admin/reports/model-training")
+async def admin_report_model_training(
+    request: Request,
+    limit: int = Query(200, ge=10, le=1000),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.report_model_training(request, limit=limit)
+
+
+@app.get("/admin/reports/usage")
+async def admin_report_usage(
+    request: Request,
+    scope: str = Query("simulate"),
+    sample: int = Query(20, ge=1, le=200),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.report_usage(request, scope=scope, sample=sample)
+
+
+@app.get("/admin/reports/telemetry")
+async def admin_report_telemetry(
+    request: Request,
+    limit: int = Query(200, ge=10, le=1000),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    return await admin_service.report_telemetry(request, limit=limit)
 
 @app.get("/config")
 async def config():
@@ -6353,9 +5904,46 @@ def _load_labeled_samples(symbol: str, limit: int = 256):
             X.append([mom, rvol, ac5])
             y.append(label)
         except Exception:
-            continue
+                    continue
 
     return np.array(X, dtype=float), np.array(y, dtype=float)
+
+
+def _build_training_dataset(
+    prices: Sequence[float],
+    *,
+    horizon: int = 1,
+    min_history: int = 60,
+) -> tuple[list[str], np.ndarray, np.ndarray, str]:
+    arr = np.asarray(
+        [float(p) for p in prices if isinstance(p, (int, float)) and math.isfinite(p)],
+        dtype=float,
+    )
+    if arr.size <= max(min_history + horizon, 10):
+        raise ValueError("Not enough price history to build training dataset")
+
+    feature_list = ["mom_20", "rvol_20", "autocorr_5"]
+    rows: list[list[float]] = []
+    targets: list[float] = []
+
+    upper = arr.size - horizon
+    start_idx = max(min_history, 1)
+
+    for idx in range(start_idx, upper):
+        window = arr[: idx + 1]
+        feats = _basic_features_from_array(window)
+        rows.append([float(feats.get(f, 0.0)) for f in feature_list])
+        future_price = arr[idx + horizon]
+        current_price = arr[idx]
+        targets.append(1.0 if future_price > current_price else 0.0)
+
+    if not rows:
+        raise ValueError("No feature rows generated for training dataset")
+
+    X = np.asarray(rows, dtype=float)
+    y = np.asarray(targets, dtype=float)
+    dataset_hash = hashlib.sha1(arr.tobytes()).hexdigest()
+    return feature_list, X, y, dataset_hash
 
 def _safe_sent(text: str) -> float:
     base = _simple_sentiment(text)
@@ -6385,6 +5973,7 @@ async def get_news(
     limit: int = 10,
     days: int = 7,
     cursor: Optional[str] = None,
+    polygon_key: Optional[str] = Header(None, alias="X-Polygon-Key"),  
     _ok: bool = Depends(require_key),
 ):
     key = _poly_key()
@@ -6663,6 +6252,7 @@ def _export_linear_onnx(symbol: str, weights: Sequence[float], feature_list: Seq
         path = _onnx_model_path(sym_up)
         path.parent.mkdir(parents=True, exist_ok=True)
         onnx.save(model, path)
+        path = path.resolve()
         _ONNX_SESSION_CACHE.pop(sym_up, None)
         return path
     except Exception as exc:
@@ -6677,16 +6267,40 @@ def _load_linear_onnx(symbol: str):
     session = _ONNX_SESSION_CACHE.get(sym)
     if session is not None:
         return session
-    path = _onnx_model_path(sym)
-    if not path.exists():
-        return None
+    candidate_paths: list[Path] = []
     try:
-        session = ort.InferenceSession(path.as_posix(), providers=["CPUExecutionProvider"])
-        _ONNX_SESSION_CACHE[sym] = session
-        return session
+        entry = get_active_model_version("linear", sym)
     except Exception as exc:
-        logger.debug("Failed to load ONNX model for %s: %s", symbol, exc)
-        return None
+        logger.debug("Model registry lookup failed for linear %s: %s", sym, exc)
+        entry = None
+    if entry and entry.get("artifact_path"):
+        try:
+            candidate_paths.append(_resolve_artifact_path(entry["artifact_path"]))
+        except Exception as exc:
+            logger.debug("Unable to resolve registry artifact for %s: %s", sym, exc)
+    candidate_paths.append(_onnx_model_path(sym))
+    seen: set[Path] = set()
+    for path in candidate_paths:
+        try:
+            candidate = Path(path)
+        except TypeError:
+            continue
+        try:
+            candidate = _resolve_artifact_path(candidate)
+        except Exception:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not candidate.exists():
+            continue
+        try:
+            session = ort.InferenceSession(candidate.as_posix(), providers=["CPUExecutionProvider"])
+            _ONNX_SESSION_CACHE[sym] = session
+            return session
+        except Exception as exc:
+            logger.debug("Failed to load ONNX model for %s from %s: %s", sym, candidate, exc)
+    return None
 
 
 def _run_linear_onnx(symbol: str, feature_vector: Sequence[float]) -> float | None:
@@ -6703,6 +6317,217 @@ def _run_linear_onnx(symbol: str, feature_vector: Sequence[float]) -> float | No
         return None
 
 
+def _lstm_saved_model_dir(symbol: str) -> Path:
+    return Path("models") / f"{symbol.upper()}_lstm.savedmodel"
+
+
+def _export_lstm_savedmodel(symbol: str, model: Any) -> Path | None:
+    if not TF_AVAILABLE or model is None:
+        return None
+    sym = symbol.upper()
+    path = _lstm_saved_model_dir(sym)
+    try:
+        if path.exists():
+            shutil.rmtree(path)
+    except Exception as exc:
+        logger.debug("Unable to prune previous SavedModel for %s: %s", sym, exc)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        exporter = getattr(model, "export", None)
+        if callable(exporter):
+            exporter(path.as_posix())
+        else:
+            import tensorflow as tf  # type: ignore
+
+            tf.saved_model.save(model, path.as_posix())
+        _LSTM_INFER_CACHE.pop(sym, None)
+        return path.resolve()
+    except Exception as exc:
+        logger.debug("LSTM SavedModel export skipped for %s: %s", sym, exc)
+        return None
+
+
+def _load_lstm_predictor(symbol: str) -> Callable[[np.ndarray], float] | None:
+    sym = symbol.upper()
+    cached = _LSTM_INFER_CACHE.get(sym)
+    if cached is not None:
+        return cached
+    try:
+        model = load_lstm_model(sym)
+    except HTTPException:
+        return None
+    if model is None:
+        return None
+    try:
+        import tensorflow as tf  # type: ignore
+    except Exception as exc:
+        logger.debug("TensorFlow unavailable for LSTM inference: %s", exc)
+        return None
+
+    if hasattr(model, "signatures"):
+        signature = getattr(model, "signatures", {}).get("serving_default")
+        if signature is not None:
+
+            def infer_fn(inputs: np.ndarray) -> float:
+                tensor = tf.convert_to_tensor(inputs, dtype=tf.float32)
+                outputs = signature(tensor)
+                first = next(iter(outputs.values()))
+                return float(np.asarray(first)[0][0])
+
+            _LSTM_INFER_CACHE[sym] = infer_fn
+            return infer_fn
+
+    if hasattr(model, "predict"):
+
+        def infer_fn(inputs: np.ndarray) -> float:
+            preds = model.predict(inputs, verbose=0)
+            return float(np.asarray(preds)[0][0])
+
+        _LSTM_INFER_CACHE[sym] = infer_fn
+        return infer_fn
+
+    if callable(model):
+
+        def infer_fn(inputs: np.ndarray) -> float:
+            tensor = tf.convert_to_tensor(inputs, dtype=tf.float32)
+            preds = model(tensor, training=False)
+            return float(np.asarray(preds)[0][0])
+
+        _LSTM_INFER_CACHE[sym] = infer_fn
+        return infer_fn
+
+    return None
+
+
+def _run_lstm_savedmodel(symbol: str, feature_vector: Sequence[float]) -> float | None:
+    infer_fn = _load_lstm_predictor(symbol)
+    if infer_fn is None:
+        return None
+    arr = np.asarray(feature_vector, dtype=np.float32).reshape(-1)
+    if arr.size == 0:
+        return None
+    inputs = arr[np.newaxis, np.newaxis, :]
+    sym = symbol.upper()
+    try:
+        prob = float(infer_fn(inputs))
+        return float(np.clip(prob, 0.0, 1.0))
+    except Exception as exc:
+        logger.debug("LSTM inference failed for %s: %s", sym, exc)
+        _LSTM_INFER_CACHE.pop(sym, None)
+        return None
+
+
+def _train_lstm_blocking(
+    sym: str,
+    feature_list: Sequence[str],
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    model_lstm = Sequential(
+        [
+            LSTM(64, input_shape=(1, len(feature_list)), return_sequences=True),
+            GRU(32),
+            Dense(16, activation="relu"),
+            Dense(1, activation="sigmoid"),
+        ]
+    )
+    model_lstm.compile(optimizer="adam", loss="binary_crossentropy")
+    X_lstm_train = np.expand_dims(X_train.astype(np.float32), axis=1)
+    y_lstm_train = y_train.astype(np.float32)
+    X_lstm_val = np.expand_dims(X_val.astype(np.float32), axis=1)
+    y_lstm_val = y_val.astype(np.float32)
+    model_lstm.fit(X_lstm_train, y_lstm_train, epochs=5, batch_size=32, verbose=0)
+    val_probs_lstm = model_lstm.predict(X_lstm_val, verbose=0).ravel()
+    val_preds_lstm = (val_probs_lstm >= 0.5).astype(float)
+    lstm_acc = float(np.mean(val_preds_lstm == y_lstm_val))
+    lstm_brier = float(np.mean((val_probs_lstm - y_lstm_val) ** 2))
+    keras_path = Path("models") / f"{sym}_lstm.keras"
+    model_lstm.save(keras_path.as_posix())
+    savedmodel_dir = _export_lstm_savedmodel(sym, model_lstm)
+    lstm_meta = {
+        "val_accuracy": lstm_acc,
+        "val_brier": lstm_brier,
+        "epochs": 5,
+        "n_train": int(X_train.shape[0]),
+        "n_val": int(X_val.shape[0]),
+        "keras_path": keras_path.as_posix(),
+    }
+    return lstm_meta, keras_path.as_posix(), savedmodel_dir.as_posix() if savedmodel_dir else None
+
+
+def _train_arima_blocking(
+    sym: str,
+    arr: np.ndarray,
+    train_idx: int,
+    val_size: int,
+) -> dict[str, Any]:
+    order = (5, 1, 0) if len(arr) >= 60 else (1, 1, 0)
+    train_prices = arr[: train_idx + 1]
+    arima_model = ARIMA(train_prices, order=order).fit()
+    forecast_steps = min(val_size, max(1, len(arr) - (train_idx + 1)))
+    mae = None
+    if forecast_steps > 0:
+        forecast_vals = arima_model.forecast(steps=forecast_steps)
+        actual_vals = arr[train_idx + 1 : train_idx + 1 + forecast_steps]
+        if actual_vals.size == forecast_vals.shape[0]:
+            mae = float(np.mean(np.abs(forecast_vals - actual_vals)))
+    final_arima = ARIMA(arr, order=order).fit()
+    with open(f"models/{sym}_arima.pkl", "wb") as file:
+        pickle.dump(final_arima, file)
+    return {
+        "order": order,
+        "aic": float(final_arima.aic) if hasattr(final_arima, "aic") else None,
+        "mae": mae,
+        "n_obs": int(len(arr)),
+    }
+
+
+def _train_rl_blocking(sym: str, prices: Sequence[float]) -> dict[str, Any]:
+    env = StockEnv(prices, window_len=RL_WINDOW)
+    try:
+        model_rl = DQN("MlpPolicy", env, verbose=0)
+        model_rl.learn(total_timesteps=10_000)
+        model_rl.save(f"models/{sym}_rl.zip")
+    finally:
+        env.close()
+    return {"total_timesteps": 10_000}
+
+
+def _predict_lstm_prob_blocking(symbol: str, feature_vector: Sequence[float]) -> float:
+    lstm_model = load_lstm_model(symbol)
+    X = np.array(feature_vector, dtype=np.float32)
+    X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)
+    p_lstm = float(lstm_model.predict(X_lstm, verbose=0)[0][0])
+    return float(np.clip(p_lstm, 0.0, 1.0))
+
+
+def _predict_arima_direction_blocking(symbol: str, prices: Sequence[float], horizon_days: int) -> float | None:
+    arima_model = load_arima_model(symbol)
+    fc = arima_model.forecast(steps=max(1, horizon_days))
+    if hasattr(fc, "iloc"):
+        last_fc = float(fc.iloc[-1])
+    else:
+        last_fc = float(fc[-1])
+    last_price = float(prices[-1])
+    return 1.0 if last_fc > last_price else 0.0
+
+
+def _predict_rl_adjust_blocking(symbol: str, prices: Sequence[float], window_len: int) -> float:
+    rl_model = load_rl_model(symbol)
+    env = StockEnv(prices, window_len=window_len)
+    try:
+        obs, _ = env.reset()
+        action, _ = rl_model.predict(obs, deterministic=True)
+        a_map = {-1: -0.01, 0: 0.0, 1: 0.01}
+        a_idx = int(action)
+        a_val = a_map.get(a_idx - 1, 0.0)
+        return float(np.clip(a_val, -0.05, 0.05))
+    finally:
+        env.close()
+
+
 async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
     if not REDIS:
         raise HTTPException(status_code=503, detail="redis_unavailable")
@@ -6712,82 +6537,192 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="symbol_required")
 
     lookback_days = int(max(30, min(lookback_days, settings.lookback_days_max)))
-    px = await _fetch_hist_prices(sym, window_days=lookback_days)
+    px = await ingestion_service.fetch_hist_prices(sym, window_days=lookback_days)
     if not px or len(px) < 10:
         raise HTTPException(status_code=400, detail="Not enough price history")
 
     os.makedirs("models", exist_ok=True)
 
-    f = await _feat_from_prices(sym, px)
-    feature_list = list(f.keys())
+    trained_at = datetime.now(timezone.utc).isoformat()
+    arr = np.asarray(px, dtype=float)
+    try:
+        feature_list, X_all, y_all, dataset_hash = _build_training_dataset(arr, horizon=1)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
-    rets = np.diff(np.log(np.asarray(px, dtype=float)))
-    y = rets[lookback_days:] if len(rets) > lookback_days else rets
-    if len(y) == 0:
-        raise HTTPException(status_code=400, detail="Insufficient data")
+    n_samples = X_all.shape[0]
+    if n_samples < 80:
+        raise HTTPException(status_code=400, detail="Insufficient samples for model training")
 
-    X_df = pd.DataFrame({feat: [f[feat]] * len(y) for feat in feature_list})
-    X = X_df.values
+    val_size = max(30, int(n_samples * 0.2))
+    if val_size >= n_samples - 20:
+        val_size = max(10, min(50, n_samples // 5))
+    train_idx = n_samples - val_size
+    if train_idx <= 20 or val_size <= 5:
+        raise HTTPException(status_code=400, detail="Insufficient samples for validation split")
+
+    X_train = np.nan_to_num(X_all[:train_idx], nan=0.0, posinf=0.0, neginf=0.0)
+    y_train = y_all[:train_idx]
+    X_val = np.nan_to_num(X_all[train_idx:], nan=0.0, posinf=0.0, neginf=0.0)
+    y_val = y_all[train_idx:]
 
     model_linear = SGDOnline(lr=0.05, l2=1e-4)
     model_linear.init(len(feature_list))
-    for x_row, yi in zip(X, y):
-        model_linear.update(x_row, 1 if yi > 0 else 0)
+    epochs = 3
+    for _ in range(epochs):
+        for x_row, yi in zip(X_train, y_train):
+            model_linear.update(x_row, yi)
 
-    trained_at = datetime.now(timezone.utc).isoformat()
+    val_probs = np.array([model_linear.proba(row) for row in X_val], dtype=float)
+    val_preds = (val_probs >= 0.5).astype(float)
+    linear_val_accuracy = float(np.mean(val_preds == y_val))
+    linear_val_brier = float(np.mean((val_probs - y_val) ** 2))
+
     weights = model_linear.w.tolist()
     linear_data = {
-        "coef": model_linear.w.tolist(),
+        "coef": weights,
         "features": feature_list,
         "trained_at": trained_at,
-        "n_samples": int(len(y)),
+        "n_train": int(train_idx),
+        "n_val": int(val_size),
         "lookback_days": int(lookback_days),
         "symbol": sym,
+        "val_accuracy": linear_val_accuracy,
+        "val_brier": linear_val_brier,
+        "dataset_hash": dataset_hash,
+        "epochs": epochs,
     }
-    onnx_path = _export_linear_onnx(sym, weights, feature_list)
+    version_suffix = (dataset_hash or uuid4().hex)[:8]
+    model_version = f"{trained_at}-{version_suffix}"
+    linear_data["version"] = model_version
+    onnx_path = await asyncio.to_thread(_export_linear_onnx, sym, weights, feature_list)
     if onnx_path:
-        linear_data["onnx_path"] = str(onnx_path)
+        onnx_path = Path(onnx_path)
+        linear_data["onnx_path"] = onnx_path.as_posix()
+        try:
+            await asyncio.to_thread(
+                register_model_version,
+                "linear",
+                sym,
+                model_version,
+                onnx_path.as_posix(),
+                "onnx",
+                metadata={
+                    "trained_at": trained_at,
+                    "dataset_hash": dataset_hash,
+                    "val_accuracy": linear_val_accuracy,
+                    "val_brier": linear_val_brier,
+                    "n_train": int(train_idx),
+                    "n_val": int(val_size),
+                    "lookback_days": int(lookback_days),
+                },
+                status="active",
+            )
+        except Exception as exc:
+            logger.debug("Model registry update failed for linear %s: %s", sym, exc)
     await REDIS.set(await _model_key(sym + "_linear"), json.dumps(linear_data))
 
-    models_trained = 1  # linear always trains
+    models_trained = 1
 
-    try:
-        if Sequential is None:
-            raise RuntimeError("Keras not available")
-        model_lstm = Sequential([
-            LSTM(50, input_shape=(1, len(feature_list)), return_sequences=True),
-            GRU(50),
-            Dense(1, activation="sigmoid"),
-        ])
-        model_lstm.compile(optimizer="adam", loss="binary_crossentropy")
-        X_reshaped = np.expand_dims(X, axis=1)
-        y_binary = (y > 0).astype(int)
-        model_lstm.fit(X_reshaped, y_binary, epochs=5, verbose=0)
-        model_lstm.save(f"models/{sym}_lstm.keras")
-        models_trained += 1
-    except Exception as e:
-        logger.warning(f"LSTM skipped: {e}")
+    lstm_meta: dict[str, Any] | None = None
+    if Sequential is not None and X_train.shape[0] >= 100:
+        try:
+            lstm_meta, _, savedmodel_dir = await asyncio.to_thread(
+                _train_lstm_blocking,
+                sym,
+                feature_list,
+                X_train,
+                y_train,
+                X_val,
+                y_val,
+            )
+            if lstm_meta:
+                if savedmodel_dir:
+                    lstm_meta["saved_model_dir"] = savedmodel_dir
+                models_trained += 1
+                if savedmodel_dir:
+                    try:
+                        await asyncio.to_thread(
+                            register_model_version,
+                            "lstm",
+                            sym,
+                            model_version,
+                            savedmodel_dir,
+                            "tf-savedmodel",
+                            metadata={
+                                "trained_at": trained_at,
+                                "dataset_hash": dataset_hash,
+                                "val_accuracy": float(lstm_meta.get("val_accuracy", 0)),
+                                "val_brier": float(lstm_meta.get("val_brier", 0)),
+                                "n_train": int(X_train.shape[0]),
+                                "n_val": int(X_val.shape[0]),
+                                "lookback_days": int(lookback_days),
+                            },
+                            status="active",
+                        )
+                    except Exception as exc:
+                        logger.debug("Model registry update failed for lstm %s: %s", sym, exc)
+        except Exception as e:
+            logger.warning(f"LSTM skipped: {e}")
+            lstm_meta = None
+        finally:
+            _LSTM_MODEL_CACHE.pop(sym, None)
+            _LSTM_INFER_CACHE.pop(sym, None)
 
+    arima_meta: dict[str, Any] | None = None
     try:
-        order = (5, 1, 0) if len(px) >= 30 else (1, 1, 0)
-        model_arima = ARIMA(px, order=order).fit()
-        with open(f"models/{sym}_arima.pkl", "wb") as file:
-            pickle.dump(model_arima, file)
+        arima_meta = await asyncio.to_thread(
+            _train_arima_blocking,
+            sym,
+            arr,
+            train_idx,
+            val_size,
+        )
         models_trained += 1
     except Exception as e:
         logger.warning(f"ARIMA skipped: {e}")
+        arima_meta = None
+    finally:
+        _ARIMA_MODEL_CACHE.pop(sym, None)
 
+    rl_meta: dict[str, Any] | None = None
     try:
         if gym is None or DQN is None:
             raise RuntimeError("RL libs not available")
-        env = StockEnv(px, window_len=RL_WINDOW)
-        model_rl = DQN("MlpPolicy", env, verbose=0)
-        model_rl.learn(total_timesteps=10_000)
-        model_rl.save(f"models/{sym}_rl.zip")
-        env.close()
+        rl_meta = await asyncio.to_thread(_train_rl_blocking, sym, px)
         models_trained += 1
     except Exception as e:
         logger.warning(f"RL skipped: {e}")
+        rl_meta = None
+    finally:
+        _RL_MODEL_CACHE.pop(sym, None)
+
+    meta_payload = {
+        "symbol": sym,
+        "trained_at": trained_at,
+        "version": model_version,
+        "dataset_hash": dataset_hash,
+        "n_samples": int(n_samples),
+        "lookback_days": int(lookback_days),
+        "linear": {
+            "val_accuracy": linear_val_accuracy,
+            "val_brier": linear_val_brier,
+            "n_train": int(train_idx),
+            "n_val": int(val_size),
+        },
+    }
+    if lstm_meta:
+        meta_payload["lstm"] = lstm_meta
+    if arima_meta:
+        meta_payload["arima"] = arima_meta
+    if rl_meta:
+        meta_payload["rl"] = rl_meta
+
+    try:
+        await REDIS.set(f"model_meta:{sym}", json.dumps(meta_payload))
+    except Exception:
+        pass
+    _MODEL_META_CACHE[sym] = meta_payload
 
     return {
         "status": "ok",
@@ -6795,7 +6730,10 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
         "models_trained": int(models_trained),
         "lookback_days": int(lookback_days),
         "trained_at": trained_at,
-        "n_samples": int(len(y)),
+        "model_version": model_version,
+        "n_samples": int(n_samples),
+        "val_accuracy": linear_val_accuracy,
+        "val_brier": linear_val_brier,
         "onnx_path": str(onnx_path) if onnx_path else None,
     }
 
@@ -6844,6 +6782,45 @@ async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None
 @app.post("/train")
 async def train(req: TrainRequest, _api_key: str = Depends(require_key)):
     return await _train_models(req.symbol, lookback_days=req.lookback_days)
+
+
+@app.get("/models/{model_group}/{symbol}/active")
+async def model_active_version(
+    model_group: str,
+    symbol: str,
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    entry = get_active_model_version(model_group, symbol)
+    if not entry:
+        raise HTTPException(status_code=404, detail="active_model_not_found")
+    return entry
+
+
+@app.get("/models/{model_group}/{symbol}/versions")
+async def model_versions(
+    model_group: str,
+    symbol: str,
+    limit: int = Query(20, ge=1, le=200),
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    versions = list_model_versions(model_group, symbol, limit=limit)
+    return {"versions": versions}
+
+
+@app.post("/models/{model_group}/{symbol}/promote")
+async def promote_model_endpoint(
+    model_group: str,
+    symbol: str,
+    req: PromoteModelRequest,
+    _ok: bool = Security(require_key, scopes=["admin"]),
+):
+    try:
+        promote_model_version(model_group, symbol, req.version)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    entry = get_active_model_version(model_group, symbol)
+    return {"status": "ok", "active": entry}
+
 
 if gym is not None:
     class StockEnv(gym.Env):  # type: ignore[attr-defined]
@@ -6980,6 +6957,8 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
     Returns an ensemble probability that the next move is up, logs the prediction to DuckDB,
     and mirrors the row into the PathPanda Feature Store so dashboards/metrics see it.
     """
+    start_time = time.perf_counter()
+    horizon_days = max(1, int(getattr(req, "horizon_days", 1)))
     # --- 1) Load linear head (coef + feature list) from Redis ---
     raw = await REDIS.get(await _model_key(req.symbol + "_linear"))
     if not raw:
@@ -6988,45 +6967,62 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
 
     # --- 2) Prices + features ---
     symbol = req.symbol.upper().strip()
-    px = await _fetch_hist_prices(symbol)
+    px = await ingestion_service.fetch_hist_prices(symbol)
     if not px or len(px) < 10:
         raise HTTPException(status_code=400, detail="Not enough price history")
     f = await _feat_from_prices(symbol, px)
+    spot0 = float(px[-1])
 
     # --- 3) Build input vector for linear head ---
     feature_list = model_linear.get("features", ["mom_20", "rvol_20", "autocorr_5"])
-    X = np.array([f.get(feat, 0.0) for feat in feature_list], dtype=float)
+    feature_vector = [float(f.get(feat, 0.0)) for feat in feature_list]
+    X = np.array(feature_vector, dtype=float)
 
     preds: List[float] = []
+    used_models: set[str] = set()
 
     # --- Linear probability via logistic(dot(w, [1, X])) ---
-    try:
-        w = np.array(model_linear.get("coef", []), dtype=float)
-        if w.size:
-            xb = np.concatenate([[1.0], X])            # prepend bias
-            k = min(w.shape[0], xb.shape[0])
-            score = float(np.dot(xb[:k], w[:k]))
-            score = float(np.clip(score, -60.0, 60.0)) # numerical safety
-            preds.append(1.0 / (1.0 + np.exp(-score)))
-    except Exception as e:
-        logger.info(f"Linear skipped: {e}")
+    linear_prob = _run_linear_onnx(symbol, feature_vector)
+    if linear_prob is None:
+        try:
+            w = np.array(model_linear.get("coef", []), dtype=float)
+            if w.size:
+                xb = np.concatenate([[1.0], X])            # prepend bias
+                k = min(w.shape[0], xb.shape[0])
+                score = float(np.dot(xb[:k], w[:k]))
+                score = float(np.clip(score, -60.0, 60.0)) # numerical safety
+                preds.append(1.0 / (1.0 + np.exp(-score)))
+                used_models.add("linear")
+        except Exception as e:
+            logger.info(f"Linear skipped: {e}")
+    else:
+        preds.append(linear_prob)
+        used_models.add("linear")
 
     # --- LSTM probability (optional/lenient) ---
-    try:
-        lstm_model = load_lstm_model(symbol)
-        X_lstm = np.expand_dims(np.expand_dims(X, axis=0), axis=0)  # (1, 1, features)
-        p_lstm = float(lstm_model.predict(X_lstm, verbose=0)[0][0])
-        preds.append(p_lstm)
-    except Exception as e:
-        logger.info(f"LSTM skipped: {e}")
+    lstm_prob = _run_lstm_savedmodel(symbol, feature_vector)
+    if lstm_prob is not None:
+        preds.append(lstm_prob)
+        used_models.add("lstm")
+    else:
+        try:
+            lstm_prob = await asyncio.to_thread(_predict_lstm_prob_blocking, symbol, feature_vector)
+            preds.append(lstm_prob)
+            used_models.add("lstm")
+        except Exception as e:
+            logger.info(f"LSTM skipped: {e}")
 
     # --- ARIMA direction (0/1) ---
     try:
-        arima_model = load_arima_model(symbol)
-        steps = max(1, int(getattr(req, "horizon_days", 1)))
-        fc = arima_model.forecast(steps=steps)
-        last_fc = float(fc.iloc[-1] if hasattr(fc, "iloc") else fc[-1])
-        preds.append(1.0 if last_fc > float(px[-1]) else 0.0)
+        arima_direction = await asyncio.to_thread(
+            _predict_arima_direction_blocking,
+            symbol,
+            px,
+            horizon_days,
+        )
+        if arima_direction is not None:
+            preds.append(arima_direction)
+            used_models.add("arima")
     except Exception as e:
         logger.info(f"ARIMA skipped: {e}")
 
@@ -7035,41 +7031,57 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
 
     # --- RL tiny tilt (optional) ---
     rl_adjust = 0.0
-    try:
-        rl_model = DQN.load(f"models/{symbol}_rl.zip", print_system_info=False)
-        env = StockEnv(px, window_len=RL_WINDOW)
-        obs, _ = env.reset()
-        action, _ = rl_model.predict(obs, deterministic=True)  # 0,1,2
-        a_map = {-1: -0.01, 0: 0.0, 1: 0.01}
-        a_idx = int(action)
-        a_val = a_map.get(a_idx - 1, 0.0)  # action 0→-1, 1→0, 2→+1
-        rl_adjust = float(np.clip(a_val, -0.05, 0.05))
-        env.close()
-    except Exception as e:
-        logger.info(f"RL skipped: {e}")
+    if StockEnv is not None:
+        try:
+            rl_adjust = await asyncio.to_thread(
+                _predict_rl_adjust_blocking,
+                symbol,
+                px,
+                RL_WINDOW,
+            )
+            used_models.add("rl")
+        except Exception as e:
+            logger.info(f"RL skipped: {e}")
+    # --- Price bands via conformal calibration ---
+    calibration_hint = await _get_calibration_params(symbol, horizon_days)
+    q05 = q50 = q95 = None
+    if calibration_hint:
+        try:
+            q05 = float(spot0 * math.exp(float(calibration_hint["q05"])))
+            q50 = float(spot0 * math.exp(float(calibration_hint["q50"])))
+            q95 = float(spot0 * math.exp(float(calibration_hint["q95"])))
+        except Exception as exc:
+            logger.debug("Calibration quantile conversion failed for %s: %s", symbol, exc)
+            q05 = q50 = q95 = None
+    fallback_quantiles = _compute_fallback_quantiles(px, prob_up, horizon_days)
+    if (q05 is None or q95 is None) and fallback_quantiles:
+        q05, q50, q95 = fallback_quantiles
+    elif q05 is None or q95 is None:
+        logger.debug("Fallback quantile calibration unavailable for %s", symbol)
 
-    # --- Simple exp-weights ensemble (defaults if no metrics available) ---
-    losses: List[float] = [0.3] * len(preds)
-    ew = EW()
-    ew.init(len(preds))
-    ew.update(np.array(losses, dtype=float))
-    prob_up = float(np.clip(sum(wt * p for wt, p in zip(ew.w, preds)) + rl_adjust, 0.0, 1.0))
-
-    # --- Quantile placeholders (wire real conformal/quantiles later) ---
-    q05 = None
-    q50 = None
-    q95 = None
+    if CALIBRATION_ERROR_GAUGE and fallback_quantiles:
+        try:
+            horizon_label = str(horizon_days)
+            if calibration_hint and q05 is not None and q95 is not None:
+                cal_error = max(
+                    abs(q05 - float(fallback_quantiles[0])),
+                    abs(q95 - float(fallback_quantiles[2])),
+                )
+                CALIBRATION_ERROR_GAUGE.labels(symbol=symbol, horizon_days=horizon_label).set(cal_error)
+            else:
+                CALIBRATION_ERROR_GAUGE.labels(symbol=symbol, horizon_days=horizon_label).set(-1.0)
+        except Exception:
+            pass
 
     # --- Log to Predictions/Outcomes store (DuckDB via src.db.duck) ---
     pred_id = str(uuid4())
-    spot0 = float(px[-1])
     try:
         insert_prediction(
             {
                 "pred_id": pred_id,
                 "ts": datetime.utcnow(),
                 "symbol": symbol,
-                "horizon_d": int(getattr(req, "horizon_days", 1)),
+                "horizon_d": horizon_days,
                 "model_id": "ensemble-v1",
                 "prob_up_next": float(prob_up),
                 "p05": q05,
@@ -7086,6 +7098,17 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
     # --- Also mirror to PathPanda Feature Store (so metrics/dashboard can see it) ---
     try:
         con_fs = fs_connect()
+        features_payload = {
+            "mom_20": float(f.get("mom_20", 0.0)),
+            "rvol_20": float(f.get("rvol_20", 0.0)),
+            "autocorr_5": float(f.get("autocorr_5", 0.0)),
+            "spot0": spot0,
+        }
+        if calibration_hint:
+            features_payload["calibration"] = {
+                "sigma_ann": float(calibration_hint.get("sigma_ann")) if calibration_hint.get("sigma_ann") is not None else None,
+                "sample_n": int(calibration_hint.get("sample_n", 0)),
+            }
         fs_log_prediction(
             con_fs,
             {
@@ -7094,24 +7117,31 @@ async def predict(req: PredictRequest, _api_key: str = Depends(require_key)):
                 "model_id": "ensemble-v1",
                 "symbol": symbol,
                 "issued_at": datetime.now(timezone.utc).isoformat(),
-                "horizon_days": int(getattr(req, "horizon_days", 1)),
+                "horizon_days": horizon_days,
                 "yhat_mean": None,                # fill with price mid later if available
                 "prob_up": float(prob_up),        # note: FS expects 'prob_up'
                 "q05": q05,
                 "q50": q50,
                 "q95": q95,
                 "uncertainty": None,
-                "features_ref": {
-                    "mom_20": float(f.get("mom_20", 0.0)),
-                    "rvol_20": float(f.get("rvol_20", 0.0)),
-                    "autocorr_5": float(f.get("autocorr_5", 0.0)),
-                    "spot0": spot0,
-                },
+                "features_ref": json.dumps(features_payload),
             },
         )
         con_fs.close()
     except Exception as e:
         logger.warning(f"Feature store mirror failed: {e}")
+
+    if MODEL_USAGE_COUNTER:
+        try:
+            for model_name in used_models:
+                MODEL_USAGE_COUNTER.labels(model=model_name).inc()
+        except Exception:
+            pass
+    if INFERENCE_LATENCY_SECONDS:
+        try:
+            INFERENCE_LATENCY_SECONDS.labels(endpoint="predict").observe(time.perf_counter() - start_time)
+        except Exception:
+            pass
 
     # --- Response for UI ---
     return {

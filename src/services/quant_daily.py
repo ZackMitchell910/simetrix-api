@@ -11,6 +11,7 @@ import numpy as np
 from fastapi import HTTPException
 
 from .. import predictive_service as svc  # type: ignore
+from . import ingestion as ingestion_service
 
 TTL_DAY_SECONDS = 27 * 3600
 TTL_MINIMAL_SECONDS = 6 * 3600
@@ -96,7 +97,7 @@ async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any
 async def _compute_minimal_summary(symbol: str, horizon_days: int) -> MinimalSummary:
     sym_fetch = svc._to_polygon_ticker(symbol)
     window_days = max(60, min(540, int(horizon_days * 12)))
-    prices = await svc._fetch_cached_hist_prices(sym_fetch, window_days, svc.REDIS)
+    prices = await ingestion_service.fetch_cached_hist_prices(sym_fetch, window_days, svc.REDIS)
     if not prices or len(prices) < 30:
         raise HTTPException(status_code=503, detail=f"Insufficient history for {symbol}")
 
