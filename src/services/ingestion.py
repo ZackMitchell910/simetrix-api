@@ -7,8 +7,9 @@ import logging
 import os
 import random
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import httpx
 import numpy as np
@@ -191,6 +192,25 @@ def _news_ts(value: Any, default: datetime) -> datetime:
     return default
 
 
+def _parse_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return None
+        try:
+            return datetime.fromisoformat(txt.replace("Z", "+00:00")).date()
+        except Exception:
+            try:
+                return datetime.strptime(txt.split("T")[0], "%Y-%m-%d").date()
+            except Exception:
+                return None
+    return None
+
+
 async def _news_rows_from_newsapi(symbol: str, since: datetime, limit: int, api_key: str) -> list[tuple]:
     url = "https://newsapi.org/v2/everything"
     params = {
@@ -276,6 +296,264 @@ async def _fetch_news_articles(symbol: str, since: datetime, provider: str, limi
             raise HTTPException(status_code=400, detail="Polygon key missing for news ingest.")
         return await _news_rows_from_polygon(symbol, since, limit=limit, api_key=key)
     raise HTTPException(status_code=400, detail=f"Unsupported news provider '{provider}'.")
+
+
+async def fetch_recent_news(symbol: str, days: int = 7, limit: int = 40) -> list[dict[str, Any]]:
+    """Return recent news rows for a symbol from the feature store."""
+    if not callable(feature_store_connect):
+        return []
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
+        return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(max(1, days)))
+    try:
+        con = feature_store_connect()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: connect failed for %s: %s", symbol_norm, exc)
+        return []
+    try:
+        rows = con.execute(
+            """
+            SELECT ts, source, title, url, summary, sentiment
+            FROM news_articles
+            WHERE symbol = ? AND ts >= ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            [symbol_norm, cutoff, int(max(1, limit))],
+        ).fetchall()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: query failed for %s: %s", symbol_norm, exc)
+        rows = []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    out: list[dict[str, Any]] = []
+    for ts, source, title, url, summary, sentiment in rows:
+        ts_dt = _as_utc_datetime(ts) or datetime.now(timezone.utc)
+        out.append(
+            {
+                "ts": ts_dt.isoformat(),
+                "source": (source or "") if source is not None else "",
+                "headline": (title or "") if title is not None else "",
+                "url": (url or "") if url is not None else "",
+                "summary": (summary or "") if summary is not None else "",
+                "sentiment": (float(sentiment) if sentiment is not None else None),
+            }
+        )
+    return out
+
+
+async def fetch_social(symbol: str, handles: Sequence[str] | str | None = None) -> dict[str, Any]:
+    """Lightweight social sentiment stub used for diagnostics."""
+    symbol_norm = (symbol or "").strip().upper()
+    handles_list: list[str]
+    if isinstance(handles, str):
+        handles_list = [h.strip().lstrip("@") for h in handles.split(",") if h and h.strip()]
+    elif isinstance(handles, Sequence):
+        handles_list = [str(h).strip().lstrip("@") for h in handles if str(h).strip()]
+    else:
+        handles_list = []
+
+    base = symbol_norm or (symbol or "").strip().upper()
+    if not base:
+        base = "MARKET"
+
+    if handles_list:
+        posts = [f"@{handle} on {base}: tracking flows and positioning" for handle in handles_list[:5]]
+    else:
+        posts = [
+            f"Chatter about {base} continues as traders debate the outlook.",
+            f"{base} sentiment mixed after recent moves.",
+        ]
+
+    def _score(text: str) -> float:
+        txt = text.lower()
+        score = 0.0
+        for word in ("buy", "bull", "breakout", "beat", "strong", "upside"):
+            if word in txt:
+                score += 0.08
+        for word in ("sell", "bear", "miss", "risk", "downgrade", "weak"):
+            if word in txt:
+                score -= 0.08
+        return max(-0.3, min(0.3, score))
+
+    score = sum(_score(p) for p in posts) if posts else 0.0
+
+    return {
+        "symbol": symbol_norm,
+        "handles": handles_list,
+        "posts": posts[:5],
+        "score": float(score),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def load_option_surface(symbol: str, asof: date | None = None) -> dict[str, Any]:
+    symbol_norm = (symbol or "").strip().upper()
+    as_of = asof or datetime.now(timezone.utc).date()
+    key = _polygon_api_key()
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    url = f"https://api.polygon.io/v3/snapshot/options/{symbol_norm}"
+    raw_nodes: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    if key:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+            for contract_type in ("call", "put"):
+                params = {
+                    "contract_type": contract_type,
+                    "limit": "250",
+                    "order": "asc",
+                    "sort": "expiration_date",
+                }
+                try:
+                    resp = await client.get(url, params=params, headers=headers)
+                    resp.raise_for_status()
+                    data = resp.json() or {}
+                except Exception as exc:
+                    errors.append(str(exc))
+                    continue
+                for item in data.get("results", []) or []:
+                    details = item.get("details") or {}
+                    expiration = details.get("expiration_date") or details.get("expiration")
+                    exp_date = _parse_date(expiration)
+                    if exp_date is None:
+                        continue
+                    dte = (exp_date - as_of).days
+                    if dte < 0:
+                        continue
+                    iv_raw = item.get("implied_volatility")
+                    if iv_raw is None:
+                        continue
+                    try:
+                        iv_val = float(iv_raw)
+                    except Exception:
+                        continue
+                    if not np.isfinite(iv_val) or iv_val <= 0:
+                        continue
+                    delta_val = 0.0
+                    greeks = item.get("greeks") or {}
+                    try:
+                        delta_val = float(greeks.get("delta", 0) or 0.0)
+                    except Exception:
+                        delta_val = 0.0
+                    strike_val = 0.0
+                    try:
+                        strike_val = float(details.get("strike_price") or 0.0)
+                    except Exception:
+                        strike_val = 0.0
+                    raw_nodes.append(
+                        {
+                            "expiration": exp_date.isoformat(),
+                            "dte": int(dte),
+                            "iv": iv_val,
+                            "type": contract_type,
+                            "delta": delta_val,
+                            "strike": strike_val,
+                        }
+                    )
+    else:
+        errors.append("polygon_key_missing")
+
+    grouped: dict[int, list[float]] = defaultdict(list)
+    for node in raw_nodes:
+        grouped[int(node["dte"])].append(float(node["iv"]))
+
+    nodes = []
+    for dte in sorted(grouped):
+        ivs = grouped[dte]
+        if not ivs:
+            continue
+        nodes.append({"dte": int(dte), "iv": float(np.mean(ivs)), "count": int(len(ivs))})
+
+    result = {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "source": "polygon",
+        "nodes": nodes,
+        "raw_count": len(raw_nodes),
+    }
+    if errors:
+        result["errors"] = errors[:3]
+    return result
+
+
+async def load_futures_curve(symbol: str, asof: date | None = None) -> dict[str, Any]:
+    symbol_norm = (symbol or "").strip().upper()
+    as_of_dt = datetime.combine(asof, datetime.min.time(), tzinfo=timezone.utc) if asof else datetime.now(timezone.utc)
+    key = _polygon_api_key()
+    params = {
+        "underlying_ticker": symbol_norm,
+        "contract_type": "futures",
+        "apiKey": key,
+    }
+    nodes: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    if key:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+                resp = await client.get("https://api.polygon.io/v3/snapshot", params=params)
+                resp.raise_for_status()
+                data = resp.json() or {}
+        except Exception as exc:
+            errors.append(str(exc))
+            data = {}
+    else:
+        errors.append("polygon_key_missing")
+        data = {}
+
+    for item in (data.get("results") or []):
+        details = item.get("details") or {}
+        expiration = details.get("expiration_date") or details.get("expiration") or item.get("expiration_date")
+        exp_date = _parse_date(expiration)
+        if exp_date is None:
+            continue
+        dte = (exp_date - as_of_dt.date()).days
+        if dte < 0:
+            continue
+        price_val = None
+        last = item.get("last")
+        if isinstance(last, dict):
+            price_val = last.get("price")
+        if price_val is None:
+            price_val = item.get("price") or item.get("close") or item.get("c")
+        try:
+            price = float(price_val)
+        except Exception:
+            continue
+        if not np.isfinite(price) or price <= 0:
+            continue
+        oi_val = 0
+        try:
+            oi_val = int(item.get("open_interest", 0) or 0)
+        except Exception:
+            oi_val = 0
+        nodes.append(
+            {
+                "ticker": item.get("ticker"),
+                "dte": int(dte),
+                "price": price,
+                "expiration": exp_date.isoformat(),
+                "open_interest": oi_val,
+            }
+        )
+
+    nodes.sort(key=lambda x: x["dte"])
+
+    result = {
+        "symbol": symbol_norm,
+        "as_of": as_of_dt.isoformat(),
+        "source": "polygon",
+        "nodes": nodes,
+    }
+    if errors:
+        result["errors"] = errors[:3]
+    return result
 
 
 async def ingest_news(
