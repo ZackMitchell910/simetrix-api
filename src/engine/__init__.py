@@ -1,14 +1,19 @@
-"""Simulation engine components."""
+"""Simulation engines for scenario-conditioned market paths."""
 
-from .types import Artifact, StateVector
-from .base import PathEngine
+from .base import PathEngine, SimulationArtifact
 from .jd import JumpDiffusionEngine
+from .heston import HestonEngine
+from .correlated import CorrelatedPathEngine
+from .state import StateVector
 from .shocks import ShockScheduler
 
+
 __all__ = [
-    "Artifact",
-    "StateVector",
     "PathEngine",
+    "SimulationArtifact",
     "JumpDiffusionEngine",
+    "HestonEngine",
+    "CorrelatedPathEngine",
+    "StateVector",
     "ShockScheduler",
 ]

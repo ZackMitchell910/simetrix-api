@@ -9,4 +9,5 @@ __all__ = [
     "ShockOverride",
     "ScenarioGenerator",
     "ScenarioBook",
+    "ShockOverride",
 ]
