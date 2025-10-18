@@ -5,6 +5,8 @@ from .jd import JumpDiffusionEngine
 from .heston import HestonEngine
 from .correlated import CorrelatedPathEngine
 from .state import StateVector
+from .shocks import ShockScheduler
+
 
 __all__ = [
     "PathEngine",
@@ -13,4 +15,5 @@ __all__ = [
     "HestonEngine",
     "CorrelatedPathEngine",
     "StateVector",
+    "ShockScheduler",
 ]

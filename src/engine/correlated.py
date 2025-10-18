@@ -1,5 +1,3 @@
-"""Correlated multi-asset path engine."""
-
 from __future__ import annotations
 
 from typing import Sequence
@@ -10,7 +8,9 @@ from ..scenarios.types import EventShock
 from .base import PathEngine, SimulationArtifact
 from .shocks import ShockScheduler
 from .state import StateVector
-
+from src.scenarios.models import EventShock
+from .base import PathEngine
+from .types import Artifact, StateVector
 
 class CorrelatedPathEngine(PathEngine):
     """Generate correlated jump-diffusion paths for multiple assets."""
@@ -87,3 +87,9 @@ class CorrelatedPathEngine(PathEngine):
 
         metadata = {"correlation": corr}
         return SimulationArtifact(time_grid=time_grid, paths=paths, metadata=metadata)
+    ) -> Artifact:
+        artifact = self.base_engine.simulate(state, scenarios, horizon_days, n_paths, dt)
+        artifact.metadata.setdefault("correlations", {})[state.symbol] = self.correlation
+        artifact.metadata.setdefault("engines", {})[state.symbol] = artifact.metadata.get("engine")
+        artifact.metadata.setdefault("symbols", []).append(state.symbol)
+        return artifact

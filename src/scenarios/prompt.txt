@@ -1,33 +1,20 @@
-You are a financial scenario strategist. Given market headlines and a dated corporate event, draft up to five mutually exclusive scenario variants that capture plausible outcomes. Each scenario must include:
-- name: concise label for the variant
-- description: one or two sentences summarizing the narrative
-- window_start / window_end: ISO timestamps bracketing when the shock applies
-- drift_bump: annualized drift adjustment in decimal form (e.g. 0.05 = +5% annualized)
-- vol_multiplier: multiplier applied to baseline volatility
-- jump_intensity: expected number of discrete jumps per year attributable to the scenario
-- jump_mean / jump_std: mean and standard deviation of the log jump size
-- prior: probability weight between 0 and 1. Priors for variants of the same event must sum to ≤ 1.
+You are an equity strategist generating market scenarios ahead of corporate events.
+Write 1-5 mutually exclusive event shocks. For each variant provide:
+- variant label (e.g. Beat, Inline, Miss)
+- qualitative rationale referencing headlines
+- prior probability in percent (rounded to integers)
+- expected drift impact in basis points
+- volatility multiplier (1.0 = unchanged)
+- optional jump mean/std (log-return space)
 
+Example:
+Ticker: XYZ
+Event: Q2 earnings 2024-08-14 after close
 Headlines:
-{headlines}
+1. XYZ secures multi-year cloud contract with Fortune 50 retailer
+2. Analysts lift revenue estimates into the print
 
-Earnings calendar item:
-{calendar_item}
-
-Respond in compact JSON with schema {"event_id": str, "scenarios": list[Scenario]}.
-
-Example 1:
-{"event_id": "AAPL-2023Q4", "scenarios": [
-  {"name": "In-line quarter", "description": "Apple reports roughly in-line ...", "window_start": "2023-10-31T13:30:00Z", "window_end": "2023-11-02T21:00:00Z", "drift_bump": 0.0, "vol_multiplier": 1.1, "jump_intensity": 0.2, "jump_mean": -0.01, "jump_std": 0.08, "prior": 0.45},
-  {"name": "Upside surprise", "description": "iPhone demand proves more resilient ...", "window_start": "2023-10-31T13:30:00Z", "window_end": "2023-11-02T21:00:00Z", "drift_bump": 0.15, "vol_multiplier": 1.3, "jump_intensity": 0.25, "jump_mean": 0.04, "jump_std": 0.12, "prior": 0.35},
-  {"name": "Guide-down", "description": "Management signals softer holiday demand ...", "window_start": "2023-10-31T13:30:00Z", "window_end": "2023-11-02T21:00:00Z", "drift_bump": -0.18, "vol_multiplier": 1.4, "jump_intensity": 0.35, "jump_mean": -0.06, "jump_std": 0.15, "prior": 0.20}
-]}
-
-Example 2:
-{"event_id": "TSLA-2024Q1", "scenarios": [
-  {"name": "Margin squeeze", "description": "Price cuts weigh on auto gross margin ...", "window_start": "2024-04-18T13:30:00Z", "window_end": "2024-04-19T21:00:00Z", "drift_bump": -0.12, "vol_multiplier": 1.5, "jump_intensity": 0.5, "jump_mean": -0.08, "jump_std": 0.18, "prior": 0.4},
-  {"name": "Energy beat", "description": "Storage and services drive an upside surprise ...", "window_start": "2024-04-18T13:30:00Z", "window_end": "2024-04-19T21:00:00Z", "drift_bump": 0.1, "vol_multiplier": 1.25, "jump_intensity": 0.3, "jump_mean": 0.05, "jump_std": 0.1, "prior": 0.35},
-  {"name": "Muted quarter", "description": "Results largely match consensus with limited volatility ...", "window_start": "2024-04-18T13:30:00Z", "window_end": "2024-04-19T21:00:00Z", "drift_bump": -0.02, "vol_multiplier": 1.05, "jump_intensity": 0.15, "jump_mean": -0.01, "jump_std": 0.06, "prior": 0.25}
-]}
-
-Use similar structure for the actual response.
+Output:
+1. Beat — contract + estimate revisions support upside. Prior 45%. Drift +120bp. Vol x1.1. Jump mean +0.04, std 0.08.
+2. Inline — consensus already embeds improvement. Prior 35%. Drift +10bp. Vol x0.95.
+3. Miss — execution risks on onboarding. Prior 20%. Drift -80bp. Vol x1.2. Jump mean -0.05, std 0.07.

@@ -1,14 +1,13 @@
-"""Scenario generation package."""
+"""Scenario generation utilities for event-driven simulations."""
 
-from .types import CalendarItem, EventShock, Headline, HistoricalOutcome
+from .models import EventShock, ShockOverride
 from .generator import ScenarioGenerator
 from .book import ScenarioBook
 
 __all__ = [
-    "CalendarItem",
     "EventShock",
-    "Headline",
-    "HistoricalOutcome",
+    "ShockOverride",
     "ScenarioGenerator",
     "ScenarioBook",
+    "ShockOverride",
 ]

@@ -49,6 +49,7 @@ class SimRequest(BaseModel):
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
+    x_handles: List[str] = Field(default_factory=list, alias="handles")
     seed: Optional[int] = None
 
     @property
@@ -57,6 +58,10 @@ class SimRequest(BaseModel):
 
     def lookback_days(self) -> int:
         return 180 if self.mode == "quick" else 3650
+
+    @property
+    def handles(self) -> List[str]:
+        return list(self.x_handles)
 
     def bars_per_day(self) -> int:
         if self.timespan == "day":

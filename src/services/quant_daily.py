@@ -6,7 +6,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 from fastapi import HTTPException
@@ -45,11 +45,6 @@ class MinimalSummary:
         }
 
 
-def _cache_key(symbol: str, horizon_days: int, day_iso: Optional[str] = None) -> str:
-    as_of = day_iso or datetime.now(timezone.utc).date().isoformat()
-    return f"quant:daily:{as_of}:summary:{symbol}:{horizon_days}"
-
-
 def _to_number(value: Any) -> Optional[float]:
     try:
         num = float(value)
@@ -58,6 +53,104 @@ def _to_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return None
+
+
+def _normalize_prob(value: Any) -> Optional[float]:
+    num = _to_number(value)
+    if num is None:
+        return None
+    if num > 1.0:
+        # Accept percentage-style inputs (e.g., 62.5) and normalise to 0-1.
+        num = num / 100.0
+    return float(np.clip(num, 0.0, 1.0))
+
+
+def _normalize_horizon(value: Any, fallback: Optional[int]) -> Optional[int]:
+    try:
+        if value is None:
+            raise ValueError("missing")
+        hz = int(value)
+        if hz <= 0:
+            raise ValueError("non-positive horizon")
+        return hz
+    except Exception:
+        if fallback is None:
+            return None
+        return max(1, int(fallback))
+
+
+def _default_blurb(symbol: str, horizon: Optional[int], prob: Optional[float], median: Optional[float], regime: str) -> str:
+    horizon_str = f"{int(horizon)}d" if isinstance(horizon, int) else "multi-day"
+    prob_str = f"≈{prob:.0%}" if isinstance(prob, (int, float)) else "mixed odds"
+    med_str = f"median ≈ {median:.1f}%" if isinstance(median, (int, float)) else "median path uncertain"
+    regime = regime or "neutral"
+    return f"{symbol}: {horizon_str} outlook {prob_str}, {med_str}. Regime {regime}."
+
+
+def normalize_pick_document(
+    doc: Mapping[str, Any] | None,
+    *,
+    fallback_horizon: Optional[int] = None,
+    required_keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Return a copy of *doc* with the daily-card fields coerced and defaults filled.
+
+    The frontend relies on ``prob_up_end``, ``median_return_pct``, ``horizon_days`` and
+    ``blurb`` being present. This helper enforces those invariants so that stale cache
+    entries or external payloads do not break the DailyQuant card UI.
+    """
+
+    if not isinstance(doc, Mapping):
+        return {}
+
+    data = {k: v for k, v in doc.items()}
+    symbol = str(data.get("symbol") or "").upper().strip()
+    if not symbol:
+        return {}
+
+    prob = _normalize_prob(data.get("prob_up_end") or data.get("prob_up_30d"))
+    if prob is not None:
+        data["prob_up_end"] = prob
+
+    median_pct = _to_number(data.get("median_return_pct"))
+    if median_pct is None:
+        base = _to_number(data.get("base_price"))
+        spot = _to_number(data.get("spot")) or _to_number(data.get("spot0"))
+        if spot not in (None, 0):
+            try:
+                median_pct = float(((base or spot) / spot - 1.0) * 100.0)
+            except Exception:
+                median_pct = None
+    if median_pct is not None:
+        data["median_return_pct"] = float(median_pct)
+
+    horizon = _normalize_horizon(data.get("horizon_days"), fallback_horizon)
+    if horizon is not None:
+        data["horizon_days"] = horizon
+
+    regime = str(data.get("regime") or "neutral").strip() or "neutral"
+    if not data.get("blurb"):
+        data["blurb"] = _default_blurb(symbol, horizon, prob, median_pct, regime)
+
+    required = set(required_keys or ("prob_up_end", "median_return_pct", "horizon_days", "blurb"))
+    missing = [key for key in required if key not in data]
+    for key in missing:
+        if key == "prob_up_end" and prob is None:
+            data[key] = 0.5
+        elif key == "median_return_pct" and median_pct is None:
+            data[key] = 0.0
+        elif key == "horizon_days" and horizon is None:
+            data[key] = fallback_horizon or 30
+        elif key == "blurb":
+            data[key] = _default_blurb(symbol, data.get("horizon_days"), data.get("prob_up_end"), data.get("median_return_pct"), regime)
+
+    data["symbol"] = symbol
+    return data
+
+
+def _cache_key(symbol: str, horizon_days: int, day_iso: Optional[str] = None) -> str:
+    as_of = day_iso or datetime.now(timezone.utc).date().isoformat()
+    return f"quant:daily:{as_of}:summary:{symbol}:{horizon_days}"
 
 
 async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any]:

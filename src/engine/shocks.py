@@ -1,20 +1,19 @@
-"""Shock scheduler applies scenario overrides across time steps."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Sequence
 
 import numpy as np
 
-from ..scenarios.types import EventShock
-from .state import StateVector
+from src.scenarios.models import EventShock
+from .types import StateVector
 
 
 @dataclass(slots=True)
-class ScheduledShockPath:
-    drift_bump: np.ndarray
+class ShockSchedule:
+    times: np.ndarray
+    drift: np.ndarray
     vol_multiplier: np.ndarray
     jump_intensity: np.ndarray
     jump_mean: np.ndarray

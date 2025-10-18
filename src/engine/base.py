@@ -5,13 +5,15 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Sequence
-
+from src.scenarios.models import EventShock
+from .types import Artifact, StateVector
 import numpy as np
 
 from .state import StateVector
 from ..scenarios.types import EventShock
 
-
+class PathEngine(ABC):
+    """Interface for pluggable Monte Carlo engines."""
 @dataclass(slots=True)
 class SimulationArtifact:
     """Container for simulated paths and metadata."""
@@ -57,3 +59,6 @@ class PathEngine(ABC):
         if grid[-1] > horizon_days:
             grid[-1] = float(horizon_days)
         return grid
+    ) -> Artifact:
+        """Simulate Monte Carlo paths subject to optional scenarios."""
+        raise NotImplementedError
