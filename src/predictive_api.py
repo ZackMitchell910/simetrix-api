@@ -51,6 +51,7 @@ from src.observability import get_recent_logs
 from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.services import auth as auth_service
+from src.routes.quant import ensure_daily_snapshot
 from src.services.quant_daily import fetch_minimal_summary
 from src.services.labeling import (
     label_outcomes as service_label_outcomes,
@@ -68,6 +69,8 @@ from src.services.quant_utils import (
     winsorize,
 )
 from src.services.quant_mc import latest_mc_metric as service_latest_mc_metric
+from src.state import StateVector
+from src.state.estimation import fuse_dynamic_factors
 from src.services.quant_candidates import llm_shortlist as service_llm_shortlist
 from src.services.quant_scheduler import (
     quant_budget_key as service_quant_budget_key,
@@ -3736,69 +3739,56 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             await _update_run_state(redis, run_id, rs, progress=32.0, detail="Estimating drift and volatility")
 
-            fusion_diag: dict | None = None
+            fusion_diag: dict[str, Any] | None = None
+            state_vector: StateVector | None = None
+            context_diag: dict[str, Any] = {}
+
+            sent: dict[str, Any] = {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
+            earn: dict[str, Any] = {
+                "surprise_last": 0.0,
+                "guidance_delta": 0.0,
+                "days_since_earn": None,
+                "days_to_next": None,
+            }
+            macr: dict[str, Any] = {"rff": None, "cpi_yoy": None, "u_rate": None}
+
             if USE_SIM_BIAS:
-                def _safe_sent_dict() -> dict:
-                    return {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
-
-                def _safe_earn_dict() -> dict:
-                    return {"surprise_last": 0.0, "guidance_delta": 0.0, "days_since_earn": None, "days_to_next": None}
-
-                def _safe_macro_dict() -> dict:
-                    return {"rff": None, "cpi_yoy": None, "u_rate": None}
-
                 try:
-                    sent = await get_sentiment_features(req.symbol)
+                    sent = await get_sentiment_features(req.symbol, diagnostics=context_diag)
                 except Exception as exc:
                     logger.debug("sim_bias: sentiment fetch failed for %s: %s", req.symbol, exc)
-                    sent = _safe_sent_dict()
                 try:
-                    earn = await get_earnings_features(req.symbol)
+                    earn = await get_earnings_features(req.symbol, diagnostics=context_diag)
                 except Exception as exc:
                     logger.debug("sim_bias: earnings fetch failed for %s: %s", req.symbol, exc)
-                    earn = _safe_earn_dict()
                 try:
-                    macr = await get_macro_features()
+                    macr = await get_macro_features(diagnostics=context_diag)
                 except Exception as exc:
                     logger.debug("sim_bias: macro fetch failed: %s", exc)
-                    macr = _safe_macro_dict()
 
-                mu_ann_pre = float(mu_ann)
-                sigma_ann_pre = float(sigma_ann)
-                sent_avg = float(sent.get("avg_sent_7d") or 0.0)
-                earn_surprise = float(earn.get("surprise_last") or 0.0)
-                mu_bias = float(np.clip(sent_avg * 0.15 + earn_surprise * 0.05, -0.15, 0.15))
-                mu_ann = float(np.clip(mu_ann + mu_bias, -mu_cap, mu_cap))
+            options_prior = {"iv": float(iv30)} if iv30 else None
+            futures_prior: dict[str, Any] | None = None
 
-                sigma_ann_post = sigma_ann
-                if float(sent.get("last24h") or 0.0) > 0.20:
-                    sigma_ann_post = float(np.clip(sigma_ann_post * 0.97, 1e-4, SIGMA_CAP))
-                sigma_ann = sigma_ann_post
+            mu_ann, sigma_ann, fusion_diag = fuse_dynamic_factors(
+                mu_ann,
+                sigma_ann,
+                news=None,
+                sentiment=sent,
+                earnings=earn,
+                macro=macr,
+                options=options_prior,
+                futures=futures_prior,
+                use_exogenous=bool(USE_SIM_BIAS),
+                mu_bounds=(-mu_cap, mu_cap),
+                sigma_bounds=(1e-4, SIGMA_CAP),
+            )
 
-                fusion_diag = {
-                    "use_sim_bias": True,
-                    "mu_ann_pre": mu_ann_pre,
-                    "mu_ann_post": float(mu_ann),
-                    "sigma_ann_pre": sigma_ann_pre,
-                    "sigma_ann_post": float(sigma_ann),
-                    "mu_bias": float(mu_bias),
-                    "sent": {
-                        "avg_sent_7d": sent_avg,
-                        "last24h": float(sent.get("last24h") or 0.0),
-                        "n_news": int(sent.get("n_news") or 0),
-                    },
-                    "earn": {
-                        "surprise_last": earn_surprise,
-                        "guidance_delta": float(earn.get("guidance_delta") or 0.0),
-                        "days_since_earn": earn.get("days_since_earn"),
-                        "days_to_next": earn.get("days_to_next"),
-                    },
-                    "macro": {
-                        "rff": (float(macr.get("rff")) if macr.get("rff") is not None else None),
-                        "cpi_yoy": (float(macr.get("cpi_yoy")) if macr.get("cpi_yoy") is not None else None),
-                        "u_rate": (float(macr.get("u_rate")) if macr.get("u_rate") is not None else None),
-                    },
-                }
+            fusion_diag = fusion_diag or {}
+            fusion_diag.setdefault("use_sim_bias", bool(USE_SIM_BIAS))
+            if context_diag:
+                fs_diag = context_diag.get("feature_store")
+                if fs_diag:
+                    fusion_diag.setdefault("feature_store", fs_diag)
 
             await _update_run_state(redis, run_id, rs, progress=42.0, detail="Blending context signals")
 
@@ -3869,6 +3859,32 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             # Final small calibration
             sigma_scale = _calibration_sigma_scale(req.symbol, int(req.horizon_days))
             sigma_adj = float(np.clip(sigma_adj * sigma_scale, 1e-4, 2.0))
+
+            now_state = datetime.now(timezone.utc)
+            jumps_diag = fusion_diag.get("jumps", {}) if fusion_diag else {}
+            provenance: dict[str, Any] = {
+                "symbol": req.symbol,
+                "horizon_days": int(req.horizon_days),
+                "feature_store": dict(context_diag.get("feature_store") or {}),
+                "generated_at": now_state.isoformat(),
+                "options_prior": options_prior,
+                "futures_prior": futures_prior,
+            }
+            state_vector = StateVector(
+                t=now_state,
+                spot=float(S0),
+                drift_annual=float(mu_adj),
+                vol_annual=float(sigma_adj),
+                jump_intensity=float(jumps_diag.get("intensity") or 0.0),
+                jump_mean=float(jumps_diag.get("mean") or 0.0),
+                jump_vol=float(jumps_diag.get("vol") or 0.0),
+                regime=str(reg.get("name", "unknown")),
+                macro=dict(macr or {}),
+                sentiment=dict(sent or {}),
+                events=[],
+                cross={},
+                provenance=provenance,
+            )
 
             # ---------- Seed (stable per-day) ----------
             import zlib
@@ -4100,6 +4116,8 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             if fusion_diag:
                 artifact.setdefault("diagnostics", {}).update(fusion_diag)
+            if state_vector is not None:
+                artifact.setdefault("diagnostics", {})["context"] = state_vector.to_dict()
 
             await _update_run_state(redis, run_id, rs, progress=90.0, detail="Persisting results")
 
@@ -5899,6 +5917,7 @@ async def quant_daily_today(
     if not out.get("equity") or not out.get("crypto"):
         out = await _run_daily_quant()
 
+    ensure_daily_snapshot(out, default_horizon=horizon_days)
     return out
 
 
