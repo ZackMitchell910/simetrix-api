@@ -51,6 +51,7 @@ from src.observability import get_recent_logs
 from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.services import auth as auth_service
+from src.routes.quant import ensure_daily_snapshot
 from src.services.quant_daily import fetch_minimal_summary
 from src.routes.quant import ensure_daily_snapshot_payload
 from src.services.labeling import (
@@ -69,6 +70,8 @@ from src.services.quant_utils import (
     winsorize,
 )
 from src.services.quant_mc import latest_mc_metric as service_latest_mc_metric
+from src.state import StateVector
+from src.state.estimation import fuse_dynamic_factors
 from src.services.quant_candidates import llm_shortlist as service_llm_shortlist
 from src.services.quant_scheduler import (
     quant_budget_key as service_quant_budget_key,
@@ -4056,6 +4059,32 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             sigma_adj = float(np.clip(sigma_adj * sigma_scale, 1e-4, 2.0))
             mu_diag_final = float(mu_adj)
             sigma_diag_final = float(sigma_adj)
+
+            now_state = datetime.now(timezone.utc)
+            jumps_diag = fusion_diag.get("jumps", {}) if fusion_diag else {}
+            provenance: dict[str, Any] = {
+                "symbol": req.symbol,
+                "horizon_days": int(req.horizon_days),
+                "feature_store": dict(context_diag.get("feature_store") or {}),
+                "generated_at": now_state.isoformat(),
+                "options_prior": options_prior,
+                "futures_prior": futures_prior,
+            }
+            state_vector = StateVector(
+                t=now_state,
+                spot=float(S0),
+                drift_annual=float(mu_adj),
+                vol_annual=float(sigma_adj),
+                jump_intensity=float(jumps_diag.get("intensity") or 0.0),
+                jump_mean=float(jumps_diag.get("mean") or 0.0),
+                jump_vol=float(jumps_diag.get("vol") or 0.0),
+                regime=str(reg.get("name", "unknown")),
+                macro=dict(macr or {}),
+                sentiment=dict(sent or {}),
+                events=[],
+                cross={},
+                provenance=provenance,
+            )
 
             # ---------- Seed (stable per-day) ----------
             import zlib

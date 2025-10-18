@@ -31,18 +31,54 @@ class MinimalSummary:
     base_price: float
     predicted_price: float
     bullish_price: float
+    spot_price: float
+    median_return_pct: float
+    blurb: str | None = None
 
     def as_dict(self) -> Dict[str, Any]:
         price_pred = self.predicted_price if math.isfinite(self.predicted_price) else self.base_price
         bullish = self.bullish_price if math.isfinite(self.bullish_price) else self.base_price
-        return {
+        spot = self.spot_price if math.isfinite(self.spot_price) and self.spot_price > 0 else price_pred
+        median_ret = self.median_return_pct
+        if not math.isfinite(median_ret):
+            try:
+                median_ret = float(((self.base_price / spot) - 1.0) * 100.0)
+            except Exception:
+                median_ret = float("nan")
+        blurb = (self.blurb or "").strip()
+        if not blurb:
+            blurb = _format_blurb(self.symbol, self.horizon_days, self.prob_up, median_ret)
+        payload = {
             "symbol": self.symbol,
+            "horizon_days": int(self.horizon_days),
+            "prob_up_end": float(self.prob_up),
+            "median_return_pct": round(median_ret, 3) if math.isfinite(median_ret) else None,
             "prob_up_30d": round(self.prob_up, 4),
             "base_price": round(self.base_price, 2),
             "predicted_price": round(price_pred, 2),
             "bullish_price": round(bullish, 2),
+            "spot_price": round(spot, 2) if math.isfinite(spot) else None,
+            "blurb": blurb,
             "p95": round(bullish, 2),  # legacy alias
         }
+        return payload
+
+
+def _format_blurb(symbol: str, horizon_days: int, prob_up: float, median_return_pct: float) -> str:
+    sym = symbol.upper().strip()
+    prob_pct = prob_up * 100.0
+    if math.isfinite(median_return_pct):
+        return f"{sym}: {horizon_days}d outlook P(up)≈{prob_pct:.0f}%, median ≈{median_return_pct:.1f}%"
+    return f"{sym}: {horizon_days}d outlook P(up)≈{prob_pct:.0f}%"
+
+
+def _median_return_pct(base_price: Optional[float], spot_price: Optional[float]) -> Optional[float]:
+    if base_price is None or spot_price is None or spot_price <= 0:
+        return None
+    try:
+        return float(((float(base_price) / float(spot_price)) - 1.0) * 100.0)
+    except Exception:
+        return None
 
 
 def _to_number(value: Any) -> Optional[float]:
@@ -172,6 +208,12 @@ async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any
                 if None not in (prob, base, bull):
                     if pred is None:
                         pred = base
+                    spot = _to_number(doc.get("spot_price") or doc.get("spot0") or doc.get("spot"))
+                    spot_val = float(spot) if spot is not None and math.isfinite(spot) else float(base)
+                    median_pct = _to_number(doc.get("median_return_pct"))
+                    if median_pct is None or not math.isfinite(median_pct):
+                        maybe_med = _median_return_pct(base, spot_val)
+                        median_pct = maybe_med if maybe_med is not None else float("nan")
                     summary = MinimalSummary(
                         symbol=symbol_clean,
                         horizon_days=horizon_days,
@@ -179,6 +221,9 @@ async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any
                         base_price=base,
                         predicted_price=pred,
                         bullish_price=bull,
+                        spot_price=spot_val,
+                        median_return_pct=float(median_pct),
+                        blurb=str(doc.get("blurb") or ""),
                     )
                     return summary.as_dict()
         except Exception:
@@ -233,6 +278,7 @@ async def _compute_minimal_summary(symbol: str, horizon_days: int) -> MinimalSum
     prob_up = float(np.mean(terminal > s0))
     base_price = float(np.median(terminal))
     bullish_price = float(np.percentile(terminal, 95))
+    median_return_pct = float(np.median(terminal / s0 - 1.0) * 100.0)
 
     predicted_price = base_price
     valid = terminal[np.isfinite(terminal) & (terminal > 0)]
@@ -257,6 +303,8 @@ async def _compute_minimal_summary(symbol: str, horizon_days: int) -> MinimalSum
         base_price=base_price,
         predicted_price=predicted_price,
         bullish_price=bullish_price,
+        spot_price=float(s0),
+        median_return_pct=median_return_pct,
     )
 
 
@@ -291,6 +339,9 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
     base = _to_number(info.get("base_price"))
     predicted = _to_number(info.get("predicted_price", info.get("most_likely_price")))
     bullish = _to_number(info.get("bullish_price", info.get("p95")))
+    spot = _to_number(info.get("spot_price") or info.get("spot0") or info.get("spot"))
+    median_pct = _to_number(info.get("median_return_pct"))
+    blurb = str(info.get("blurb") or "").strip()
 
     if base is None:
         spot = _to_number(info.get("spot0") or info.get("spot"))
@@ -301,6 +352,9 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
     if predicted is None:
         predicted = base
 
+    spot_val: float
+    median_val: Optional[float]
+
     if prob is None or base is None or bullish is None:
         refreshed = await _refresh_summary(symbol_clean, horizon_days)
         if refreshed is None:
@@ -309,6 +363,10 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
         base = refreshed.base_price
         predicted = refreshed.predicted_price
         bullish = refreshed.bullish_price
+        spot_val = float(refreshed.spot_price)
+        median_val = float(refreshed.median_return_pct)
+        if not blurb:
+            blurb = refreshed.blurb or ""
     else:
         if predicted is None:
             predicted = base
@@ -328,11 +386,24 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
                         predicted = _to_number(art_doc.get("most_likely_price"))
             except Exception:
                 pass
+        if spot is not None and math.isfinite(spot):
+            spot_val = float(spot)
+        else:
+            spot_val = float(base)
+        if median_pct is not None and math.isfinite(median_pct):
+            median_val = float(median_pct)
+        else:
+            median_val = _median_return_pct(base, spot_val)
 
     if predicted is None:
         predicted = base
     if None in (prob, base, predicted, bullish):
         return None
+
+    if median_val is None:
+        median_val = _median_return_pct(base, spot_val)
+    if median_val is None:
+        median_val = float("nan")
 
     summary = MinimalSummary(
         symbol=symbol_clean,
@@ -341,6 +412,9 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
         base_price=base,
         predicted_price=predicted,
         bullish_price=bullish,
+        spot_price=spot_val,
+        median_return_pct=float(median_val),
+        blurb=blurb,
     )
     return summary.as_dict()
 
