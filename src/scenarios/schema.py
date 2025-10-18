@@ -2,23 +2,23 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict
+from typing import Any, Mapping
+
+__all__ = ["EventShock"]
 
 
-@dataclass
+@dataclass(slots=True)
 class EventShock:
-    """Structured shock injected by the scenario generator."""
-
     id: str
     title: str
     window_start: datetime
     window_end: datetime
     p: float
-    overrides: Dict[str, Any] = field(default_factory=dict)
-    trigger: str = "macro"
+    overrides: Mapping[str, Any] = field(default_factory=dict)
+    trigger: str = ""
     rationale: str = ""
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "id": self.id,
             "title": self.title,
@@ -29,6 +29,3 @@ class EventShock:
             "trigger": self.trigger,
             "rationale": self.rationale,
         }
-
-
-__all__ = ["EventShock"]

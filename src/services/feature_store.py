@@ -1,206 +1,107 @@
 from __future__ import annotations
 
 import asyncio
-import json
-import sqlite3
+import inspect
+import pickle
 import time
-from contextlib import closing
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping, MutableMapping, Optional
+from collections import defaultdict
+from typing import Any, Awaitable, Callable, Mapping
 
-from src.core import DATA_ROOT, REDIS
+from redis.asyncio import Redis
 
-RedisType = Any  # redis.asyncio.Redis but kept generic to avoid optional import issues
+from src.core import REDIS
+from src.observability import log_json
 
-
-def _json_default(value: Any) -> Any:
-    if isinstance(value, (set, tuple)):
-        return list(value)
-    if hasattr(value, "isoformat"):
-        try:
-            return value.isoformat()
-        except Exception:  # pragma: no cover - defensive
-            pass
-    raise TypeError(f"Value of type {type(value)!r} is not JSON serializable")
+CacheLoader = Callable[[], Awaitable[Any] | Any]
 
 
-class FeatureStoreCache:
-    def __init__(self, redis: Optional[RedisType] = None, sqlite_path: Optional[Path] = None) -> None:
-        self._redis = redis
-        self._sqlite_path = sqlite_path or (Path(DATA_ROOT) / "feature_store_cache.sqlite")
-        self._sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_sqlite()
+class FeatureStore:
+    """Thin async cache wrapper backed by Redis with an in-process fallback."""
 
-    def _ensure_sqlite(self) -> None:
-        con = sqlite3.connect(self._sqlite_path)
-        try:
-            con.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cache (
-                    namespace TEXT NOT NULL,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    expires_at REAL NOT NULL,
-                    PRIMARY KEY (namespace, key)
-                )
-                """
-            )
-            con.commit()
-        finally:
-            con.close()
+    def __init__(self, redis: Redis | None = None) -> None:
+        self._redis = redis or REDIS
+        self._local: dict[str, tuple[float, Any]] = {}
+        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._lock = asyncio.Lock()
 
-    async def _sqlite_get(self, namespace: str, key: str, now: float) -> Any | None:
-        def _get() -> Any | None:
-            with closing(sqlite3.connect(self._sqlite_path)) as con:
-                row = con.execute(
-                    "SELECT value, expires_at FROM cache WHERE namespace = ? AND key = ?",
-                    [namespace, key],
-                ).fetchone()
-                if not row:
-                    return None
-                value, expires_at = row
-                if expires_at < now:
-                    con.execute("DELETE FROM cache WHERE namespace = ? AND key = ?", [namespace, key])
-                    con.commit()
-                    return None
-                return json.loads(value)
-
-        return await asyncio.to_thread(_get)
-
-    async def _sqlite_set(self, namespace: str, key: str, value: Any, expires_at: float) -> None:
-        payload = json.dumps(value, default=_json_default)
-
-        def _set() -> None:
-            with closing(sqlite3.connect(self._sqlite_path)) as con:
-                con.execute(
-                    "REPLACE INTO cache(namespace, key, value, expires_at) VALUES (?,?,?,?)",
-                    [namespace, key, payload, expires_at],
-                )
-                con.commit()
-
-        await asyncio.to_thread(_set)
-
-    def _redis_key(self, namespace: str, key: str) -> str:
-        return f"fs:{namespace}:{key}"
-
-    async def fetch(
+    async def get_or_load(
         self,
         namespace: str,
         key: str,
-        loader: Callable[[], Awaitable[Any] | Any],
+        loader: CacheLoader,
         *,
-        ttl: int = 3600,
-        diagnostics: MutableMapping[str, Any] | None = None,
-        default: Any | None = None,
+        ttl: int = 900,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> Any:
-        now = time.time()
-        redis = self._redis
-        cache_key = self._redis_key(namespace, key)
-        diag = diagnostics.setdefault("feature_store", {}) if diagnostics is not None else None
+        composite = f"feature:{namespace}:{key}"
+        start = time.perf_counter()
+        cached = await self._read(composite)
+        cold = cached is None
 
-        if redis is not None:
+        if cold:
+            lock = await self._lock_for(composite)
+            async with lock:
+                cached = await self._read(composite)
+                if cached is None:
+                    result = loader()
+                    if inspect.isawaitable(result):
+                        result = await result  # type: ignore[assignment]
+                    await self._write(composite, result, ttl)
+                    cached = result
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        log_json(
+            "info",
+            msg="feature_store_cache",
+            namespace=namespace,
+            key=key,
+            hit=not cold,
+            duration_ms=round(elapsed_ms, 3),
+            backend="redis" if self._redis else "memory",
+            diagnostics=diagnostics or {},
+        )
+        return cached
+
+    async def _lock_for(self, key: str) -> asyncio.Lock:
+        async with self._lock:
+            return self._locks[key]
+
+    async def _read(self, composite: str) -> Any:
+        now = time.monotonic()
+
+        if self._redis:
             try:
-                cached = await redis.get(cache_key)
+                raw = await self._redis.get(composite)
             except Exception:
-                cached = None
-            if cached:
+                raw = None
+            if raw:
                 try:
-                    data = json.loads(cached)
-                except Exception:
-                    data = None
-                if data is not None:
-                    self._record_diag(diag, namespace, hit=True, source="redis", latency_ms=0.0)
-                    return data
-
-        sqlite_hit = await self._sqlite_get(namespace, key, now)
-        if sqlite_hit is not None:
-            self._record_diag(diag, namespace, hit=True, source="sqlite", latency_ms=0.0)
-            if redis is not None:
-                try:
-                    await redis.setex(cache_key, ttl, json.dumps(sqlite_hit, default=_json_default))
+                    return pickle.loads(raw)
                 except Exception:
                     pass
-            return sqlite_hit
 
-        start = time.perf_counter()
-        try:
-            value = loader()
-            if asyncio.iscoroutine(value):
-                value = await value
-        except Exception:
-            self._record_diag(diag, namespace, hit=False, source="loader", latency_ms=(time.perf_counter() - start) * 1000.0, error=True)
-            if default is not None:
-                return default
-            raise
+        expiry, payload = self._local.get(composite, (0.0, None))
+        if expiry and expiry > now:
+            return payload
+        if composite in self._local:
+            self._local.pop(composite, None)
+        return None
 
-        latency_ms = (time.perf_counter() - start) * 1000.0
-        self._record_diag(diag, namespace, hit=False, source="loader", latency_ms=latency_ms)
+    async def _write(self, composite: str, value: Any, ttl: int) -> None:
+        expires_at = time.monotonic() + float(max(1, ttl))
+        self._local[composite] = (expires_at, value)
 
-        if value is None:
-            return default
-
-        expires_at = now + ttl
-        await self._sqlite_set(namespace, key, value, expires_at)
-        if redis is not None:
-            try:
-                await redis.setex(cache_key, ttl, json.dumps(value, default=_json_default))
-            except Exception:
-                pass
-        return value
-
-    @staticmethod
-    def _record_diag(
-        diagnostics: MutableMapping[str, Any] | None,
-        namespace: str,
-        *,
-        hit: bool,
-        source: str,
-        latency_ms: float,
-        error: bool = False,
-    ) -> None:
-        if diagnostics is None:
+        if not self._redis:
             return
-        diagnostics.setdefault("hits", 0)
-        diagnostics.setdefault("misses", 0)
-        diagnostics.setdefault("namespaces", {})
-        ns_diag = diagnostics["namespaces"].setdefault(namespace, {})
-
-        if hit:
-            diagnostics["hits"] += 1
-            ns_diag["last_hit_source"] = source
-            ns_diag["last_hit_ms"] = round(latency_ms, 3)
-            last_miss = ns_diag.get("last_miss_ms")
-            if last_miss:
-                improvement = max(0.0, 1.0 - (ns_diag["last_hit_ms"] / last_miss))
-                ns_diag["latency_improvement"] = round(improvement, 3)
-        else:
-            diagnostics["misses"] += 1
-            ns_diag["last_miss_source"] = source
-            ns_diag["last_miss_ms"] = round(latency_ms, 3)
-            if error:
-                ns_diag["error"] = True
+        try:
+            payload = pickle.dumps(value)
+            await self._redis.setex(composite, ttl, payload)
+        except Exception:
+            # Redis write failures should not break callers; they simply fall back
+            # to the in-process cache.
+            pass
 
 
-FEATURE_STORE_CACHE = FeatureStoreCache(redis=REDIS)
+FEATURE_STORE = FeatureStore()
 
-
-async def cached_feature(
-    namespace: str,
-    key: str,
-    loader: Callable[[], Awaitable[Any] | Any],
-    *,
-    ttl: int = 3600,
-    diagnostics: MutableMapping[str, Any] | None = None,
-    default: Any | None = None,
-) -> Any:
-    return await FEATURE_STORE_CACHE.fetch(
-        namespace,
-        key,
-        loader,
-        ttl=ttl,
-        diagnostics=diagnostics,
-        default=default,
-    )
-
-
-__all__ = ["FEATURE_STORE_CACHE", "cached_feature", "FeatureStoreCache"]
+__all__ = ["FeatureStore", "FEATURE_STORE"]

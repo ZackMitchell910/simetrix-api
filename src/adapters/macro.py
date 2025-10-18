@@ -1,31 +1,41 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime, timedelta
+from typing import Mapping
 
-from . import AdapterFrame, AdapterRecord
-
-
-async def fetch(symbol: str, asof: datetime | None = None, window: int = 30) -> AdapterFrame:
-    """Fetch macro signals relevant for the symbol universe."""
-
-    now = asof or datetime.now(timezone.utc)
-    payload: dict[str, Any] = {
-        "window_days": int(max(1, window)),
-        "macro": {
-            "rff": None,
-            "cpi_yoy": None,
-            "u_rate": None,
-        },
-    }
-    record = AdapterRecord(
-        symbol=symbol.upper(),
-        asof=now,
-        source="macro",
-        confidence=0.0,
-        payload=payload,
-    )
-    return [record]
-
+from src.adapters.base import AdapterFrame, coerce_window
+from src.services.feature_store import FEATURE_STORE
 
 __all__ = ["fetch"]
+
+_TTL_SECONDS = 12 * 3600
+
+
+async def fetch(symbol: str, asof: datetime, window: timedelta | int | None = None) -> AdapterFrame:
+    window_td = coerce_window(window, default_days=30)
+    cache_key = f"{symbol.upper()}:{int(window_td.total_seconds())}"
+
+    async def _loader() -> Mapping[str, object]:
+        return {
+            "source": "macro",
+            "data": [],
+            "confidence": 0.0,
+            "metadata": {"window_seconds": int(window_td.total_seconds())},
+        }
+
+    payload = await FEATURE_STORE.get_or_load(
+        "macro",
+        cache_key,
+        _loader,
+        ttl=_TTL_SECONDS,
+        diagnostics={"symbol": symbol.upper(), "window_seconds": int(window_td.total_seconds())},
+    )
+
+    return AdapterFrame(
+        symbol=symbol,
+        asof=asof,
+        source=str(payload.get("source", "macro")),
+        confidence=float(payload.get("confidence", 0.0)),
+        payload=payload.get("data") or [],
+        metadata={**(payload.get("metadata") or {}), "window_seconds": int(window_td.total_seconds())},
+    )

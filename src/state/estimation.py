@@ -1,139 +1,87 @@
 from __future__ import annotations
 
-from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence
 
-import math
-from typing import Any, Mapping
+from src.scenarios.schema import EventShock
+from src.state.contracts import StateVector
 
-
-def _to_float(value: Any) -> float | None:
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return None
-    return num if math.isfinite(num) else None
+__all__ = ["DynamicFactorInputs", "apply_dynamic_factors"]
 
 
-def _kalman_blend(prior: float, measurement: float, prior_var: float, meas_var: float) -> tuple[float, float, float]:
-    gain = prior_var / (prior_var + meas_var)
-    posterior = prior + gain * (measurement - prior)
-    posterior_var = (1.0 - gain) * prior_var
-    return posterior, posterior_var, gain
+@dataclass(slots=True)
+class DynamicFactorInputs:
+    drift_prior: float | None = None
+    drift_confidence: float = 0.0
+    vol_prior: float | None = None
+    vol_confidence: float = 0.0
+    jump_intensity: float | None = None
+    jump_mean: float | None = None
+    jump_vol: float | None = None
+    news_bias: float = 0.0
+    sentiment_bias: float = 0.0
+    macro: Mapping[str, Any] = field(default_factory=dict)
+    sentiment: Mapping[str, Any] = field(default_factory=dict)
+    cross: Mapping[str, Any] = field(default_factory=dict)
+    events: Sequence[EventShock] = field(default_factory=list)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
 
-def fuse_dynamic_factors(
-    mu_prior: float,
-    sigma_prior: float,
-    *,
-    news: Mapping[str, Any] | None = None,
-    sentiment: Mapping[str, Any] | None = None,
-    earnings: Mapping[str, Any] | None = None,
-    macro: Mapping[str, Any] | None = None,
-    options: Mapping[str, Any] | None = None,
-    futures: Mapping[str, Any] | None = None,
-    use_exogenous: bool = True,
-    mu_bounds: tuple[float, float] = (-1.5, 1.5),
-    sigma_bounds: tuple[float, float] = (1e-4, 5.0),
-) -> tuple[float, float, dict[str, Any]]:
-    """Blend heterogeneous signals into drift/volatility updates.
+def _kalman_blend(prior: float, signal: float, confidence: float) -> float:
+    weight = max(0.0, min(1.0, float(confidence)))
+    return float(prior * (1.0 - weight) + signal * weight)
 
-    The function applies simple Kalman-like updates for priors (options/futures) and
-    linear tilts for exogenous signals (news, sentiment, macro). Diagnostics capture
-    each contribution so downstream consumers can audit the adjustments.
+
+def _bounded(value: float, lower: float, upper: float) -> float:
+    return float(max(lower, min(upper, value)))
+
+
+def apply_dynamic_factors(prior: StateVector, inputs: DynamicFactorInputs) -> StateVector:
+    """Fuse exogenous signals into a new :class:`StateVector`.
+
+    The function intentionally implements a lightweight Kalman-style update so
+    that downstream code has sane defaults even without the heavy statistical
+    stack in place.  News and sentiment enter as small tilts on the drift,
+    options-implied volatility flows through ``vol_prior`` and macro/credit
+    spreads flow via the ``macro`` and ``cross`` payloads.
     """
 
-    mu_low, mu_high = mu_bounds
-    sig_low, sig_high = sigma_bounds
+    drift = prior.drift_annual
+    if inputs.drift_prior is not None:
+        drift = _kalman_blend(drift, float(inputs.drift_prior), inputs.drift_confidence)
+    drift += 0.05 * float(inputs.news_bias) + 0.03 * float(inputs.sentiment_bias)
+    drift = _bounded(drift, -1.5, 1.5)
 
-    mu_post = float(mu_prior)
-    sigma_post = float(sigma_prior)
+    vol = prior.vol_annual
+    if inputs.vol_prior is not None:
+        vol = _kalman_blend(vol, float(inputs.vol_prior), inputs.vol_confidence)
+    vol = _bounded(vol, 1e-4, 5.0)
 
-    diagnostics: dict[str, Any] = {
-        "mu_pre": float(mu_prior),
-        "sigma_pre": float(sigma_prior),
-        "contributors": {},
-        "jumps": {"intensity": 0.02, "mean": 0.0, "vol": 0.0},
-    }
+    jump_intensity = inputs.jump_intensity if inputs.jump_intensity is not None else prior.jump_intensity
+    jump_mean = inputs.jump_mean if inputs.jump_mean is not None else prior.jump_mean
+    jump_vol = inputs.jump_vol if inputs.jump_vol is not None else prior.jump_vol
+    jump_intensity = _bounded(float(jump_intensity), 0.0, 5.0)
+    jump_vol = _bounded(float(jump_vol), 0.0, 5.0)
 
-    contributors = diagnostics["contributors"]
+    macro = {**dict(prior.macro), **dict(inputs.macro)}
+    sentiment = {**dict(prior.sentiment), **dict(inputs.sentiment)}
+    cross = {**dict(prior.cross), **dict(inputs.cross)}
+    provenance = {**dict(prior.provenance), **dict(inputs.provenance)}
 
-    if options:
-        iv = _to_float(options.get("iv") or options.get("sigma"))
-        if iv is not None and iv > 0:
-            sigma_post, posterior_var, gain = _kalman_blend(sigma_post, iv, prior_var=0.10, meas_var=0.20)
-            sigma_post = float(max(sig_low, min(sig_high, sigma_post)))
-            contributors["options"] = {"iv": iv, "kalman_gain": float(gain), "posterior_var": float(posterior_var)}
+    events = list(inputs.events or prior.events)
 
-    if futures:
-        drift_hint = _to_float(futures.get("drift") or futures.get("annualized_return"))
-        if drift_hint is not None:
-            mu_post, _, gain = _kalman_blend(mu_post, drift_hint, prior_var=0.05, meas_var=0.12)
-            contributors["futures"] = {"drift": drift_hint, "kalman_gain": float(gain)}
-
-    sent_last24 = 0.0
-    sent_avg = 0.0
-    if use_exogenous and sentiment:
-        sent_last24 = _to_float(sentiment.get("last24h")) or 0.0
-        sent_avg = _to_float(sentiment.get("avg_sent_7d")) or 0.0
-        mu_shift_raw = sent_last24 * 0.12 + sent_avg * 0.05
-        mu_shift = float(max(-0.2, min(0.2, mu_shift_raw)))
-        mu_post += mu_shift
-        contributors["sentiment"] = {
-            "mu_shift": mu_shift,
-            "avg_sent_7d": sent_avg,
-            "last24h": sent_last24,
-        }
-
-    if use_exogenous and earnings:
-        surprise = _to_float(earnings.get("surprise_last")) or 0.0
-        guidance = _to_float(earnings.get("guidance_delta")) or 0.0
-        mu_shift = 0.04 * surprise + 0.02 * guidance
-        mu_post += mu_shift
-        contributors["earnings"] = {
-            "mu_shift": mu_shift,
-            "surprise_last": surprise,
-            "guidance_delta": guidance,
-        }
-
-    if use_exogenous and macro:
-        rff = _to_float(macro.get("rff"))
-        u_rate = _to_float(macro.get("u_rate"))
-        macro_tilt = 0.0
-        if rff is not None:
-            macro_tilt += -0.02 * max(0.0, rff - 0.04)
-        if u_rate is not None:
-            macro_tilt += -0.03 * max(0.0, u_rate - 0.06)
-        mu_post += macro_tilt
-        contributors["macro"] = {"mu_shift": macro_tilt, "rff": rff, "u_rate": u_rate}
-
-    if news and use_exogenous:
-        try:
-            sentiment_signal = float(news.get("sentiment"))
-        except Exception:
-            sentiment_signal = 0.0
-        vol_shift = 0.05 * abs(sentiment_signal)
-        sigma_post += vol_shift
-        contributors["news"] = {"vol_shift": vol_shift, "sentiment": sentiment_signal}
-
-    mu_post = float(max(mu_low, min(mu_high, mu_post)))
-    sigma_post = float(max(sig_low, min(sig_high, sigma_post)))
-
-    jump_intensity = diagnostics["jumps"]["intensity"] + abs(sent_last24) * 0.05
-    if news and use_exogenous:
-        jump_intensity += 0.05
-    diagnostics["jumps"].update(
-        {
-            "intensity": float(max(0.0, jump_intensity)),
-            "mean": float(sent_avg * 0.02),
-            "vol": float(max(0.0, 0.10 + abs(sent_last24) * 0.05)),
-        }
+    return StateVector(
+        t=prior.t,
+        spot=prior.spot,
+        drift_annual=drift,
+        vol_annual=vol,
+        jump_intensity=jump_intensity,
+        jump_mean=jump_mean,
+        jump_vol=jump_vol,
+        regime=prior.regime,
+        macro=macro,
+        sentiment=sentiment,
+        events=events,
+        cross=cross,
+        provenance=provenance,
     )
-
-    diagnostics["mu_post"] = mu_post
-    diagnostics["sigma_post"] = sigma_post
-    diagnostics["use_exogenous"] = bool(use_exogenous)
-
-    return mu_post, sigma_post, diagnostics
-
-
-__all__ = ["fuse_dynamic_factors"]

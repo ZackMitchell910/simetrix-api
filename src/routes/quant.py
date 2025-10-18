@@ -1,96 +1,55 @@
+"""Helpers for Quant routes.
+
+The public ``/quant/daily/today`` endpoint serves two distinct payloads: the
+dashboard snapshot (equity/crypto picks, finalists, etc.) and the on-demand
+minimal summary for a single ticker. Historically, the cached snapshot payload
+could lack a handful of keys that the frontend now expects (``prob_up_end``,
+``median_return_pct``, ``horizon_days`` and ``blurb``).  When stale data sneaks
+in, the DailyQuant card falls back to placeholder copy and breaks the "Open in
+Simulator" deep-link.
+
+To make the route resilient, we sanitise every card-shaped document before it
+is returned to the caller.  The sanitisation logic lives in
+``src.services.quant_daily.normalize_pick_document`` so it can be re-used by the
+prefill jobs and adapters.
+"""
+
 from __future__ import annotations
 
-import math
-from collections.abc import Mapping, MutableMapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any
 
+from src.services.quant_daily import normalize_pick_document
 
-def _to_float(value: Any) -> float | None:
-    try:
-        num = float(value)
-    except (TypeError, ValueError):
-        return None
-    return num if math.isfinite(num) else None
+__all__ = ["ensure_daily_snapshot_payload"]
 
 
-def _ensure_median(pick: Mapping[str, Any], spot: float | None, base: float | None) -> float | None:
-    median = _to_float(pick.get("median_return_pct"))
-    if median is not None:
-        return median
-    if base is None or spot is None or spot <= 0:
-        return None
-    try:
-        return ((base / spot) - 1.0) * 100.0
-    except ZeroDivisionError:
-        return None
+def _normalise_sequence(items: Any, fallback_horizon: int | None) -> list[dict[str, Any]]:
+    if not isinstance(items, Sequence):
+        return []
+    normalised: list[dict[str, Any]] = []
+    for entry in items:
+        doc = normalize_pick_document(entry, fallback_horizon=fallback_horizon)
+        if doc:
+            normalised.append(doc)
+    return normalised
 
 
-def _format_blurb(symbol: str, horizon: int, prob: float | None, median: float | None) -> str:
-    sym = symbol.upper().strip()
-    pieces: list[str] = []
-    if prob is not None:
-        pieces.append(f"P(up)≈{prob * 100.0:.0f}%")
-    if median is not None:
-        pieces.append(f"median ≈{median:.1f}%")
-    if pieces:
-        details = ", ".join(pieces)
-        return f"{sym}: {horizon}d outlook {details}"
-    return f"{sym}: {horizon}d outlook pending signals"
+def ensure_daily_snapshot_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    fallback_horizon: int | None = None,
+) -> dict[str, Any]:
+    """Return a defensive copy of *payload* with pick documents normalised."""
 
+    data: dict[str, Any] = dict(payload or {})
+    data["equity"] = normalize_pick_document(data.get("equity"), fallback_horizon=fallback_horizon)
+    data["crypto"] = normalize_pick_document(data.get("crypto"), fallback_horizon=fallback_horizon)
 
-def ensure_daily_pick_fields(pick: Mapping[str, Any], *, horizon_default: int | None = None) -> dict[str, Any]:
-    data = dict(pick or {})
-    symbol = str(data.get("symbol") or "").upper()
-    horizon = data.get("horizon_days")
-    if horizon is None:
-        horizon = horizon_default if horizon_default is not None else 30
-    try:
-        horizon = int(horizon)
-    except Exception:
-        horizon = 30
-    prob = _to_float(data.get("prob_up_end") or data.get("prob_up_30d") or data.get("prob_up"))
-    base = _to_float(data.get("base_price"))
-    spot = _to_float(data.get("spot_price") or data.get("spot0") or data.get("spot"))
-    if spot is None and base is not None and data.get("median_return_pct") is not None:
-        median_candidate = _to_float(data.get("median_return_pct"))
-        if median_candidate is not None:
-            spot = base / (1.0 + median_candidate / 100.0)
-    if spot is None and base is not None:
-        spot = base
-    median = _ensure_median(data, spot, base)
-    blurb = str(data.get("blurb") or "").strip()
-    if not blurb:
-        blurb = _format_blurb(symbol, horizon, prob, median)
+    for key in ("equity_top", "crypto_top", "equity_finalists", "crypto_finalists"):
+        data[key] = _normalise_sequence(data.get(key), fallback_horizon)
 
-    data.update(
-        {
-            "symbol": symbol,
-            "horizon_days": horizon,
-            "prob_up_end": prob,
-            "median_return_pct": median,
-            "spot_price": spot,
-            "blurb": blurb,
-        }
-    )
+    if fallback_horizon is not None and not data.get("horizon_days"):
+        data["horizon_days"] = int(fallback_horizon)
+
     return data
-
-
-def ensure_daily_snapshot(payload: MutableMapping[str, Any], *, default_horizon: int | None = None) -> MutableMapping[str, Any]:
-    for key in ("equity", "crypto"):
-        pick = payload.get(key)
-        if isinstance(pick, Mapping):
-            payload[key] = ensure_daily_pick_fields(pick, horizon_default=default_horizon)
-
-    for list_key in ("equity_top", "crypto_top", "equity_finalists", "crypto_finalists"):
-        items = payload.get(list_key)
-        if isinstance(items, Sequence):
-            payload[list_key] = [
-                ensure_daily_pick_fields(item, horizon_default=default_horizon)
-                if isinstance(item, Mapping)
-                else item
-                for item in items
-            ]
-    return payload
-
-
-__all__ = ["ensure_daily_pick_fields", "ensure_daily_snapshot"]
