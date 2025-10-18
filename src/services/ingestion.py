@@ -9,7 +9,7 @@ import os
 import random
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import httpx
 import numpy as np
@@ -657,6 +657,56 @@ async def load_option_surface(symbol: str, asof: datetime | date | None = None) 
         if not math.isfinite(sigma_daily) or sigma_daily <= 0:
             continue
         sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0))
+        nodes.append({"days": int(days), "atm_iv": sigma_ann})
+
+    nodes.sort(key=lambda x: x["days"])
+    result["surface"] = nodes
+    result["status"] = "ok" if nodes else "empty"
+    return result
+
+
+async def load_futures_curve(symbol: str, asof: datetime | None = None) -> dict[str, Any]:
+    """Approximate a futures carry curve using recent realized drift as proxy."""
+
+    symbol_norm = (symbol or "").strip().upper()
+    asof_dt = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    closes = await fetch_cached_hist_prices(symbol_norm, 365)
+    arr = np.asarray(
+        [float(c) for c in closes if isinstance(c, (int, float)) and math.isfinite(float(c))],
+        dtype=float,
+    )
+
+    result: dict[str, Any] = {
+        "symbol": symbol_norm,
+        "asof": asof_dt.isoformat(),
+        "spot": float(arr[-1]) if arr.size else None,
+        "forwards": [],
+        "source": "realized_carry",
+    }
+
+    if arr.size < 5:
+        result["status"] = "insufficient_history"
+        result["annualized_carry"] = 0.0
+        return result
+
+    rets = np.diff(np.log(arr))
+    if rets.size >= 60:
+        mu_daily = float(np.mean(rets[-60:]))
+    else:
+        mu_daily = float(np.mean(rets)) if rets.size else 0.0
+
+    mu_ann = float(mu_daily * 252.0)
+    spot = float(arr[-1]) if arr.size else 0.0
+    horizons = [30, 60, 90, 180, 365]
+    forwards: list[dict[str, Any]] = []
+    for days in horizons:
+        price = float(spot * math.exp(mu_daily * days)) if spot > 0 else 0.0
+        forwards.append({"days": int(days), "price": price})
+
+    result["forwards"] = forwards
+    result["annualized_carry"] = mu_ann
+    result["status"] = "ok" if forwards else "empty"
+    return result
         surface.append({"tenor_days": int(window), "iv": sigma_ann})
 
     if not surface:
