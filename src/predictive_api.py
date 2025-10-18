@@ -52,6 +52,7 @@ from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.services import auth as auth_service
 from src.services.quant_daily import fetch_minimal_summary
+from src.routes.quant import ensure_daily_snapshot_payload
 from src.services.labeling import (
     label_outcomes as service_label_outcomes,
     labeler_pass as service_labeler_pass,
@@ -6112,7 +6113,9 @@ async def quant_daily_today(
     if not out.get("equity") or not out.get("crypto"):
         out = await _run_daily_quant()
 
-    return out
+    snapshot = ensure_daily_snapshot_payload(out, fallback_horizon=settings.daily_quant_horizon_days)
+    snapshot.setdefault("as_of", d)
+    return snapshot
 
 
 @app.get("/quant/daily/history")
