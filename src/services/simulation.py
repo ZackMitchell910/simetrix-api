@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from redis.asyncio import Redis
 
 from src.core import (
@@ -49,8 +49,26 @@ class SimRequest(BaseModel):
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
-    x_handles: List[str] = Field(default_factory=list, alias="handles")
+    x_handles: list[str] = Field(default_factory=list, alias="x_handles")
     seed: Optional[int] = None
+
+    @field_validator("x_handles", mode="before")
+    @classmethod
+    def _normalize_handles(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            parts = [segment.strip() for segment in value.split(",")]
+            return [p for p in parts if p]
+        handles: list[str] = []
+        if isinstance(value, Iterable):
+            for item in value:
+                if item is None:
+                    continue
+                text = str(item).strip()
+                if text:
+                    handles.append(text)
+        return handles
 
     @property
     def n_paths(self) -> int:

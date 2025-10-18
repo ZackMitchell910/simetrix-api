@@ -11,6 +11,8 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 
+import math
+
 import httpx
 import numpy as np
 from fastapi import HTTPException
@@ -190,6 +192,279 @@ def _news_ts(value: Any, default: datetime) -> datetime:
         except Exception:
             pass
     return default
+
+
+async def fetch_recent_news(symbol: str, days: int = 7, limit: int = 60) -> list[dict[str, Any]]:
+    """Return recent news articles from the feature store (if available)."""
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
+        return []
+    window = int(max(1, days))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window)
+    limit = int(max(1, limit))
+
+    if not callable(feature_store_connect):
+        return []
+
+    try:
+        con = feature_store_connect()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: fs_connect failed for %s: %s", symbol_norm, exc)
+        return []
+
+    try:
+        rows = con.execute(
+            """
+            SELECT ts, source, title, url, summary, sentiment
+            FROM news_articles
+            WHERE symbol = ? AND ts >= ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            [symbol_norm, cutoff, limit],
+        ).fetchall()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: query failed for %s: %s", symbol_norm, exc)
+        rows = []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    articles: list[dict[str, Any]] = []
+    for ts, source, title, url, summary, sentiment in rows:
+        ts_dt = _as_utc_datetime(ts) or datetime.now(timezone.utc)
+        articles.append(
+            {
+                "symbol": symbol_norm,
+                "ts": ts_dt.isoformat(),
+                "source": source,
+                "title": title,
+                "url": url,
+                "summary": summary,
+                "sentiment": (float(sentiment) if sentiment is not None else None),
+            }
+        )
+    return articles
+
+
+async def fetch_social(symbol: str, handles: Iterable[str] | str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    """Lightweight stub for social sentiment. Generates neutral posts for provided handles."""
+    symbol_norm = (symbol or "").strip().upper()
+    handle_list: list[str]
+    if handles is None:
+        handle_list = []
+    elif isinstance(handles, str):
+        handle_list = [h.strip() for h in handles.split(",") if h.strip()]
+    else:
+        handle_list = []
+        for item in handles:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                handle_list.append(text)
+
+    if not handle_list:
+        return []
+
+    now = datetime.now(timezone.utc)
+    out: list[dict[str, Any]] = []
+    for handle in handle_list[: int(max(1, limit))]:
+        out.append(
+            {
+                "symbol": symbol_norm,
+                "handle": handle,
+                "ts": now.isoformat(),
+                "text": f"Recent mention of {symbol_norm} from {handle}",
+                "sentiment": 0.0,
+            }
+        )
+    return out
+
+
+async def load_option_surface(symbol: str, asof: date | datetime | None = None) -> list[dict[str, Any]]:
+    """Return an approximate option surface for the symbol."""
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
+        return []
+    if isinstance(asof, datetime):
+        as_of_date = asof.date()
+    elif isinstance(asof, date):
+        as_of_date = asof
+    else:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    surface: list[dict[str, Any]] = []
+
+    if callable(feature_store_connect):
+        try:
+            con = feature_store_connect()
+        except Exception as exc:
+            logger.debug("load_option_surface: fs_connect failed for %s: %s", symbol_norm, exc)
+            con = None
+        if con is not None:
+            try:
+                rows = con.execute(
+                    """
+                    SELECT tenor_days, atm_iv
+                    FROM option_surface
+                    WHERE symbol = ?
+                    ORDER BY tenor_days ASC
+                    LIMIT 96
+                    """,
+                    [symbol_norm],
+                ).fetchall()
+            except Exception as exc:
+                logger.debug("load_option_surface: query failed for %s: %s", symbol_norm, exc)
+                rows = []
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            for tenor_days, atm_iv in rows:
+                try:
+                    tenor_val = float(tenor_days)
+                    iv_val = float(atm_iv)
+                except Exception:
+                    continue
+                if tenor_val <= 0 or iv_val <= 0:
+                    continue
+                surface.append(
+                    {
+                        "symbol": symbol_norm,
+                        "tenor_days": tenor_val,
+                        "atm_iv": iv_val,
+                        "as_of": as_of_date.isoformat(),
+                        "source": "feature_store",
+                    }
+                )
+    if surface:
+        return surface
+
+    try:
+        prices = await fetch_cached_hist_prices(symbol_norm, window_days=180, redis=REDIS)
+    except Exception as exc:
+        logger.debug("load_option_surface: hist fetch failed for %s: %s", symbol_norm, exc)
+        prices = []
+    if len(prices) < 2:
+        return surface
+    rets = np.diff(np.log(np.array(prices, dtype=float)))
+    if rets.size == 0:
+        return surface
+    hv = float(np.std(rets)) * math.sqrt(252.0)
+    hv = float(np.clip(hv, 0.05, 2.5))
+    tenors = [7, 14, 21, 30, 45, 60, 90, 120]
+    for tenor in tenors:
+        adjust = math.sqrt(min(tenor, 60) / 60.0)
+        iv_val = float(np.clip(hv * adjust, 0.05, 3.0))
+        surface.append(
+            {
+                "symbol": symbol_norm,
+                "tenor_days": float(tenor),
+                "atm_iv": iv_val,
+                "as_of": as_of_date.isoformat(),
+                "source": "hist_vol_proxy",
+            }
+        )
+    return surface
+
+
+async def load_futures_curve(symbol: str, asof: date | datetime | None = None) -> list[dict[str, Any]]:
+    """Approximate a futures curve using stored data or realized carry."""
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
+        return []
+    if isinstance(asof, datetime):
+        as_of_date = asof.date()
+    elif isinstance(asof, date):
+        as_of_date = asof
+    else:
+        as_of_date = datetime.now(timezone.utc).date()
+
+    curve: list[dict[str, Any]] = []
+
+    if callable(feature_store_connect):
+        try:
+            con = feature_store_connect()
+        except Exception as exc:
+            logger.debug("load_futures_curve: fs_connect failed for %s: %s", symbol_norm, exc)
+            con = None
+        if con is not None:
+            try:
+                rows = con.execute(
+                    """
+                    SELECT tenor_days, forward, as_of
+                    FROM futures_curve
+                    WHERE symbol = ?
+                    ORDER BY tenor_days ASC
+                    LIMIT 96
+                    """,
+                    [symbol_norm],
+                ).fetchall()
+            except Exception as exc:
+                logger.debug("load_futures_curve: query failed for %s: %s", symbol_norm, exc)
+                rows = []
+            finally:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+            for tenor_days, forward, row_as_of in rows:
+                try:
+                    tenor_val = float(tenor_days)
+                    price_val = float(forward)
+                except Exception:
+                    continue
+                if tenor_val <= 0 or price_val <= 0:
+                    continue
+                curve.append(
+                    {
+                        "symbol": symbol_norm,
+                        "tenor_days": tenor_val,
+                        "forward": price_val,
+                        "as_of": (
+                            _as_utc_datetime(row_as_of).date().isoformat()
+                            if isinstance(row_as_of, (datetime, date))
+                            else as_of_date.isoformat()
+                        ),
+                        "source": "feature_store",
+                    }
+                )
+    if curve:
+        return curve
+
+    try:
+        prices = await fetch_cached_hist_prices(symbol_norm, window_days=180, redis=REDIS)
+    except Exception as exc:
+        logger.debug("load_futures_curve: hist fetch failed for %s: %s", symbol_norm, exc)
+        prices = []
+    if len(prices) < 2:
+        return curve
+
+    arr = np.array(prices, dtype=float)
+    spot = float(arr[-1])
+    if spot <= 0:
+        return curve
+    rets = np.diff(np.log(arr))
+    mu_ann = float(np.mean(rets)) * 252.0 if rets.size else 0.0
+    mu_ann = float(np.clip(mu_ann, -1.0, 1.0))
+    tenors = [15, 30, 45, 60, 90, 120, 180]
+    for tenor in tenors:
+        forward_price = float(spot * math.exp(mu_ann * (tenor / 365.0)))
+        curve.append(
+            {
+                "symbol": symbol_norm,
+                "tenor_days": float(tenor),
+                "forward": forward_price,
+                "spot": spot,
+                "as_of": as_of_date.isoformat(),
+                "source": "carry_proxy",
+            }
+        )
+    return curve
 
 
 async def _news_rows_from_newsapi(symbol: str, since: datetime, limit: int, api_key: str) -> list[tuple]:
