@@ -56,11 +56,38 @@ def create_duckdb_backup(db_path: str | Path, target_dir: str | Path, *, keep: i
         export_path.mkdir(parents=True, exist_ok=True)
 
         export_sql_path = export_path.as_posix().replace("'", "''")
-        with duckdb.connect(str(src)) as source_con:
-            source_con.execute(f"EXPORT DATABASE '{export_sql_path}'")
+    with duckdb.connect(str(src)) as source_con:
+        try:
+            source_con.execute("""
+                ALTER TABLE IF EXISTS predictions
+                ADD COLUMN IF NOT EXISTS issued_at TIMESTAMP;
+            """)
+            source_con.execute("""
+                ALTER TABLE IF EXISTS predictions
+                ADD COLUMN IF NOT EXISTS features_ref VARCHAR;
+            """)
+        except Exception as e:
+            print("⚠️  source_con schema patch skipped:", e)
 
-        with duckdb.connect(str(dest)) as dest_con:
-            dest_con.execute(f"IMPORT DATABASE '{export_sql_path}'")
+        # Proceed with export
+        source_con.execute(f"EXPORT DATABASE '{export_sql_path}'")
+
+    with duckdb.connect(str(dest)) as dest_con:
+        try:
+            dest_con.execute("""
+                ALTER TABLE IF EXISTS predictions
+                ADD COLUMN IF NOT EXISTS issued_at TIMESTAMP;
+            """)
+            dest_con.execute("""
+                ALTER TABLE IF EXISTS predictions
+                ADD COLUMN IF NOT EXISTS features_ref VARCHAR;
+            """)
+        except Exception as e:
+            print("⚠️  dest_con schema patch skipped:", e)
+
+        # Proceed with import
+        dest_con.execute(f"IMPORT DATABASE '{export_sql_path}'")
+
 
     keep = max(1, int(keep))
     _prune_old_backups(target, stem, keep)

@@ -26,6 +26,9 @@ DB_PATH = os.getenv(
     str((DATA_ROOT / "pt.duckdb").resolve()),
 )
 
+_SCHEMA_READY = False
+_PREDICTIONS_HAS_ISSUED_AT: Optional[bool] = None
+
 DDL = """
 CREATE TABLE IF NOT EXISTS predictions (
   pred_id UUID PRIMARY KEY,
@@ -37,7 +40,9 @@ CREATE TABLE IF NOT EXISTS predictions (
   p05 DOUBLE, p50 DOUBLE, p95 DOUBLE,
   spot0 DOUBLE,
   user_ctx JSON,
-  run_id TEXT
+  run_id TEXT,
+  issued_at TIMESTAMP,
+  features_ref TEXT
 );
 
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -110,18 +115,62 @@ def _ensure_dir() -> str:
 
 
 def get_conn() -> duckdb.DuckDBPyConnection:
-    """Singleton connection with a sane thread setting."""
+    """Singleton connection with a sane thread setting and self-healing schema."""
     global _conn
     if _conn is None:
         db_file = _ensure_dir()
+
+        # Debug log to confirm the actual DB path used (ASCII only for Windows consoles)
+        logger.info("DuckDB core DB path: %s", db_file)
+
         _conn = duckdb.connect(db_file)
         _conn.execute("PRAGMA threads=4;")
+
+        # ---- Self-healing patch ----
+        try:
+            cols = {r[1] for r in _conn.execute("PRAGMA table_info('predictions')").fetchall()}
+            if "issued_at" not in cols:
+                logger.info("Adding missing 'issued_at' column on predictions")
+                _conn.execute("ALTER TABLE predictions ADD COLUMN issued_at TIMESTAMP")
+                if "ts" in cols:
+                    _conn.execute("UPDATE predictions SET issued_at = ts WHERE issued_at IS NULL")
+            if "features_ref" not in cols:
+                logger.info("Adding missing 'features_ref' column on predictions")
+                _conn.execute("ALTER TABLE predictions ADD COLUMN features_ref VARCHAR")
+            _conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_predictions_issued_at ON predictions(issued_at)"
+            )
+        except Exception as e:
+            logger.warning("Schema self-heal failed: %s", e)
+        # ----------------------------
+
     return _conn
 
-
 def init_schema() -> None:
+    global _SCHEMA_READY, _PREDICTIONS_HAS_ISSUED_AT
     con = get_conn()
     con.execute(DDL)
+    try:
+        con.execute("ALTER TABLE predictions ADD COLUMN IF NOT EXISTS issued_at TIMESTAMP")
+        con.execute("ALTER TABLE predictions ADD COLUMN IF NOT EXISTS features_ref TEXT")
+        con.execute("UPDATE predictions SET issued_at = COALESCE(issued_at, ts) WHERE issued_at IS NULL")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_predictions_issued_at ON predictions(issued_at)")
+    except Exception as exc:
+        logger.warning("DuckDB compatibility adjustments failed: %s", exc)
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info('predictions')").fetchall()}
+        _PREDICTIONS_HAS_ISSUED_AT = "issued_at" in cols
+    except Exception:
+        _PREDICTIONS_HAS_ISSUED_AT = False
+    _SCHEMA_READY = True
+
+
+def _ensure_schema() -> None:
+    if not _SCHEMA_READY:
+        try:
+            init_schema()
+        except Exception as exc:
+            logger.warning("init_schema deferred due to error: %s", exc)
 
 
 def insert_prediction(row: Dict[str, Any]) -> None:
@@ -132,20 +181,31 @@ def insert_prediction(row: Dict[str, Any]) -> None:
       p50 (float or None), p95 (float or None), spot0 (float or None),
       user_ctx (dict|json str|None), run_id (str|None)
     """
+    _ensure_schema()
     con = get_conn()
     ctx = row.get("user_ctx")
     if isinstance(ctx, dict):
         row["user_ctx"] = json.dumps(ctx)  # store JSON text
-    placeholders = ",".join(["?"] * 12)
+    features_ref = row.get("features_ref")
+    if isinstance(features_ref, (dict, list)):
+        try:
+            row["features_ref"] = json.dumps(features_ref)
+        except Exception:
+            row["features_ref"] = json.dumps({"value": features_ref})
+    issued_at = row.get("issued_at") or row.get("ts")
+    row["issued_at"] = issued_at
+    placeholders = ",".join(["?"] * 14)
     con.execute(
         f"""
         INSERT OR REPLACE INTO predictions
-        (pred_id, ts, symbol, horizon_d, model_id, prob_up_next, p05, p50, p95, spot0, user_ctx, run_id)
+        (pred_id, ts, issued_at, features_ref, symbol, horizon_d, model_id, prob_up_next, p05, p50, p95, spot0, user_ctx, run_id)
         VALUES ({placeholders})
         """,
         [
             row.get("pred_id"),
             row.get("ts"),
+            row.get("issued_at"),
+            row.get("features_ref"),
             row.get("symbol"),
             row.get("horizon_d"),
             row.get("model_id"),
@@ -176,15 +236,17 @@ def matured_predictions_now(limit: int = 5000) -> List[Tuple]:
     Rows that have matured (ts + horizon_d days <= now) and are not yet labeled.
     Returns: [(pred_id, ts, symbol, horizon_d, spot0), ...]
     """
+    _ensure_schema()
     con = get_conn()
+    column = "COALESCE(p.issued_at, p.ts)" if _PREDICTIONS_HAS_ISSUED_AT else "p.ts"
     return con.execute(
-        """
-        SELECT p.pred_id, p.ts, p.symbol, p.horizon_d, p.spot0
+        f"""
+        SELECT p.pred_id, {column} AS ts, p.symbol, p.horizon_d, p.spot0
         FROM predictions p
         LEFT JOIN outcomes o ON o.pred_id = p.pred_id
         WHERE o.pred_id IS NULL
-          AND p.ts + (p.horizon_d * INTERVAL 1 DAY) <= now()
-        ORDER BY p.ts
+          AND {column} + (p.horizon_d * INTERVAL 1 DAY) <= now()
+        ORDER BY ts
         LIMIT ?
         """,
         [int(limit)],
@@ -192,9 +254,11 @@ def matured_predictions_now(limit: int = 5000) -> List[Tuple]:
 
 
 def recent_predictions(symbol: Optional[str] = None, limit: int = 200) -> List[Dict[str, Any]]:
+    _ensure_schema()
     con = get_conn()
-    q = """
-      SELECT pred_id, ts, symbol, horizon_d, model_id,
+    column = "COALESCE(issued_at, ts)" if _PREDICTIONS_HAS_ISSUED_AT else "ts"
+    q = f"""
+      SELECT pred_id, {column} AS issued_at, symbol, horizon_d, model_id,
              prob_up_next, p05, p50, p95, spot0, run_id
       FROM predictions
     """
@@ -202,7 +266,7 @@ def recent_predictions(symbol: Optional[str] = None, limit: int = 200) -> List[D
     if symbol:
         q += " WHERE symbol = ?"
         args.append(symbol.upper())
-    q += " ORDER BY ts DESC LIMIT ?"
+    q += " ORDER BY issued_at DESC LIMIT ?"
     args.append(int(limit))
     rows = con.execute(q, args).fetchall()
     cols = [d[0] for d in con.description]

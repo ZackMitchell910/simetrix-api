@@ -37,8 +37,8 @@ from src.services import common as service_common
 from src.services import ingestion as ingestion_service
 from src.services.watchlists import get_crypto_watchlist, get_equity_watchlist
 from src.services.validation import validate_mc_paths as run_mc_validation
-from src.services.predictive_bridge import (
-    get_learn_online,
+from src.services.labeling import label_outcomes
+from src.services.training import OnlineLearnRequest, learn_online as perform_learn_online
 try:
     from src.db.duck import DB_PATH as CORE_DB_PATH, recent_predictions
 except Exception:  # pragma: no cover - optional import
@@ -48,9 +48,6 @@ except Exception:  # pragma: no cover - optional import
 
 try:
     from src.feature_store import connect as feature_store_connect, DB_PATH as FS_DB_PATH
-except Exception:  # pragma: no cover - optional import
-    feature_store_connect = None  # type: ignore
-    FS_DB_PATH = None  # type: ignore
 except Exception:  # pragma: no cover - optional import
     feature_store_connect = None  # type: ignore
     FS_DB_PATH = None  # type: ignore
@@ -277,46 +274,19 @@ async def refresh(request: Request, response: Response) -> dict[str, Any]:
 
 
 async def warm() -> dict[str, Any]:
-    legacy_tf = legacy_arima = legacy_sb3 = None
+    await asyncio.gather(
+        service_common.ensure_tf(),
+        service_common.ensure_arima(),
+    )
     try:
-        from src import predictive_service as legacy  # type: ignore
-
-        ensure_tf = getattr(legacy, "ensure_tf", None)
-        ensure_arima = getattr(legacy, "ensure_arima", None)
-        ensure_sb3 = getattr(legacy, "ensure_sb3", None)
-        tasks = []
-        if callable(ensure_tf):
-            tasks.append(ensure_tf())
-        if callable(ensure_arima):
-            tasks.append(ensure_arima())
-        if tasks:
-            await asyncio.gather(*tasks)
-        if callable(ensure_sb3):
-            try:
-                await ensure_sb3()
-            except Exception:
-                pass
-        legacy_tf = bool(getattr(legacy, "TF_AVAILABLE", False))
-        legacy_arima = bool(getattr(legacy, "ARIMA_AVAILABLE", False))
-        legacy_sb3 = bool(getattr(legacy, "SB3_AVAILABLE", False))
+        await service_common.ensure_sb3()
     except Exception:
-        await asyncio.gather(
-            service_common.ensure_tf(),
-            service_common.ensure_arima(),
-        )
-        try:
-            await service_common.ensure_sb3()
-        except Exception:
-            pass
-        legacy_tf = bool(service_common.TF_AVAILABLE)
-        legacy_arima = bool(service_common.ARIMA_AVAILABLE)
-        legacy_sb3 = bool(service_common.SB3_AVAILABLE)
-
+        pass
     return {
         "ok": True,
-        "tf": bool(legacy_tf),
-        "arima": bool(legacy_arima),
-        "sb3": bool(legacy_sb3),
+        "tf": bool(service_common.TF_AVAILABLE),
+        "arima": bool(service_common.ARIMA_AVAILABLE),
+        "sb3": bool(service_common.SB3_AVAILABLE),
     }
 
 
@@ -360,14 +330,8 @@ async def cron_daily(request: Request, *, n: int, steps: int, batch: int) -> dic
     redis = _active_redis()
     await enforce_limits(redis, request, scope="cron", per_min=CRON_LIMIT_PER_MIN, cost_units=1)
 
-    outcomes_label = get_outcomes_label()
-    learn_online = get_learn_online()
-    OnlineLearnRequest = get_online_learn_request()
     WL_EQ = list(get_equity_watchlist())
     WL_CR = list(get_crypto_watchlist())
-
-    if not callable(outcomes_label) or not callable(learn_online) or OnlineLearnRequest is None:
-        raise HTTPException(status_code=503, detail="cron_handlers_unavailable")
 
     job = "cron_daily"
     t0 = time.perf_counter()
@@ -377,7 +341,7 @@ async def cron_daily(request: Request, *, n: int, steps: int, batch: int) -> dic
         log_json("info", msg="cron_start", job=job, n=n, steps=steps, batch=batch)
 
         label_t0 = time.perf_counter()
-        lab = await outcomes_label(limit=20000, _api_key=True)  # type: ignore[misc]
+        lab = await label_outcomes(limit=20000)  # type: ignore[misc]
         label_sec = round(time.perf_counter() - label_t0, 3)
         log_json("info", msg="cron_labeled", job=job, labeled=lab, duration_s=label_sec)
 
@@ -394,7 +358,7 @@ async def cron_daily(request: Request, *, n: int, steps: int, batch: int) -> dic
             for attempt in (1, 2):
                 try:
                     req = OnlineLearnRequest(symbol=sym, steps=steps, batch=batch)  # type: ignore[call-arg]
-                    res = await learn_online(req, _api_key=True)  # type: ignore[misc]
+                    res = await perform_learn_online(req)  # type: ignore[misc]
                     dur = round(time.perf_counter() - sym_t0, 3)
                     log_json("info", msg="learn_ok", job=job, symbol=sym, attempt=attempt, duration_s=dur)
                     return {

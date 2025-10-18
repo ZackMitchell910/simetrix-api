@@ -15,6 +15,12 @@ from typing import Iterable, Optional, Mapping, Any, List, Tuple
 
 import duckdb
 import numpy as np
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except Exception:  # pragma: no cover - optional import fallback
+    pa = None  # type: ignore[assignment]
+    pq = None  # type: ignore[assignment]
 
 
 def _default_data_root() -> Path:
@@ -32,6 +38,13 @@ def _default_data_root() -> Path:
 DATA_ROOT = _default_data_root()
 os.environ.setdefault("PT_DATA_ROOT", str(DATA_ROOT))
 logger = logging.getLogger(__name__)
+
+ARROW_ROOT = DATA_ROOT / "arrow_store"
+ARROW_PREDICTIONS_DIR = ARROW_ROOT / "predictions"
+ARROW_OUTCOMES_DIR = ARROW_ROOT / "outcomes"
+ARROW_ROOT.mkdir(parents=True, exist_ok=True)
+ARROW_PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
+ARROW_OUTCOMES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _ensure_db_path(path_str: str) -> str:
@@ -125,6 +138,21 @@ CREATE TABLE IF NOT EXISTS mc_metrics (
 CREATE INDEX IF NOT EXISTS idx_fs_mc_metrics_symbol_time
   ON mc_metrics(symbol, as_of DESC, horizon_days);
 
+CREATE TABLE IF NOT EXISTS calibration_params (
+  symbol        TEXT,
+  horizon_days  INTEGER,
+  df            DOUBLE,
+  loc           DOUBLE,
+  scale         DOUBLE,
+  q05           DOUBLE,
+  q50           DOUBLE,
+  q95           DOUBLE,
+  sample_n      INTEGER,
+  sigma_ann     DOUBLE,
+  updated_at    TIMESTAMP DEFAULT now(),
+  PRIMARY KEY (symbol, horizon_days)
+);
+
 CREATE TABLE IF NOT EXISTS news_articles (
   symbol    TEXT,
   ts        TIMESTAMP,
@@ -180,14 +208,98 @@ CREATE INDEX IF NOT EXISTS idx_ingest_log_asof
 # ---------- Connection / bootstrap ----------
 
 def connect() -> duckdb.DuckDBPyConnection:
+    """
+    Open the Feature Store DB and ensure legacy tables get the columns
+    newer code expects (issued_at, features_ref, horizon_days).
+    """
     folder = os.path.dirname(DB_PATH) or "."
     os.makedirs(folder, exist_ok=True)
     con = duckdb.connect(DB_PATH)
+
+    # Create tables if first run
     con.execute(DDL)
+
+    # --- Compatibility patch for old files ---
+    try:
+        cols = {row[1] for row in con.execute("PRAGMA table_info('predictions')").fetchall()}
+
+        if "issued_at" not in cols:
+            con.execute("ALTER TABLE predictions ADD COLUMN issued_at TIMESTAMP")
+            # backfill based on what's available
+            cols2 = {row[1] for row in con.execute("PRAGMA table_info('predictions')").fetchall()}
+            if "ts" in cols2:  # some very old schemas had ts
+                con.execute("UPDATE predictions SET issued_at = ts WHERE issued_at IS NULL")
+            else:
+                con.execute("UPDATE predictions SET issued_at = now() WHERE issued_at IS NULL")
+
+        if "features_ref" not in cols:
+            con.execute("ALTER TABLE predictions ADD COLUMN features_ref TEXT")
+
+        # Some older builds used horizon_d; keep both but ensure horizon_days is present
+        cols = {row[1] for row in con.execute("PRAGMA table_info('predictions')").fetchall()}
+        if "horizon_days" not in cols and "horizon_d" in cols:
+            con.execute("ALTER TABLE predictions ADD COLUMN horizon_days INTEGER")
+            con.execute("UPDATE predictions SET horizon_days = horizon_d WHERE horizon_days IS NULL")
+
+        # Helpful index for common reads
+        con.execute("CREATE INDEX IF NOT EXISTS idx_fs_pred_symbol_issued ON predictions(symbol, issued_at DESC)")
+    except Exception as exc:
+        logger.warning("Feature Store compat patch failed: %s", exc)
+
     return con
 
 def get_con() -> duckdb.DuckDBPyConnection:
-    return connect()
+    """Return a live DuckDB connection to the Feature Store and ensure schema compatibility."""
+    con = connect()
+
+    try:
+        logger.info('Feature Store DB path: %s', DB_PATH)
+
+        cols = {r[1] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
+
+        if 'issued_at' not in cols:
+            logger.info("Adding missing 'issued_at' column to Feature Store predictions table")
+            con.execute("ALTER TABLE predictions ADD COLUMN issued_at TIMESTAMP")
+            if 'ts' in cols:
+                con.execute("UPDATE predictions SET issued_at = ts WHERE issued_at IS NULL")
+            else:
+                con.execute("UPDATE predictions SET issued_at = now() WHERE issued_at IS NULL")
+
+        if 'features_ref' not in cols:
+            logger.info("Adding missing 'features_ref' column to Feature Store predictions table")
+            con.execute("ALTER TABLE predictions ADD COLUMN features_ref VARCHAR")
+
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_fs_pred_symbol_issued ON predictions(symbol, issued_at DESC)"
+        )
+
+    except Exception as exc:
+        logger.warning('Feature Store schema check failed: %s', exc)
+
+    return con
+
+def _ensure_predictions_schema(con: duckdb.DuckDBPyConnection) -> None:
+    """Backfill legacy predictions table with issued_at and features_ref columns."""
+    try:
+        columns = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('predictions')").fetchall()
+        }
+        if "issued_at" not in columns:
+            con.execute("ALTER TABLE predictions ADD COLUMN issued_at TIMESTAMP")
+            con.execute(
+                "UPDATE predictions SET issued_at = COALESCE(issued_at, now())"
+            )
+        if "features_ref" not in columns:
+            con.execute("ALTER TABLE predictions ADD COLUMN features_ref TEXT")
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pred_symbol_time ON predictions(symbol, issued_at DESC)"
+        )
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_pred_model_time ON predictions(model_id, issued_at DESC)"
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("ensure_predictions_schema_failed: %s", exc)
 
 # ---------- Normalization helpers ----------
 
@@ -215,6 +327,41 @@ def insert_mc_metrics(con, rows: list[tuple]) -> int:
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
     return con.rowcount
+
+def upsert_calibration_params(con, rows: list[tuple]) -> int:
+    """
+    rows: [(symbol, horizon_days, df, loc, scale, q05, q50, q95, sample_n, sigma_ann, updated_at), ...]
+    """
+    if not rows:
+        return 0
+    con.executemany(
+        """
+        INSERT OR REPLACE INTO calibration_params
+        (symbol, horizon_days, df, loc, scale, q05, q50, q95, sample_n, sigma_ann, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    return con.rowcount
+
+def get_calibration_params(
+    con: duckdb.DuckDBPyConnection,
+    symbol: str,
+    horizon_days: int,
+) -> dict | None:
+    row = con.execute(
+        """
+        SELECT df, loc, scale, q05, q50, q95, sample_n, sigma_ann, updated_at
+        FROM calibration_params
+        WHERE symbol = ? AND horizon_days = ?
+        LIMIT 1
+        """,
+        [symbol.upper(), int(horizon_days)],
+    ).fetchone()
+    if not row:
+        return None
+    cols = ["df", "loc", "scale", "q05", "q50", "q95", "sample_n", "sigma_ann", "updated_at"]
+    return dict(zip(cols, row))
 
 def insert_news(con, rows: list[tuple]) -> int:
     """
@@ -326,21 +473,30 @@ def _pred_tuples(preds: Iterable[Mapping]) -> list[tuple]:
 
 def log_prediction(pred: Mapping[str, Any]) -> None:
     """Single-row upsert for a prediction artifact."""
-    con = get_con()
-    con.execute(f"""
-        INSERT OR REPLACE INTO predictions ({','.join(_PRED_COLS)})
-        VALUES ({','.join(['?']*len(_PRED_COLS))})
-    """, _pred_tuple(pred))
+    log_predictions([pred])
 
 def log_predictions(preds: Iterable[Mapping[str, Any]]) -> int:
     """Batch upsert for prediction artifacts."""
+    preds_list = [dict(p) for p in preds]
+    if not preds_list:
+        return 0
+    for row in preds_list:
+        val = row.get("features_ref")
+        if isinstance(val, (dict, list)):
+            row["features_ref"] = json.dumps(val)
+    tuples = [_pred_tuple(row) for row in preds_list]
     con = get_con()
     con.executemany(f"""
         INSERT OR REPLACE INTO predictions ({','.join(_PRED_COLS)})
         VALUES ({','.join(['?']*len(_PRED_COLS))})
-    """, _pred_tuples(preds))
-    return con.rowcount
-
+    """, tuples)
+    count = con.rowcount
+    con.close()
+    try:
+        _append_predictions_arrow(preds_list)
+    except Exception as exc:
+        logger.debug("Arrow append (predictions) failed: %s", exc)
+    return count
 def insert_outcome(outcome: Mapping[str, Any]) -> None:
     """Single-row upsert for realized outcome (y)."""
     con = get_con()
@@ -348,21 +504,343 @@ def insert_outcome(outcome: Mapping[str, Any]) -> None:
         INSERT OR REPLACE INTO outcomes (run_id, symbol, realized_at, y)
         VALUES (?, ?, ?, ?)
     """, (outcome["run_id"], outcome["symbol"], outcome["realized_at"], outcome["y"]))
+    con.close()
+    try:
+        _append_outcomes_arrow([outcome])
+    except Exception as exc:
+        logger.debug("Arrow append (outcomes) failed: %s", exc)
 
 # ---------- Retrieval ----------
 
 def matured_predictions(limit: int = 5000) -> list[tuple]:
     """Matured but unlabeled predictions: (run_id, issued_at, symbol, horizon_days)."""
     con = get_con()
-    return con.execute("""
-        SELECT p.run_id, p.issued_at, p.symbol, p.horizon_days
+    _ensure_predictions_schema(con)
+    has_issued = _predictions_has_issued_at(con)
+    issued_expr = "p.issued_at" if has_issued else "p.ts"
+    select_issued = f"{issued_expr} AS issued_at"
+
+    query = f"""
+        SELECT p.run_id, {select_issued}, p.symbol, p.horizon_days
         FROM predictions p
         LEFT JOIN outcomes o USING (run_id)
         WHERE o.run_id IS NULL
-          AND p.issued_at + (p.horizon_days * INTERVAL 1 DAY) <= now()
-        ORDER BY p.issued_at DESC
+          AND {issued_expr} + (p.horizon_days * INTERVAL 1 DAY) <= now()
+        ORDER BY {issued_expr} DESC
         LIMIT ?
-    """, [limit]).fetchall()
+    """
+    return con.execute(query, [limit]).fetchall()
+
+# ---------- Arrow / Parquet helpers ----------
+
+def _require_pyarrow() -> tuple[Any, Any]:
+    if pa is None or pq is None:
+        raise RuntimeError("pyarrow is not available; install the pyarrow extra to use this helper")
+    return pa, pq
+
+
+def _predictions_has_issued_at(con: duckdb.DuckDBPyConnection) -> bool:
+    """Check whether the predictions table currently exposes issued_at."""
+    try:
+        cols_now = {row[1] for row in con.execute("PRAGMA table_info('predictions')").fetchall()}
+    except Exception:
+        return False
+    return "issued_at" in cols_now
+
+
+def _pred_cols_and_order(
+    con: duckdb.DuckDBPyConnection,
+    base_cols: Sequence[str],
+) -> tuple[list[str], str]:
+    """
+    Build a safe SELECT column list and ORDER BY column for reading predictions.
+    Falls back to ts if issued_at is missing (e.g., on transient tables).
+    """
+    select_cols = list(base_cols)
+    order_col = "issued_at"
+
+    if not _predictions_has_issued_at(con):
+        select_cols = [c for c in select_cols if c != "issued_at"] + ["ts AS issued_at"]
+        order_col = "ts"
+
+    return select_cols, order_col
+
+def _normalize_datetime(value: Any) -> tuple[str, str]:
+    if isinstance(value, dt.datetime):
+        dt_obj = value.astimezone(dt.timezone.utc)
+    else:
+        try:
+            dt_obj = dt.datetime.fromisoformat(str(value))
+            if dt_obj.tzinfo is None:
+                dt_obj = dt_obj.replace(tzinfo=dt.timezone.utc)
+            else:
+                dt_obj = dt_obj.astimezone(dt.timezone.utc)
+        except Exception:
+            dt_obj = dt.datetime.now(dt.timezone.utc)
+    return dt_obj.isoformat(), dt_obj.date().isoformat()
+
+def _append_predictions_arrow(rows: Iterable[Mapping[str, Any]]) -> int:
+    if pa is None or pq is None:
+        return 0
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        rec = {}
+        for col in _PRED_COLS:
+            if col == "features_ref":
+                val = row.get(col)
+                if isinstance(val, (dict, list)):
+                    rec[col] = json.dumps(val)
+                else:
+                    rec[col] = val
+            else:
+                rec[col] = row.get(col)
+        issued_iso, issued_day = _normalize_datetime(rec.get("issued_at"))
+        rec["issued_at"] = issued_iso
+        rec["issued_date"] = issued_day
+        records.append(rec)
+    if not records:
+        return 0
+    keys = records[0].keys()
+    columns = {k: [rec.get(k) for rec in records] for k in keys}
+    table = pa.Table.from_pydict(columns)  # type: ignore[arg-type]
+    try:
+        pq.write_to_dataset(
+            table,
+            root_path=ARROW_PREDICTIONS_DIR.as_posix(),
+            partition_cols=["issued_date"],
+            existing_data_behavior="overwrite_or_ignore",
+        )
+    except TypeError:
+        pq.write_to_dataset(
+            table,
+            root_path=ARROW_PREDICTIONS_DIR.as_posix(),
+            partition_cols=["issued_date"],
+        )
+    return len(records)
+
+def _append_outcomes_arrow(rows: Iterable[Mapping[str, Any]]) -> int:
+    if pa is None or pq is None:
+        return 0
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        rec = dict(row)
+        realized_iso, realized_day = _normalize_datetime(rec.get("realized_at"))
+        rec["realized_at"] = realized_iso
+        rec["realized_date"] = realized_day
+        records.append(rec)
+    if not records:
+        return 0
+    keys = records[0].keys()
+    columns = {k: [rec.get(k) for rec in records] for k in keys}
+    table = pa.Table.from_pydict(columns)  # type: ignore[arg-type]
+    try:
+        pq.write_to_dataset(
+            table,
+            root_path=ARROW_OUTCOMES_DIR.as_posix(),
+            partition_cols=["realized_date"],
+            existing_data_behavior="overwrite_or_ignore",
+        )
+    except TypeError:
+        pq.write_to_dataset(
+            table,
+            root_path=ARROW_OUTCOMES_DIR.as_posix(),
+            partition_cols=["realized_date"],
+        )
+    return len(records)
+
+def fetch_predictions_arrow(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    symbol: str | None = None,
+    min_issued_at: dt.datetime | None = None,
+    day: dt.date | None = None,
+    limit: int = 5000,
+) -> "pa.Table":
+    """
+    Return recent predictions as a PyArrow table directly from DuckDB.
+    """
+    _require_pyarrow()
+    _ensure_predictions_schema(con)
+    has_issued = _predictions_has_issued_at(con)
+    issued_expr = "issued_at" if has_issued else "ts"
+
+    filters: list[str] = []
+    params: list[Any] = []
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.upper())
+    if min_issued_at:
+        filters.append(f"{issued_expr} >= ?")
+        params.append(min_issued_at)
+    if day:
+        filters.append(f"date({issued_expr}) = ?")
+        params.append(day)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+
+    select_cols, order_col = _pred_cols_and_order(con, _PRED_COLS)
+    sql = f"""
+        SELECT {','.join(select_cols)}
+        FROM predictions
+        {where}
+        ORDER BY {order_col} DESC
+        LIMIT {int(max(1, limit))}
+    """
+    tbl = con.execute(sql, params).fetch_arrow_table()
+    if hasattr(tbl, "combine_chunks"):
+        tbl = tbl.combine_chunks()
+    return tbl
+
+def fetch_outcomes_arrow(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    symbol: str | None = None,
+    day: dt.date | None = None,
+    limit: int = 5000,
+) -> "pa.Table":
+    """
+    Return recent outcomes as a PyArrow table directly from DuckDB.
+    """
+    _require_pyarrow()
+    filters: list[str] = []
+    params: list[Any] = []
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.upper())
+    if day:
+        filters.append("date(realized_at) = ?")
+        params.append(day)
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    sql = f"""
+        SELECT run_id, symbol, realized_at, y
+        FROM outcomes
+        {where}
+        ORDER BY realized_at DESC
+        LIMIT {int(max(1, limit))}
+    """
+    tbl = con.execute(sql, params).fetch_arrow_table()
+    if hasattr(tbl, "combine_chunks"):
+        tbl = tbl.combine_chunks()
+    return tbl
+
+def export_predictions_parquet(
+    dest: str | Path,
+    *,
+    symbol: str | None = None,
+    min_issued_at: dt.datetime | None = None,
+    day: dt.date | None = None,
+    limit: int = 5000,
+) -> Path:
+    """
+    Persist recent predictions to a Parquet file using PyArrow.
+    """
+    _, pq_mod = _require_pyarrow()
+    con = get_con()
+    table = fetch_predictions_arrow(
+        con,
+        symbol=symbol,
+        min_issued_at=min_issued_at,
+        day=day,
+        limit=limit,
+    )
+    path = Path(dest).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq_mod.write_table(table, path.as_posix())
+    return path
+
+
+def export_outcomes_parquet(
+    dest: str | Path,
+    *,
+    symbol: str | None = None,
+    day: dt.date | None = None,
+    limit: int = 5000,
+) -> Path:
+    """
+    Persist outcomes to a Parquet file using PyArrow.
+    """
+    _, pq_mod = _require_pyarrow()
+    con = get_con()
+    table = fetch_outcomes_arrow(
+        con,
+        symbol=symbol,
+        day=day,
+        limit=limit,
+    )
+    path = Path(dest).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq_mod.write_table(table, path.as_posix())
+    return path
+
+
+def fetch_metrics_daily_arrow(
+    con: duckdb.DuckDBPyConnection,
+    *,
+    day: dt.date | None = None,
+    symbol: str | None = None,
+    model_id: str | None = None,
+    horizon_days: int | None = None,
+    limit: int | None = None,
+) -> "pa.Table":
+    """
+    Return metrics_daily rows as a PyArrow table.
+    """
+    _require_pyarrow()
+    filters: list[str] = []
+    params: list[Any] = []
+    if day:
+        filters.append("date = ?")
+        params.append(day)
+    if symbol:
+        filters.append("symbol = ?")
+        params.append(symbol.upper())
+    if model_id:
+        filters.append("model_id = ?")
+        params.append(model_id)
+    if horizon_days is not None:
+        filters.append("horizon_days = ?")
+        params.append(int(horizon_days))
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    limit_clause = f"LIMIT {int(limit)}" if limit else ""
+    sql = f"""
+        SELECT date, model_id, symbol, horizon_days,
+               rmse, mae, brier, crps, mape, p80_cov, p90_cov, n
+        FROM metrics_daily
+        {where}
+        ORDER BY date DESC, symbol, horizon_days
+        {limit_clause}
+    """
+    tbl = con.execute(sql, params).fetch_arrow_table()
+    if hasattr(tbl, "combine_chunks"):
+        tbl = tbl.combine_chunks()
+    return tbl
+
+
+def export_metrics_parquet(
+    dest: str | Path,
+    *,
+    day: dt.date | None = None,
+    symbol: str | None = None,
+    model_id: str | None = None,
+    horizon_days: int | None = None,
+    limit: int | None = None,
+) -> Path:
+    """
+    Persist metrics_daily rows to Parquet.
+    """
+    _, pq_mod = _require_pyarrow()
+    con = get_con()
+    table = fetch_metrics_daily_arrow(
+        con,
+        day=day,
+        symbol=symbol,
+        model_id=model_id,
+        horizon_days=horizon_days,
+        limit=limit,
+    )
+    path = Path(dest).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    pq_mod.write_table(table, path.as_posix())
+    return path
 
 # ---------- Metrics Rollup ----------
 
@@ -386,8 +864,11 @@ def compute_and_upsert_metrics_daily(
     """Computes/upserts aggregate metrics for matured predictions on a given day."""
     if day is None:
         day = dt.date.today() - dt.timedelta(days=1)  # Yesterday by default
+    _ensure_predictions_schema(con)
+    has_issued = _predictions_has_issued_at(con)
+    issued_expr = "p.issued_at" if has_issued else "p.ts"
 
-    where = ["date(p.issued_at) = ?"]
+    where = [f"CAST({issued_expr} AS DATE) = ?"]
     params = [day]
 
     if model_id:
@@ -403,7 +884,7 @@ def compute_and_upsert_metrics_daily(
     rows = con.execute(f"""
         SELECT p.run_id, p.model_id, p.symbol, p.horizon_days,
                p.yhat_mean, p.prob_up, p.q05, p.q50, p.q95, p.features_ref,
-               o.y
+                o.y
         FROM predictions p
         JOIN outcomes    o ON o.run_id = p.run_id
         WHERE {" AND ".join(where)}
@@ -473,13 +954,16 @@ def generate_accuracy_statements(
     min_date: Optional[dt.date] = None
 ) -> List[str]:
     con = get_con()
+    _ensure_predictions_schema(con)
+    has_issued = _predictions_has_issued_at(con)
+    issued_expr = "p.issued_at" if has_issued else "p.ts"
     where = ["o.y IS NOT NULL"]
     params = []
     if symbol:
         where.append("p.symbol = ?")
         params.append(symbol)
     if min_date:
-        where.append("p.issued_at >= ?")
+        where.append(f"{issued_expr} >= ?")
         params.append(min_date)
 
     rows = con.execute(f"""
@@ -487,7 +971,7 @@ def generate_accuracy_statements(
         FROM predictions p
         JOIN outcomes o ON o.run_id = p.run_id
         WHERE {" AND ".join(where)}
-        ORDER BY p.issued_at DESC
+        ORDER BY {issued_expr} DESC
         LIMIT ?
     """, params + [limit]).fetchall()
 

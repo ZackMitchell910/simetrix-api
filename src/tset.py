@@ -1,4 +1,4 @@
-# src/predictive_service.py
+# src/predictive_api.py
 # =============================================================================
 # Predictive Service (Render-friendly startup)
 # - Heavy/optional deps are loaded in @app.on_event("startup")
@@ -997,4 +997,4 @@ def _bars_per_day(timespan: str) -> int:
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("src.predictive_service:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run("src.predictive_api:app", host="0.0.0.0", port=port, log_level="info")

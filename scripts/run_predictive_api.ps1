@@ -17,4 +17,4 @@ if (Test-Path ".env") {
 }
 
 # Run FastAPI service
-python -m uvicorn backend.src.predictive_service:app --reload --host 0.0.0.0 --port 8081
+python -m uvicorn backend.src.predictive_api:app --reload --host 0.0.0.0 --port 8081

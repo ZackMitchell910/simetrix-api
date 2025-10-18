@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Callable, Optional
+from typing import Callable, Optional, Iterable
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 def label_mature_predictions(
     fetch_close_fn: Callable[[str, datetime], Optional[float]],
     limit: int = 5000,
+    rows: Optional[Iterable[tuple]] = None,
 ) -> int:
     """
     Labels any matured predictions (ts + horizon_d <= now) that are missing outcomes.
@@ -32,18 +33,27 @@ def label_mature_predictions(
     - Writes labels to src.db.duck.outcomes
     - Optionally mirrors each label into PathPanda Feature Store (if available)
 
+    Args:
+        fetch_close_fn: Callable that returns a realized close for (symbol, target_ts).
+        limit: Maximum rows to fetch from matured predictions when `rows` is None.
+        rows: Optional pre-fetched iterable of matured rows to label. Each row should
+            match the tuple shape returned by `matured_predictions_now`.
+
     Returns:
         int: count of outcomes labeled.
     """
     try:
-        rows = matured_predictions_now(limit=limit)
+        if rows is None:
+            rows_iter = matured_predictions_now(limit=limit)
+        else:
+            rows_iter = list(rows)
     except Exception as e:
         logger.exception(f"matured_predictions_now failed: {e}")
         return 0
 
     labeled = 0
 
-    for pred_id, ts, symbol, horizon_d, spot0 in rows:
+    for pred_id, ts, symbol, horizon_d, spot0 in rows_iter:
         try:
             if spot0 in (None, 0):
                 continue

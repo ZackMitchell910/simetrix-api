@@ -3690,7 +3690,13 @@ def _poly_to_app_symbol(s: str) -> str:
         return f"{s[:-3]}-USD"
     return s
 
-async def llm_shortlist(kind: str, symbols: list[str], top_k: int = 20) -> list[str]:
+async def llm_shortlist(
+    kind: str,
+    symbols: list[str],
+    top_k: int = 20,
+    *,
+    horizon_days: int | None = None,
+) -> list[str]:
     key = os.getenv("XAI_API_KEY", "").strip()
     base = [s.upper() for s in symbols]
     if not base:
@@ -3700,11 +3706,17 @@ async def llm_shortlist(kind: str, symbols: list[str], top_k: int = 20) -> list[
     if not key:
         return base[:top_k]  # fallback
 
+    horizon_phrase = (
+        f"over the next {int(horizon_days)} days"
+        if isinstance(horizon_days, (int, float)) and horizon_days > 0
+        else "in the near term"
+    )
+
     prompt = {
         "role": "user",
         "content": (
-            "Given this watchlist, pick the TOP symbols to review today based on likely near-term catalysts, "
-            "liquidity, momentum, and risk. Return JSON {list:[...]} with up to "
+            f"Given this watchlist, pick the TOP symbols most likely to outperform {horizon_phrase}. "
+            "Consider catalysts, liquidity, momentum, and risk. Return JSON {list:[...]} with up to "
             f"{top_k} tickers only. Watchlist ({kind}): {', '.join(base)}"
         ),
     }
@@ -4497,7 +4509,7 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
         ]
         log_json("info", msg="quant_candidates_external", kind="equity", items=len(eq_rank))
     else:
-        eq_seed: list[str] = await llm_shortlist("equity", list(eq_watch), top_k=seed_k)
+        eq_seed: list[str] = await llm_shortlist("equity", list(eq_watch), top_k=seed_k, horizon_days=horizon)
         eq_rank = await _rank_candidates(eq_seed, top_k=rank_k)
 
     if cr_precandidates:
@@ -4507,7 +4519,7 @@ async def _run_daily_quant(horizon_days: int | None = None) -> dict:
         ]
         log_json("info", msg="quant_candidates_external", kind="crypto", items=len(cr_rank))
     else:
-        cr_seed: list[str] = await llm_shortlist("crypto", list(cr_watch), top_k=seed_k)
+        cr_seed: list[str] = await llm_shortlist("crypto", list(cr_watch), top_k=seed_k, horizon_days=horizon)
         cr_rank = await _rank_candidates(cr_seed, top_k=rank_k)
 
     eq_rank = await _enrich_candidate_list(eq_rank)
@@ -6062,9 +6074,18 @@ def _load_labeled_samples(symbol: str, limit: int = 256):
     Features come from features_ref (legacy friendly).
     """
     con = fs_connect()
-    rows = con.execute("""
+    try:
+        cols_now = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('predictions')").fetchall()
+        }
+    except Exception:
+        cols_now = set()
+    issued_expr = "p.issued_at" if "issued_at" in cols_now else "p.ts"
+    rows = con.execute(
+        f"""
         SELECT
-            p.model_id, p.symbol, p.issued_at, p.horizon_days,
+            p.model_id, p.symbol, {issued_expr} AS issued_at, p.horizon_days,
             p.features_ref, p.q50, p.yhat_mean,
             o.realized_at, o.y AS realized_price
         FROM predictions p
@@ -6072,7 +6093,9 @@ def _load_labeled_samples(symbol: str, limit: int = 256):
         WHERE p.symbol = ?
         ORDER BY o.realized_at DESC
         LIMIT ?
-    """, [symbol.upper(), limit]).fetchall()
+    """,
+        [symbol.upper(), limit],
+    ).fetchall()
     con.close()
 
     X, y = [], []
