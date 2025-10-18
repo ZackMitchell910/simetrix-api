@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -298,262 +299,60 @@ async def _fetch_news_articles(symbol: str, since: datetime, provider: str, limi
     raise HTTPException(status_code=400, detail=f"Unsupported news provider '{provider}'.")
 
 
-async def fetch_recent_news(symbol: str, days: int = 7, limit: int = 40) -> list[dict[str, Any]]:
-    """Return recent news rows for a symbol from the feature store."""
-    if not callable(feature_store_connect):
+async def fetch_recent_news(symbol: str, days: int = 7, *, limit: int = 100) -> list[dict[str, Any]]:
+    """Load recent news rows for a symbol from the feature store."""
+
+    app_symbol = _to_app_symbol(symbol)
+    if not app_symbol or not callable(feature_store_connect):
         return []
-    symbol_norm = (symbol or "").strip().upper()
-    if not symbol_norm:
-        return []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=int(max(1, days)))
-    try:
-        con = feature_store_connect()
-    except Exception as exc:
-        logger.debug("fetch_recent_news: connect failed for %s: %s", symbol_norm, exc)
-        return []
-    try:
-        rows = con.execute(
-            """
-            SELECT ts, source, title, url, summary, sentiment
-            FROM news_articles
-            WHERE symbol = ? AND ts >= ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            [symbol_norm, cutoff, int(max(1, limit))],
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("fetch_recent_news: query failed for %s: %s", symbol_norm, exc)
-        rows = []
-    finally:
+
+    horizon = max(1, int(days))
+    since = datetime.now(timezone.utc) - timedelta(days=horizon)
+
+    def _load() -> list[dict[str, Any]]:
         try:
-            con.close()
+            con = feature_store_connect()
         except Exception:
-            pass
+            return []
 
-    out: list[dict[str, Any]] = []
-    for ts, source, title, url, summary, sentiment in rows:
-        ts_dt = _as_utc_datetime(ts) or datetime.now(timezone.utc)
-        out.append(
-            {
-                "ts": ts_dt.isoformat(),
-                "source": (source or "") if source is not None else "",
-                "headline": (title or "") if title is not None else "",
-                "url": (url or "") if url is not None else "",
-                "summary": (summary or "") if summary is not None else "",
-                "sentiment": (float(sentiment) if sentiment is not None else None),
-            }
-        )
-    return out
+        try:
+            rows = con.execute(
+                """
+                SELECT ts, source, title, url, summary, sentiment
+                FROM news_articles
+                WHERE symbol = ? AND ts >= ?
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                [app_symbol, since, int(limit)],
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
 
-
-async def fetch_social(symbol: str, handles: Sequence[str] | str | None = None) -> dict[str, Any]:
-    """Lightweight social sentiment stub used for diagnostics."""
-    symbol_norm = (symbol or "").strip().upper()
-    handles_list: list[str]
-    if isinstance(handles, str):
-        handles_list = [h.strip().lstrip("@") for h in handles.split(",") if h and h.strip()]
-    elif isinstance(handles, Sequence):
-        handles_list = [str(h).strip().lstrip("@") for h in handles if str(h).strip()]
-    else:
-        handles_list = []
-
-    base = symbol_norm or (symbol or "").strip().upper()
-    if not base:
-        base = "MARKET"
-
-    if handles_list:
-        posts = [f"@{handle} on {base}: tracking flows and positioning" for handle in handles_list[:5]]
-    else:
-        posts = [
-            f"Chatter about {base} continues as traders debate the outlook.",
-            f"{base} sentiment mixed after recent moves.",
-        ]
-
-    def _score(text: str) -> float:
-        txt = text.lower()
-        score = 0.0
-        for word in ("buy", "bull", "breakout", "beat", "strong", "upside"):
-            if word in txt:
-                score += 0.08
-        for word in ("sell", "bear", "miss", "risk", "downgrade", "weak"):
-            if word in txt:
-                score -= 0.08
-        return max(-0.3, min(0.3, score))
-
-    score = sum(_score(p) for p in posts) if posts else 0.0
-
-    return {
-        "symbol": symbol_norm,
-        "handles": handles_list,
-        "posts": posts[:5],
-        "score": float(score),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-
-
-async def load_option_surface(symbol: str, asof: date | None = None) -> dict[str, Any]:
-    symbol_norm = (symbol or "").strip().upper()
-    as_of = asof or datetime.now(timezone.utc).date()
-    key = _polygon_api_key()
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    url = f"https://api.polygon.io/v3/snapshot/options/{symbol_norm}"
-    raw_nodes: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    if key:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-            for contract_type in ("call", "put"):
-                params = {
-                    "contract_type": contract_type,
-                    "limit": "250",
-                    "order": "asc",
-                    "sort": "expiration_date",
+        payload: list[dict[str, Any]] = []
+        for ts, source, title, url, summary, sentiment in rows:
+            ts_dt = _as_utc_datetime(ts) or since
+            payload.append(
+                {
+                    "symbol": app_symbol,
+                    "ts": ts_dt,
+                    "source": (source or ""),
+                    "title": (title or ""),
+                    "url": (url or ""),
+                    "summary": (summary or ""),
+                    "sentiment": (float(sentiment) if sentiment is not None else None),
                 }
-                try:
-                    resp = await client.get(url, params=params, headers=headers)
-                    resp.raise_for_status()
-                    data = resp.json() or {}
-                except Exception as exc:
-                    errors.append(str(exc))
-                    continue
-                for item in data.get("results", []) or []:
-                    details = item.get("details") or {}
-                    expiration = details.get("expiration_date") or details.get("expiration")
-                    exp_date = _parse_date(expiration)
-                    if exp_date is None:
-                        continue
-                    dte = (exp_date - as_of).days
-                    if dte < 0:
-                        continue
-                    iv_raw = item.get("implied_volatility")
-                    if iv_raw is None:
-                        continue
-                    try:
-                        iv_val = float(iv_raw)
-                    except Exception:
-                        continue
-                    if not np.isfinite(iv_val) or iv_val <= 0:
-                        continue
-                    delta_val = 0.0
-                    greeks = item.get("greeks") or {}
-                    try:
-                        delta_val = float(greeks.get("delta", 0) or 0.0)
-                    except Exception:
-                        delta_val = 0.0
-                    strike_val = 0.0
-                    try:
-                        strike_val = float(details.get("strike_price") or 0.0)
-                    except Exception:
-                        strike_val = 0.0
-                    raw_nodes.append(
-                        {
-                            "expiration": exp_date.isoformat(),
-                            "dte": int(dte),
-                            "iv": iv_val,
-                            "type": contract_type,
-                            "delta": delta_val,
-                            "strike": strike_val,
-                        }
-                    )
-    else:
-        errors.append("polygon_key_missing")
+            )
+        return payload
 
-    grouped: dict[int, list[float]] = defaultdict(list)
-    for node in raw_nodes:
-        grouped[int(node["dte"])].append(float(node["iv"]))
-
-    nodes = []
-    for dte in sorted(grouped):
-        ivs = grouped[dte]
-        if not ivs:
-            continue
-        nodes.append({"dte": int(dte), "iv": float(np.mean(ivs)), "count": int(len(ivs))})
-
-    result = {
-        "symbol": symbol_norm,
-        "as_of": as_of.isoformat(),
-        "source": "polygon",
-        "nodes": nodes,
-        "raw_count": len(raw_nodes),
-    }
-    if errors:
-        result["errors"] = errors[:3]
-    return result
-
-
-async def load_futures_curve(symbol: str, asof: date | None = None) -> dict[str, Any]:
-    symbol_norm = (symbol or "").strip().upper()
-    as_of_dt = datetime.combine(asof, datetime.min.time(), tzinfo=timezone.utc) if asof else datetime.now(timezone.utc)
-    key = _polygon_api_key()
-    params = {
-        "underlying_ticker": symbol_norm,
-        "contract_type": "futures",
-        "apiKey": key,
-    }
-    nodes: list[dict[str, Any]] = []
-    errors: list[str] = []
-
-    if key:
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
-                resp = await client.get("https://api.polygon.io/v3/snapshot", params=params)
-                resp.raise_for_status()
-                data = resp.json() or {}
-        except Exception as exc:
-            errors.append(str(exc))
-            data = {}
-    else:
-        errors.append("polygon_key_missing")
-        data = {}
-
-    for item in (data.get("results") or []):
-        details = item.get("details") or {}
-        expiration = details.get("expiration_date") or details.get("expiration") or item.get("expiration_date")
-        exp_date = _parse_date(expiration)
-        if exp_date is None:
-            continue
-        dte = (exp_date - as_of_dt.date()).days
-        if dte < 0:
-            continue
-        price_val = None
-        last = item.get("last")
-        if isinstance(last, dict):
-            price_val = last.get("price")
-        if price_val is None:
-            price_val = item.get("price") or item.get("close") or item.get("c")
-        try:
-            price = float(price_val)
-        except Exception:
-            continue
-        if not np.isfinite(price) or price <= 0:
-            continue
-        oi_val = 0
-        try:
-            oi_val = int(item.get("open_interest", 0) or 0)
-        except Exception:
-            oi_val = 0
-        nodes.append(
-            {
-                "ticker": item.get("ticker"),
-                "dte": int(dte),
-                "price": price,
-                "expiration": exp_date.isoformat(),
-                "open_interest": oi_val,
-            }
-        )
-
-    nodes.sort(key=lambda x: x["dte"])
-
-    result = {
-        "symbol": symbol_norm,
-        "as_of": as_of_dt.isoformat(),
-        "source": "polygon",
-        "nodes": nodes,
-    }
-    if errors:
-        result["errors"] = errors[:3]
-    return result
+    rows = await asyncio.to_thread(_load)
+    rows.sort(key=lambda row: row.get("ts") or since, reverse=True)
+    return rows
 
 
 async def ingest_news(
@@ -800,6 +599,153 @@ async def score_news(
             pass
         log_json("error", msg="news_score_fail", symbol=symbol_norm, error=str(exc), tag=log_tag)
         raise HTTPException(status_code=500, detail=f"failed to update news sentiment: {exc}") from exc
+
+
+async def fetch_social(symbol: str, handles: Iterable[str] | None = None) -> dict[str, Any]:
+    """Lightweight deterministic social sentiment generator for X handles."""
+
+    symbol_norm = _to_app_symbol(symbol)
+    handles_list = [h.strip().lstrip("@") for h in (handles or []) if isinstance(h, str) and h.strip()]
+    handles_norm = [h.lower() for h in handles_list]
+
+    key_bits = [symbol_norm.upper()]
+    key_bits.extend(handles_norm)
+    key = "|".join(key_bits) or symbol_norm.upper()
+    digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).digest()
+
+    base = int.from_bytes(digest[:4], "big") / float(0xFFFFFFFF)
+    sentiment = float(np.clip(base * 2.0 - 1.0, -1.0, 1.0))
+
+    phrases = [
+        "seeing momentum build",
+        "vol remains elevated",
+        "watching macro catalysts",
+        "desk chatter mixed",
+        "options flow leaning bullish",
+    ]
+    samples: list[dict[str, Any]] = []
+    for idx, handle in enumerate(handles_norm[:5]):
+        start = 4 + idx * 4
+        chunk = digest[start:start + 4]
+        if len(chunk) < 4:
+            chunk = (chunk + digest[:4])[:4]
+        val = int.from_bytes(chunk, "big") / float(0xFFFFFFFF)
+        tone = "bullish" if val > 0.55 else ("bearish" if val < 0.45 else "neutral")
+        samples.append(
+            {
+                "handle": handle,
+                "tone": tone,
+                "score": float(np.clip((val - 0.5) * 2.0, -1.0, 1.0)),
+                "text": f"@{handle} {phrases[idx % len(phrases)]}",
+            }
+        )
+
+    return {
+        "symbol": symbol_norm,
+        "handles": handles_norm,
+        "sentiment": sentiment,
+        "sample": samples,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def load_option_surface(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Approximate an implied volatility surface using recent realized volatility."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "surface": [],
+            "source": "realized_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    horizons = [7, 14, 21, 30, 45, 60, 90, 120, 180]
+    surface: list[dict[str, Any]] = []
+    for window in horizons:
+        if rets.size < max(5, window):
+            continue
+        window_rets = rets[-window:]
+        sigma_daily = float(np.std(window_rets, ddof=1))
+        if not math.isfinite(sigma_daily) or sigma_daily <= 0:
+            continue
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0))
+        surface.append({"tenor_days": int(window), "iv": sigma_ann})
+
+    if not surface:
+        sigma_daily = float(np.std(rets, ddof=1)) if rets.size >= 5 else 0.0
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0)) if sigma_daily > 0 else 0.2
+        surface.append({"tenor_days": 30, "iv": sigma_ann})
+
+    ivs = np.array([row["iv"] for row in surface], dtype=float)
+    if ivs.size >= 3:
+        kernel_size = min(5, ivs.size)
+        kernel = np.ones(kernel_size, dtype=float) / float(kernel_size)
+        smooth = np.convolve(ivs, kernel, mode="same")
+        for entry, val in zip(surface, smooth):
+            entry["iv"] = float(np.clip(val, 1e-4, 3.0))
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "surface": surface,
+        "source": "realized_proxy",
+    }
+
+
+async def load_futures_curve(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Estimate a futures curve using recent drift as a carry proxy."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "curve": [],
+            "source": "drift_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    if rets.size == 0:
+        mu_daily = 0.0
+    else:
+        lookback = min(60, rets.size)
+        mu_daily = float(np.mean(rets[-lookback:]))
+    mu_ann = float(np.clip(mu_daily * 252.0, -5.0, 5.0))
+
+    horizons = [7, 30, 60, 90, 180, 365]
+    curve: list[dict[str, Any]] = []
+    spot = float(arr[-1])
+    for tenor in horizons:
+        decay = math.exp(-tenor / 365.0)
+        annualized = float(mu_ann * decay)
+        forward = float(spot * math.exp(annualized * tenor / 252.0))
+        curve.append(
+            {
+                "tenor_days": int(tenor),
+                "annualized_carry": annualized,
+                "forward_price": forward,
+            }
+        )
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "curve": curve,
+        "source": "drift_proxy",
+    }
 
 
 async def _fetch_earnings_polygon(symbol: str, lookback_days: int, limit: int = 16) -> list[tuple]:
@@ -1453,6 +1399,10 @@ async def ingest_grouped_daily(
 __all__ = [
     "ingest_news",
     "score_news",
+    "fetch_recent_news",
+    "fetch_social",
+    "load_option_surface",
+    "load_futures_curve",
     "ingest_earnings",
     "ingest_macro",
     "fetch_hist_prices",
