@@ -16,6 +16,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from src.api.deps import get_settings, get_redis
 from src.quotas import BASE_LIMIT_PER_MIN, rate_limit
 from src.api.routers import admin, auth as auth_router, core, inference, llm, training
+from src.routes import quant as quant_routes
 
 logger = logging.getLogger("simetrix.api")
 
@@ -72,6 +73,7 @@ app.include_router(training.router)
 app.include_router(inference.router)
 app.include_router(llm.router)
 app.include_router(core.router)
+app.include_router(quant_routes.router)
 
 
 @app.get("/")
