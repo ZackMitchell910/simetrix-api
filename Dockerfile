@@ -31,4 +31,4 @@ EXPOSE 8081
 HEALTHCHECK --interval=20s --timeout=5s --retries=5 
 CMD curl -fsS http://127.0.0.1:8081/health || exit 1
 
-CMD ["uvicorn", "predictive_service:app", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["uvicorn", "src.predictive_api:app", "--host", "0.0.0.0", "--port", "8081"]

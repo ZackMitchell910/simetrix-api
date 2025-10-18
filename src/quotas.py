@@ -22,8 +22,11 @@ BASE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))   # baseline RP
 SIM_LIMIT_PER_MIN  = int(os.getenv("SIM_LIMIT_PER_MIN",  "30"))    # simulate endpoints
 CRON_LIMIT_PER_MIN = int(os.getenv("CRON_LIMIT_PER_MIN", "10"))    # admin cron endpoints
 
+QUOTA_DISABLED = os.getenv("QUOTA_DISABLED", "0") == "1"
+DEV_PLAN_WHEN_NO_REDIS = os.getenv("DEV_PLAN_WHEN_NO_REDIS", "").strip()
+
 # Daily quotas per plan (override via env)
-Q_FREE  = int(os.getenv("QUOTA_FREE_DAILY",  "50"))
+Q_FREE  = int(os.getenv("QUOTA_FREE_DAILY",  "150"))
 Q_PRO   = int(os.getenv("QUOTA_PRO_DAILY",   "500"))
 Q_INST  = int(os.getenv("QUOTA_INST_DAILY",  "5000"))
 PLAN_DEFAULT = os.getenv("PLAN_DEFAULT", "free")  # free|pro|inst
@@ -90,11 +93,19 @@ def _daily_quota_for(plan: str) -> int:
         return Q_PRO
     return Q_FREE
 
+def _redis_ok(r: Optional[RedisLike]) -> bool:
+    try:
+        return bool(r) and hasattr(r, "ping")
+    except Exception:
+        return False
+
 async def rate_limit(r: Optional[RedisLike], request: Request, scope: str, limit_per_min: int) -> None:
     """
     Fixed-window per-minute limiter. Raises 429 on exceed.
     """
-    if not r:
+    if QUOTA_DISABLED:
+        return
+    if not _redis_ok(r):
         return  # no Redis configured => no enforcement
     caller = _caller_id(request)
     bucket = _now_minute_bucket()
@@ -117,8 +128,13 @@ async def quota_consume(r: Optional[RedisLike], request: Request, scope: str, un
     """
     Per-day quota by plan (free/pro/inst). Returns (used, limit). Raises 429 on exceed.
     """
-    if not r:
-        return (0, 0)  # no Redis => skip
+    if QUOTA_DISABLED:
+        return (0, 0)
+    if not _redis_ok(r):
+        # Dev fallback if Redis unavailable
+        plan = DEV_PLAN_WHEN_NO_REDIS or PLAN_DEFAULT
+        limit = _daily_quota_for(plan)
+        return (0, limit)
     caller = _caller_id(request)
     plan = _state_plan(request) or await _plan_for(caller, r)
     limit = _daily_quota_for(plan)

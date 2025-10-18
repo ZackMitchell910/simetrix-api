@@ -19,6 +19,10 @@ from src.core import (
     SIM_DISPATCHER,
     _MODEL_META_CACHE,
 )
+try:
+    from src.db.duck import insert_prediction
+except Exception:  # pragma: no cover - optional import
+    insert_prediction = None  # type: ignore[assignment]
 from src.feature_store import connect as fs_connect, log_prediction as fs_log_prediction
 from src.model_registry import get_active_model_version
 from src.services.inference import (
@@ -117,56 +121,13 @@ async def _update_run_state(
 
 
 async def run_simulation(run_id: str, req: SimRequest, redis: Redis) -> None:
-    mode_label = str(getattr(req, "mode", "quick") or "quick").lower()
-    started_at = time.perf_counter()
-
-    try:
-        logger.info("Starting simulation run %s symbol=%s", run_id, req.symbol)
-        rs = await _ensure_run(run_id)
-        await _update_run_state(
-            redis,
-            run_id,
-            rs,
-            status="running",
-            progress=0.05,
-            detail="Preparing historical data",
-        )
-
-        px = await ingestion_service.fetch_hist_prices(req.symbol, window_days=req.lookback_days())
-        if not px or len(px) < 10:
-            raise HTTPException(status_code=400, detail="Not enough price history")
-
-        prob_up = await get_ensemble_prob(req.symbol, redis, req.horizon_days)
-        await _update_run_state(redis, run_id, rs, progress=0.5, detail="Monte Carlo simulation running")
-
-        await asyncio.sleep(0)  # placeholder for actual simulation work
-
-        await _update_run_state(
-            redis,
-            run_id,
-            rs,
-            status="done",
-            progress=1.0,
-            detail="Simulation complete",
-        )
-        logger.info("Simulation run %s completed in %.3fs", run_id, time.perf_counter() - started_at)
-        return
-    except Exception as exc:
-        logger.exception("simulation_failed for %s: %s", run_id, exc)
-        try:
-            rs = await _ensure_run(run_id)
-        except Exception:
-            rs = RunState(run_id=run_id)
-        await _update_run_state(
-            redis,
-            run_id,
-            rs,
-            status="error",
-            progress=1.0,
-            detail="Simulation failed",
-            error=str(exc),
-        )
-        raise
+    from src import predictive_api
+    predictive_api.REDIS = redis
+    if not hasattr(predictive_api, '_ensure_run'):
+        predictive_api._ensure_run = _ensure_run
+    if not hasattr(predictive_api, '_update_run_state'):
+        predictive_api._update_run_state = _update_run_state
+    await predictive_api.run_simulation(run_id, req, redis)
 
 
 async def list_models(redis: Redis | None = None) -> List[str]:
@@ -195,24 +156,25 @@ async def log_prediction_to_stores(
     q50 = calibration_hint.get("q50") if calibration_hint else None
     q95 = calibration_hint.get("q95") if calibration_hint else None
 
-    try:
-        insert_prediction(
-            {
-                "pred_id": pred_id,
-                "ts": datetime.utcnow(),
-                "symbol": symbol,
-                "horizon_d": horizon_days,
-                "model_id": "ensemble-v1",
-                "prob_up_next": float(prob_up),
-                "p05": q05,
-                "p50": q50,
-                "p95": q95,
-                "spot0": spot0,
-                "user_ctx": {"ui": "pathpanda"},
-            }
-        )
-    except Exception as exc:
-        logger.exception("DuckDB insert_prediction failed: %s", exc)
+    if callable(insert_prediction):
+        try:
+            insert_prediction(
+                {
+                    "pred_id": pred_id,
+                    "ts": datetime.utcnow(),
+                    "symbol": symbol,
+                    "horizon_d": horizon_days,
+                    "model_id": "ensemble-v1",
+                    "prob_up_next": float(prob_up),
+                    "p05": q05,
+                    "p50": q50,
+                    "p95": q95,
+                    "spot0": spot0,
+                    "user_ctx": {"ui": "pathpanda"},
+                }
+            )
+        except Exception as exc:
+            logger.exception("DuckDB insert_prediction failed: %s", exc)
 
     try:
         con_fs = fs_connect()

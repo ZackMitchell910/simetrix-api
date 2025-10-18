@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 import pytest
 
-# Ensure required env vars so predictive_service imports cleanly
+# Ensure required env vars so predictive_api imports cleanly
 os.environ.setdefault("PT_POLYGON_KEY", "test-key")
 os.environ.setdefault("OPENAI_API_KEY", "")
 os.environ.setdefault("XAI_API_KEY", "dummy")
@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src import predictive_service as svc  # noqa: E402
+from src.services import llm as svc_llm  # noqa: E402
 
 
 class _DummyResponse:
@@ -62,9 +62,9 @@ _COMMON_PAYLOAD = {
 @pytest.mark.asyncio
 async def test_llm_summarize_async_parses_structured_dict(monkeypatch):
     data = {"choices": [{"message": {"content": dict(_COMMON_PAYLOAD)}}]}
-    monkeypatch.setattr(svc.httpx, "AsyncClient", _make_dummy_client(data), raising=False)
+    monkeypatch.setattr(svc_llm.httpx, "AsyncClient", _make_dummy_client(data), raising=False)
 
-    result = await svc.llm_summarize_async(
+    result = await svc_llm.summarize(
         {"role": "user", "content": "context"},
         prefer_xai=True,
         xai_key="dummy",
@@ -76,11 +76,11 @@ async def test_llm_summarize_async_parses_structured_dict(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_llm_summarize_async_parses_markdown_fenced_json(monkeypatch):
-    fenced = "```json\n" + svc.json.dumps(_COMMON_PAYLOAD) + "\n```"
+    fenced = "```json\n" + svc_llm.json.dumps(_COMMON_PAYLOAD) + "\n```"
     data = {"choices": [{"message": {"content": fenced}}]}
-    monkeypatch.setattr(svc.httpx, "AsyncClient", _make_dummy_client(data), raising=False)
+    monkeypatch.setattr(svc_llm.httpx, "AsyncClient", _make_dummy_client(data), raising=False)
 
-    result = await svc.llm_summarize_async(
+    result = await svc_llm.summarize(
         {"role": "user", "content": "context"},
         prefer_xai=True,
         xai_key="dummy",

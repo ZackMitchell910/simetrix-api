@@ -11,8 +11,8 @@ passlib[bcrypt]>=1.7,<2
 python-jose[cryptography]>=3.3,<3.4
 pyyaml>=6.0
 # --- Numerics / data
-# Use NumPy >=2.1.0 for Python 3.13 and TF 2.20 compatibility
-numpy>=2.1.0
+# Use a NumPy range that satisfies both TensorFlow and scikit-learn wheels on Render
+numpy>=1.24,<2.2
 pandas==2.2.3
 scikit-learn==1.5.2
 statsmodels==0.14.2
@@ -22,7 +22,10 @@ redis>=5,<6
 nltk>=3.9,<4
 ta==0.11.0
 onnx>=1.16,<2
-onnxruntime>=1.18,<2
+onnxruntime==1.17.3
+scipy>=1.14,<2
+pyarrow>=17,<18
+discord.py>=2.4,<3
 
 # --- Testing (optional)
 pytest>=8.2,<9
@@ -31,7 +34,7 @@ pytest-asyncio>=0.23,<0.24
 # --- RL stack (SB3 is PyTorch-based)
 gymnasium==0.29.1
 stable-baselines3==2.3.0
-torch>=2.3,<3            # SB3 needs PyTorch
+torch==2.3.1             # cpu wheel available for linux/windows; SB3 needs >=2.3
 
 # --- TensorFlow (CPU builds)
 # tensorflow-intel==2.15.0  # Windows-only; comment out for Linux deployment

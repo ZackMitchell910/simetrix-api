@@ -83,6 +83,21 @@ def run_migrations(target: str, db_path: str) -> List[str]:
     db_file = _normalized_db_path(db_path)
     con = duckdb.connect(db_file)
     try:
+        # --- Self-heal schema before running migrations ---
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info('predictions')").fetchall()}
+            if "issued_at" not in cols:
+                logger.info("migrations: adding missing 'issued_at' in %s", db_file)
+                con.execute("ALTER TABLE predictions ADD COLUMN issued_at TIMESTAMP")
+                if "ts" in cols:
+                    con.execute("UPDATE predictions SET issued_at = ts WHERE issued_at IS NULL")
+            if "features_ref" not in cols:
+                logger.info("migrations: adding missing 'features_ref' in %s", db_file)
+                con.execute("ALTER TABLE predictions ADD COLUMN features_ref VARCHAR")
+        except Exception as e:
+            logger.warning("migrations schema check skipped: %s", e)
+        # ---------------------------------------------------
+
         _ensure_migrations_table(con)
         applied = {
             row[0]
@@ -115,6 +130,7 @@ def run_migrations(target: str, db_path: str) -> List[str]:
         return executed
     finally:
         con.close()
+
 
 
 def run_all() -> Dict[str, List[str]]:

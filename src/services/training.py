@@ -8,13 +8,15 @@ import math
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
+from pydantic import BaseModel
 
 from src.core import (
+    REDIS,
     settings,
     _ARIMA_MODEL_CACHE,
     _LSTM_INFER_CACHE,
@@ -82,13 +84,8 @@ def _poly_key() -> str:
 
 
 def _get_redis():
-    """Fetch the Redis client from predictive_service for compatibility."""
-    try:
-        from src import predictive_service as svc  # type: ignore
-
-        return getattr(svc, "REDIS", None)
-    except Exception:
-        return None
+    """Return the shared Redis client (None when unavailable)."""
+    return REDIS
 
 
 def _basic_features_from_array(arr: np.ndarray) -> Dict[str, float]:
@@ -129,10 +126,18 @@ async def _feat_from_prices(symbol: str, px: List[float]) -> Dict[str, float]:
 
 def _load_labeled_samples(symbol: str, limit: int = 256) -> Tuple[np.ndarray, np.ndarray]:
     con = fs_connect()
+    try:
+        cols = {
+            row[1]
+            for row in con.execute("PRAGMA table_info('predictions')").fetchall()
+        }
+    except Exception:
+        cols = set()
+    issued_expr = "p.issued_at" if "issued_at" in cols else "p.ts"
     rows = con.execute(
-        """
+        f"""
         SELECT
-            p.model_id, p.symbol, p.issued_at, p.horizon_days,
+            p.model_id, p.symbol, {issued_expr} AS issued_at, p.horizon_days,
             p.features_ref, p.q50, p.yhat_mean,
             o.realized_at, o.y AS realized_price
         FROM predictions p
@@ -445,11 +450,57 @@ QUICK_TRAIN_LOOKBACK_DAYS = max(
 DEEP_TRAIN_LOOKBACK_DAYS = max(
     30, min(settings.lookback_days_max, int(os.getenv("PT_TRAIN_DEEP_LOOKBACK_DAYS", "3650")))
 )
+DEFAULT_TRAIN_PROFILE = "quick"
+_TRAIN_PROFILE_LOOKBACK: dict[str, int] = {
+    "quick": QUICK_TRAIN_LOOKBACK_DAYS,
+    "deep": DEEP_TRAIN_LOOKBACK_DAYS,
+}
+
+
+def _normalize_profile(profile: str | None) -> str:
+    """Return a supported training profile name."""
+    if not profile:
+        return DEFAULT_TRAIN_PROFILE
+    norm = profile.strip().lower()
+    if norm not in _TRAIN_PROFILE_LOOKBACK:
+        raise ValueError(f"Unsupported training profile '{profile}'")
+    return norm
+
+
+def _profile_lookback(profile: str) -> int:
+    return _TRAIN_PROFILE_LOOKBACK[profile]
+
+
+def _linear_model_key(symbol: str, profile: str) -> str:
+    """Return the Redis key for the linear head under the selected profile."""
+    sym = (symbol or "").upper().strip()
+    suffix = "LINEAR" if profile == DEFAULT_TRAIN_PROFILE else f"LINEAR:{profile.upper()}"
+    return model_key(f"{sym}_{suffix}")
+
+
+def resolve_training_profile(profile: str | None) -> str:
+    """Public helper to normalise a training profile name."""
+    return _normalize_profile(profile)
+
+
+def training_profile_lookback(profile: str) -> int:
+    """Return the default lookback window for a training profile."""
+    return _profile_lookback(profile)
+
+
+def linear_model_key_for_profile(symbol: str, profile: str) -> str:
+    """Return the Redis key for a linear model under the selected profile."""
+    return _linear_model_key(symbol, profile)
 
 RL_WINDOW = int(os.getenv("PT_RL_WINDOW", "100"))
 
 
-async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
+async def _train_models(
+    symbol: str,
+    *,
+    lookback_days: int | None = None,
+    profile: str | None = None,
+) -> dict[str, Any]:
     redis = _get_redis()
     if not redis:
         raise HTTPException(status_code=503, detail="redis_unavailable")
@@ -458,6 +509,12 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
     if not sym:
         raise HTTPException(status_code=400, detail="symbol_required")
 
+    try:
+        resolved_profile = _normalize_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if lookback_days is None:
+        lookback_days = _profile_lookback(resolved_profile)
     lookback_days = int(max(30, min(lookback_days, settings.lookback_days_max)))
     px = await ingestion_service.fetch_hist_prices(sym, window_days=lookback_days)
     if not px or len(px) < 10:
@@ -513,6 +570,7 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
         "val_brier": linear_val_brier,
         "dataset_hash": dataset_hash,
         "epochs": epochs,
+        "profile": resolved_profile,
     }
     version_suffix = (dataset_hash or uuid4().hex)[:8]
     model_version = f"{trained_at}-{version_suffix}"
@@ -524,7 +582,7 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
         try:
             await asyncio.to_thread(
                 register_model_version,
-                "linear",
+                "linear" if resolved_profile == DEFAULT_TRAIN_PROFILE else f"linear-{resolved_profile}",
                 sym,
                 model_version,
                 onnx_path.as_posix(),
@@ -537,12 +595,25 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
                     "n_train": int(train_idx),
                     "n_val": int(val_size),
                     "lookback_days": int(lookback_days),
+                    "profile": resolved_profile,
                 },
                 status="active",
             )
         except Exception as exc:
             logger.debug("Model registry update failed for linear %s: %s", sym, exc)
-    await redis.set(model_key(sym + "_linear"), json.dumps(linear_data))
+    cache_payload = {
+        "model": "logreg",
+        "weights": weights,
+        "features": feature_list,
+        "trained_at": trained_at,
+        "lookback_days": int(lookback_days),
+        "symbol": sym,
+        "val_accuracy": linear_val_accuracy,
+        "val_brier": linear_val_brier,
+        "dataset_hash": dataset_hash,
+        "profile": resolved_profile,
+    }
+    await redis.set(_linear_model_key(sym, resolved_profile), json.dumps(cache_payload))
 
     models_trained = 1
 
@@ -660,7 +731,12 @@ async def _train_models(symbol: str, *, lookback_days: int) -> dict[str, Any]:
     }
 
 
-async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None:
+async def _ensure_trained_models(
+    symbol: str,
+    *,
+    required_lookback: int | None = None,
+    profile: str | None = None,
+) -> None:
     redis = _get_redis()
     if not redis:
         raise HTTPException(status_code=503, detail="redis_unavailable")
@@ -669,9 +745,15 @@ async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None
     if not sym:
         raise HTTPException(status_code=400, detail="symbol_required")
 
+    try:
+        resolved_profile = _normalize_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if required_lookback is None:
+        required_lookback = _profile_lookback(resolved_profile)
     required_lookback = int(max(30, min(required_lookback, settings.lookback_days_max)))
 
-    redis_key = model_key(sym + "_linear")
+    redis_key = _linear_model_key(sym, resolved_profile)
 
     raw = await redis.get(redis_key)
     if raw:
@@ -682,6 +764,9 @@ async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None
         except Exception:
             data = {}
 
+        stored_profile = str(data.get("profile") or DEFAULT_TRAIN_PROFILE).strip().lower()
+        if stored_profile not in _TRAIN_PROFILE_LOOKBACK:
+            stored_profile = DEFAULT_TRAIN_PROFILE
         stored_lookback = int(data.get("lookback_days") or 0)
         trained_at = parse_trained_at(data.get("trained_at"))
 
@@ -693,17 +778,82 @@ async def _ensure_trained_models(symbol: str, *, required_lookback: int) -> None
                 age = datetime.now(timezone.utc) - trained_at
                 is_fresh = age <= TRAIN_REFRESH_DELTA
 
-        if stored_lookback >= required_lookback and is_fresh:
+        if stored_profile == resolved_profile and stored_lookback >= required_lookback and is_fresh:
             return
 
-    try:
-        from src import predictive_service as svc  # type: ignore
+    await _train_models(sym, lookback_days=required_lookback, profile=resolved_profile)
 
-        train_fn = getattr(svc, "_train_models", _train_models)
-    except Exception:
-        train_fn = _train_models
 
-    await train_fn(sym, lookback_days=required_lookback)
+class OnlineLearnRequest(BaseModel):
+    symbol: str
+    steps: int = 50
+    batch: int = 32
+    lr: float = 0.05
+    l2: float = 1e-4
+    eta: float = 2.0
+
+
+async def learn_online(req: OnlineLearnRequest) -> dict[str, Any]:
+    redis = _get_redis()
+    if redis is None:
+        raise HTTPException(status_code=503, detail="redis_unavailable")
+
+    sym = str(req.symbol or "").strip().upper()
+    if not sym:
+        raise HTTPException(status_code=422, detail="symbol is required")
+
+    limit = max(128, int(req.steps) * int(req.batch))
+    X, y = _load_labeled_samples(sym, limit=limit)
+    if X.size == 0 or y.size == 0:
+        return {"status": "no_data"}
+
+    key = _linear_model_key(sym, DEFAULT_TRAIN_PROFILE)
+    raw = await redis.get(key)
+    w0: np.ndarray | None = None
+    meta: Dict[str, Any] = {}
+    if raw:
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        try:
+            js = json.loads(raw)
+            w0 = np.asarray(js.get("coef", []), dtype=float)
+            feats = js.get("features", ["mom_20", "rvol_20", "autocorr_5"])
+            meta = {k: js.get(k) for k in ("trained_at", "n_samples")}
+            if w0.shape[0] != len(feats) + 1:
+                w0 = None
+        except Exception:
+            w0 = None
+
+    rng = np.random.default_rng(42)
+    idx = np.arange(X.shape[0])
+    rng.shuffle(idx)
+    Xs = X[idx]
+    ys = y[idx].astype(float)
+
+    learner = SGDOnline(lr=float(req.lr), l2=float(req.l2))
+    learner.init(X.shape[1])
+
+    if w0 is not None and hasattr(learner, "w"):
+        learner.w = w0.astype(float)
+
+    steps = max(1, int(req.steps))
+    batch = max(1, int(req.batch))
+    for t in range(steps):
+        lo = (t * batch) % Xs.shape[0]
+        hi = lo + batch
+        xb = Xs[lo:hi]
+        yb = ys[lo:hi]
+        for i in range(xb.shape[0]):
+            learner.update(xb[i], float(yb[i]))
+
+    model = {
+        "coef": learner.w.tolist(),
+        "features": ["mom_20", "rvol_20", "autocorr_5"],
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "n_samples": int((meta.get("n_samples") or 0) + X.shape[0]),
+    }
+    await redis.set(key, json.dumps(model))
+    return {"status": "ok", "model": model}
 
 
 if gym is not None:
@@ -775,12 +925,18 @@ __all__ = [
     "_train_lstm_blocking",
     "_train_models",
     "_train_rl_blocking",
+    "DEFAULT_TRAIN_PROFILE",
     "DEEP_TRAIN_LOOKBACK_DAYS",
     "EW",
+    "linear_model_key_for_profile",
     "QUICK_TRAIN_LOOKBACK_DAYS",
     "RL_WINDOW",
     "SGDOnline",
     "StockEnv",
     "TRAIN_REFRESH_DELTA",
     "TRAIN_REFRESH_HOURS",
+    "resolve_training_profile",
+    "OnlineLearnRequest",
+    "training_profile_lookback",
+    "learn_online",
 ]

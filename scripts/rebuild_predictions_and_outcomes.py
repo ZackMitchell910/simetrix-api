@@ -40,7 +40,9 @@ if table_exists("predictions"):
           p95           DOUBLE,
           spot0         DOUBLE,
           user_ctx      JSON,
-          run_id        TEXT
+          run_id        TEXT,
+          issued_at     TIMESTAMP,
+          features_ref  TEXT
         )
     """)
     # Map old columns -> canonical
@@ -50,7 +52,7 @@ if table_exists("predictions"):
         SELECT
           COALESCE({pred_id}, uuid())      AS pred_id,
           COALESCE({ts}, NOW())            AS ts,
-          symbol                           AS symbol,
+          {symbol}                         AS symbol,
           COALESCE({horizon}, 0)           AS horizon_d,
           COALESCE(model_id, 'unknown')    AS model_id,
           {prob_up_next}                   AS prob_up_next,
@@ -59,16 +61,22 @@ if table_exists("predictions"):
           {p95}                            AS p95,
           NULL                             AS spot0,
           NULL                             AS user_ctx,
-          run_id                           AS run_id
+          {run_id}                         AS run_id,
+          COALESCE({issued}, NOW())        AS issued_at,
+          {features}                       AS features_ref
         FROM predictions
     """.format(
         pred_id   = "pred_id"      if "pred_id"      in have else "NULL",
         ts        = "issued_at"    if "issued_at"    in have else "ts" if "ts" in have else "NULL",
+        symbol    = "symbol"       if "symbol"       in have else "'UNKNOWN'",
         horizon   = "horizon_days" if "horizon_days" in have else "horizon_d" if "horizon_d" in have else "NULL",
         prob_up_next = "prob_up"   if "prob_up"      in have else "prob_up_next" if "prob_up_next" in have else "NULL",
         p05       = "q05"          if "q05"          in have else "p05" if "p05" in have else "NULL",
         p50       = "q50"          if "q50"          in have else "p50" if "p50" in have else "NULL",
         p95       = "q95"          if "q95"          in have else "p95" if "p95" in have else "NULL",
+        run_id    = "run_id"       if "run_id"       in have else "NULL",
+        issued    = "issued_at"    if "issued_at"    in have else "ts" if "ts" in have else "NULL",
+        features  = "features_ref" if "features_ref" in have else "NULL",
     )
     con.execute("INSERT INTO predictions__canon " + sel)
     con.execute("DROP TABLE predictions")
@@ -88,7 +96,9 @@ else:
           p95           DOUBLE,
           spot0         DOUBLE,
           user_ctx      JSON,
-          run_id        TEXT
+          run_id        TEXT,
+          issued_at     TIMESTAMP,
+          features_ref  TEXT
         )
     """)
 

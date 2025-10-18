@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,8 +11,13 @@ from typing import Any, Dict, Optional
 import numpy as np
 from fastapi import HTTPException
 
-from .. import predictive_service as svc  # type: ignore
+from src.core import REDIS
+from src.services.inference import get_ensemble_prob
+from src.services.labeling import to_polygon_ticker
+from src.services.quant_utils import ewma_sigma, horizon_shrink, simulate_gbm_student_t, winsorize
 from . import ingestion as ingestion_service
+
+logger = logging.getLogger("simetrix.services.quant_daily")
 
 TTL_DAY_SECONDS = 27 * 3600
 TTL_MINIMAL_SECONDS = 6 * 3600
@@ -59,7 +65,7 @@ async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any
     if not symbol_clean:
         raise HTTPException(status_code=400, detail="Symbol cannot be blank")
 
-    redis = svc.REDIS
+    redis = REDIS
     cache_key = _cache_key(symbol_clean, horizon_days)
     if redis:
         try:
@@ -95,9 +101,9 @@ async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any
 
 
 async def _compute_minimal_summary(symbol: str, horizon_days: int) -> MinimalSummary:
-    sym_fetch = svc._to_polygon_ticker(symbol)
+    sym_fetch = to_polygon_ticker(symbol)
     window_days = max(60, min(540, int(horizon_days * 12)))
-    prices = await ingestion_service.fetch_cached_hist_prices(sym_fetch, window_days, svc.REDIS)
+    prices = await ingestion_service.fetch_cached_hist_prices(sym_fetch, window_days, REDIS)
     if not prices or len(prices) < 30:
         raise HTTPException(status_code=503, detail=f"Insufficient history for {symbol}")
 
@@ -107,20 +113,20 @@ async def _compute_minimal_summary(symbol: str, horizon_days: int) -> MinimalSum
     rets = np.diff(np.log(arr[-(history_window + 1):]))
     if rets.size == 0 or not np.isfinite(rets).all():
         raise HTTPException(status_code=503, detail=f"Insufficient history for {symbol}")
-    rets = svc._winsorize(rets)
+    rets = winsorize(rets)
 
     scale = 252.0
-    sigma_ann = float(np.clip(svc._ewma_sigma(rets) * math.sqrt(scale), 1e-4, 5.0))
+    sigma_ann = float(np.clip(ewma_sigma(rets) * math.sqrt(scale), 1e-4, 5.0))
     mu_ann = float(np.clip(np.mean(rets) * scale, -1.5, 1.5))
-    mu_ann *= svc._horizon_shrink(horizon_days)
+    mu_ann *= horizon_shrink(horizon_days)
 
     try:
-        p_up_ml = await asyncio.wait_for(svc.get_ensemble_prob(symbol, svc.REDIS, horizon_days), timeout=0.6)
+        p_up_ml = await asyncio.wait_for(get_ensemble_prob(symbol, REDIS, horizon_days), timeout=0.6)
         mu_ann = float(mu_ann + 0.30 * (2.0 * p_up_ml - 1.0) * sigma_ann)
     except Exception:
         pass
 
-    paths = svc.simulate_gbm_student_t(
+    paths = simulate_gbm_student_t(
         S0=s0,
         mu_ann=mu_ann,
         sigma_ann=sigma_ann,
@@ -167,7 +173,7 @@ async def prefill_minimal_summary(
     as_of: str,
     horizon_days: int,
 ) -> None:
-    redis = svc.REDIS
+    redis = REDIS
     if not redis:
         return
 
@@ -215,7 +221,7 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
             predicted = base
         if not math.isfinite(bullish) and info.get("run_id"):
             try:
-                raw_art = await svc.REDIS.get(f"artifact:{info.get('run_id')}")
+                raw_art = await REDIS.get(f"artifact:{info.get('run_id')}")
                 if raw_art:
                     art_doc = json.loads(raw_art)
                     term_prices = art_doc.get("terminal_prices") or []
@@ -248,34 +254,10 @@ async def _payload_from_doc(symbol: str, doc: Optional[dict], horizon_days: int)
 
 async def _refresh_summary(symbol: str, horizon_days: int) -> Optional[MinimalSummary]:
     try:
-        res = await svc._mc_summary(symbol, horizon_days)
+        summary = await _compute_minimal_summary(symbol, horizon_days)
+        return summary
     except HTTPException:
         raise
     except Exception as exc:
-        svc.logger.debug("mc_summary refresh failed for %s: %s", symbol, exc)
+        logger.debug("refresh_summary failed for %s: %s", symbol, exc)
         return None
-
-    prob = _to_number(res.get("prob_up_end", res.get("prob_up_30d")))
-    base = _to_number(res.get("base_price"))
-    predicted = _to_number(res.get("predicted_price", res.get("most_likely_price")))
-    bullish = _to_number(res.get("bullish_price", res.get("p95")))
-
-    if base is None:
-        spot = _to_number(res.get("spot0") or res.get("spot"))
-        med_pct = _to_number(res.get("median_return_pct"))
-        if spot is not None and med_pct is not None:
-            base = float(spot * (1.0 + med_pct / 100.0))
-    if predicted is None:
-        predicted = base
-
-    if None in (prob, base, predicted, bullish):
-        return None
-
-    return MinimalSummary(
-        symbol=symbol,
-        horizon_days=horizon_days,
-        prob_up=prob,
-        base_price=base,
-        predicted_price=predicted,
-        bullish_price=bullish,
-    )

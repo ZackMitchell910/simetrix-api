@@ -8,7 +8,7 @@ services:
     buildCommand: |
       pip install -U pip
       pip install -r requirements.txt
-    startCommand: uvicorn src.predictive_service:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn src.predictive_api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
     envVars:
@@ -19,7 +19,7 @@ services:
         sync: false
       - key: XAI_API_KEY           # your xAI key
         sync: false
-      - key: REDIS_URL             # a Render/Upstash Redis URL
+      - key: PT_REDIS_URL          # a Render/Upstash Redis URL
         sync: false
 
       # --- LLM model (can keep default) ---
@@ -67,6 +67,27 @@ services:
     #   - name: duckdb
     #     mountPath: /var/data
     #     sizeGB: 1
+
+  # -------------------- DISCORD BOT WORKER --------------------
+  - type: worker
+    name: simetrix-discord-bot
+    env: python
+    plan: starter
+    buildCommand: |
+      pip install -U pip
+      pip install -r requirements.txt
+    startCommand: python scripts/discord_bot.py
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: SIMETRIX_API_BASE
+        value: https://simetrix.io
+      - key: SIMETRIX_API_KEY
+        sync: false
+      - key: SIMETRIX_DEFAULT_SYMBOL
+        value: NVDA
+      - key: SIMETRIX_DEFAULT_HORIZON
+        value: 30
 
   # -------------------- CRON: warm/health (UTC) --------------------
   - type: cron

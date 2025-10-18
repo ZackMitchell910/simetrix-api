@@ -49,7 +49,6 @@ from src.services.common import (
     load_gymnasium,
     load_stable_baselines3,
     load_tensorflow,
-    model_key,
 )
 from src.services.training import (
     RL_WINDOW,
@@ -57,6 +56,9 @@ from src.services.training import (
     _feat_from_prices,
     _onnx_model_path,
     _onnx_supported,
+    DEFAULT_TRAIN_PROFILE,
+    linear_model_key_for_profile,
+    resolve_training_profile,
 )
 from src.services import ingestion as ingestion_service
 
@@ -72,6 +74,7 @@ class PreparedFeatures:
     feature_map: dict[str, float]
     prices: List[float]
     spot: float
+    profile: str
 
 
 @dataclass
@@ -639,7 +642,13 @@ def _sigmoid(z: float) -> float:
     return 1.0 / (1.0 + math.exp(-float(np.clip(z, -60.0, 60.0))))
 
 
-async def prepare_features(symbol: str, redis, horizon_days: int) -> PreparedFeatures:
+async def prepare_features(
+    symbol: str,
+    redis,
+    horizon_days: int,
+    *,
+    profile: str | None = None,
+) -> PreparedFeatures:
     sym = (symbol or "").upper().strip()
     if not sym:
         raise HTTPException(status_code=400, detail="symbol_required")
@@ -647,9 +656,19 @@ async def prepare_features(symbol: str, redis, horizon_days: int) -> PreparedFea
     if redis is None:
         raise HTTPException(status_code=503, detail="redis_unavailable")
 
-    raw = await redis.get(model_key(sym + "_linear"))
+    try:
+        resolved_profile = resolve_training_profile(profile)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    raw = await redis.get(linear_model_key_for_profile(sym, resolved_profile))
     if not raw:
-        raise HTTPException(status_code=404, detail="Linear model not found; train first")
+        detail = (
+            f"linear model ({resolved_profile}) not found; train first"
+            if resolved_profile != DEFAULT_TRAIN_PROFILE
+            else "Linear model not found; train first"
+        )
+        raise HTTPException(status_code=404, detail=detail)
     if isinstance(raw, (bytes, bytearray)):
         raw = raw.decode("utf-8", errors="replace")
     try:
@@ -674,6 +693,7 @@ async def prepare_features(symbol: str, redis, horizon_days: int) -> PreparedFea
         feature_map=feature_map,
         prices=list(prices),
         spot=spot,
+        profile=resolved_profile,
     )
 
 
@@ -748,9 +768,15 @@ async def evaluate_models(prep: PreparedFeatures, horizon_days: int) -> ModelEva
     return ModelEvaluation(prob_up=prob_up, used_models=used, preds=preds, rl_adjust=rl_adjust)
 
 
-async def get_ensemble_prob(symbol: str, redis, horizon_days: int = 1) -> float:
+async def get_ensemble_prob(
+    symbol: str,
+    redis,
+    horizon_days: int = 1,
+    *,
+    profile: str | None = None,
+) -> float:
     try:
-        prep = await prepare_features(symbol, redis, horizon_days)
+        prep = await prepare_features(symbol, redis, horizon_days, profile=profile)
         evaluation = await evaluate_models(prep, horizon_days)
         return evaluation.prob_up
     except HTTPException:
@@ -760,9 +786,15 @@ async def get_ensemble_prob(symbol: str, redis, horizon_days: int = 1) -> float:
         return 0.5
 
 
-async def get_ensemble_prob_light(symbol: str, redis, horizon_days: int = 1) -> float:
+async def get_ensemble_prob_light(
+    symbol: str,
+    redis,
+    horizon_days: int = 1,
+    *,
+    profile: str | None = None,
+) -> float:
     try:
-        prep = await prepare_features(symbol, redis, horizon_days)
+        prep = await prepare_features(symbol, redis, horizon_days, profile=profile)
         prob = _linear_probability(prep)
         if prob is not None:
             return prob

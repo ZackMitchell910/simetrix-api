@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src import predictive_service as svc  # noqa: E402
+from src import predictive_api as svc  # noqa: E402
 
 
 @pytest.mark.skipif(not svc._onnx_supported(), reason="ONNX runtime not available")
