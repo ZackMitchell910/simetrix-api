@@ -8,8 +8,9 @@ import math
 import os
 import random
 import time
+from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import httpx
 import numpy as np
@@ -190,6 +191,25 @@ def _news_ts(value: Any, default: datetime) -> datetime:
         except Exception:
             pass
     return default
+
+
+def _parse_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        txt = value.strip()
+        if not txt:
+            return None
+        try:
+            return datetime.fromisoformat(txt.replace("Z", "+00:00")).date()
+        except Exception:
+            try:
+                return datetime.strptime(txt.split("T")[0], "%Y-%m-%d").date()
+            except Exception:
+                return None
+    return None
 
 
 async def _news_rows_from_newsapi(symbol: str, since: datetime, limit: int, api_key: str) -> list[tuple]:

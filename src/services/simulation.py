@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from redis.asyncio import Redis
 
 from src.core import (
@@ -49,8 +49,30 @@ class SimRequest(BaseModel):
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
-    x_handles: List[str] = Field(default_factory=list, alias="handles")
+    x_handles: list[str] = Field(default_factory=list, description="Optional X/Twitter handles to bias sentiment fetch")
     seed: Optional[int] = None
+
+    @model_validator(mode="before")
+    def _coerce_handles(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        raw = (
+            values.get("x_handles")
+            or values.get("handles")
+            or values.get("xHandles")
+            or values.get("x_handles")
+        )
+        if raw is None:
+            return values
+        handles: list[str] = []
+        if isinstance(raw, str):
+            handles = [h.strip() for h in raw.split(",") if h and h.strip()]
+        elif isinstance(raw, (list, tuple, set)):
+            handles = [str(h).strip() for h in raw if str(h).strip()]
+        else:
+            txt = str(raw).strip()
+            if txt:
+                handles = [txt]
+        values["x_handles"] = handles
+        return values
 
     @property
     def n_paths(self) -> int:
