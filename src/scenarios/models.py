@@ -1,94 +1,62 @@
-"""Data structures representing scenario shocks."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Mapping
 
 
-@dataclass
-class EventShock:
-    """Represents a discrete scenario applied during the simulation horizon.
+@dataclass(frozen=True, slots=True)
+class ShockOverride:
+    """Quantitative overrides applied by an :class:`EventShock`.
 
-    The fields are intentionally generic so that both scenario generation and
-    pricing engines can attach additional metadata without breaking downstream
-    consumers.  The `mutually_exclusive_group` flag allows scenario generators to
-    emit several variants (for example, *beat*, *inline*, *miss*) that should be
-    normalised so that their priors sum to at most one.
+    Attributes
+    ----------
+    drift_bump : float
+        Annualised drift adjustment applied additively.
+    vol_multiplier : float
+        Multiplicative factor applied to the instantaneous volatility.
+    jump_intensity : float
+        Additional jump arrival intensity (lambda) expressed in annualised units.
+    jump_mean : float
+        Mean jump size in log space.
+    jump_std : float
+        Standard deviation of the jump size in log space.
     """
 
-    symbol: str
-    label: str
-    window_start: datetime
-    window_end: datetime
-    prior: float
-    variant: str = "base"
-    description: str | None = None
-    drift: float = 0.0
-    volatility_scale: float = 1.0
+    drift_bump: float = 0.0
+    vol_multiplier: float = 1.0
     jump_intensity: float = 0.0
     jump_mean: float = 0.0
     jump_std: float = 0.0
-    mutually_exclusive_group: str | None = None
-    evidence: list[str] = field(default_factory=list)
-    metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def copy(self, **updates: Any) -> "EventShock":
-        """Return a copy with updated fields."""
+    def merge(self, other: "ShockOverride") -> "ShockOverride":
+        """Combine overrides sequentially."""
+        return ShockOverride(
+            drift_bump=self.drift_bump + other.drift_bump,
+            vol_multiplier=self.vol_multiplier * other.vol_multiplier,
+            jump_intensity=self.jump_intensity + other.jump_intensity,
+            jump_mean=self.jump_mean + other.jump_mean,
+            jump_std=max(self.jump_std, other.jump_std),
+        )
 
-        return replace(self, **updates)
+
+@dataclass(frozen=True, slots=True)
+class EventShock:
+    """Structured representation of a hypothetical event outcome."""
+
+    symbol: str
+    name: str
+    variant: str
+    prior: float
+    window_start: datetime
+    window_end: datetime
+    override: ShockOverride = field(default_factory=ShockOverride)
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def with_prior(self, prior: float) -> "EventShock":
-        """Return a copy with an updated prior while keeping other fields."""
+        return replace(self, prior=max(0.0, float(prior)))
 
-        return self.copy(prior=prior)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialise the shock to a dictionary for logging/diagnostics."""
-
-        payload: Dict[str, Any] = {
-            "symbol": self.symbol,
-            "label": self.label,
-            "window_start": self.window_start.isoformat(),
-            "window_end": self.window_end.isoformat(),
-            "prior": self.prior,
-            "variant": self.variant,
-            "description": self.description,
-            "drift": self.drift,
-            "volatility_scale": self.volatility_scale,
-            "jump_intensity": self.jump_intensity,
-            "jump_mean": self.jump_mean,
-            "jump_std": self.jump_std,
-            "mutually_exclusive_group": self.mutually_exclusive_group,
-            "evidence": list(self.evidence),
-        }
-        if self.metadata:
-            payload["metadata"] = self.metadata
-        return payload
-
-
-def normalise_priors(shocks: Mapping[str | None, list[EventShock]]) -> list[EventShock]:
-    """Normalise priors within each mutually exclusive group.
-
-    Parameters
-    ----------
-    shocks:
-        Mapping from mutually exclusive group name to the list of shocks that
-        belong to the group.  The ``None`` key represents shocks with no
-        exclusivity constraints.
-    """
-
-    normalised: list[EventShock] = []
-    for group, variants in shocks.items():
-        if not variants:
-            continue
-        total = sum(max(variant.prior, 0.0) for variant in variants)
-        if group is None or total <= 1.0 or total == 0.0:
-            normalised.extend(variant if variant.prior >= 0 else variant.with_prior(0.0) for variant in variants)
-            continue
-        scale = min(1.0 / total, 1.0)
-        for variant in variants:
-            clipped = max(variant.prior, 0.0) * scale
-            normalised.append(variant.with_prior(clipped))
-    return normalised
+    def with_metadata(self, **metadata: Any) -> "EventShock":
+        merged = dict(self.metadata)
+        merged.update(metadata)
+        return replace(self, metadata=merged)

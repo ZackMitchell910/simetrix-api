@@ -1,91 +1,82 @@
-"""Shock scheduling utilities used by simulation engines."""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Sequence
+from typing import Sequence
 
 import numpy as np
 
 from src.scenarios.models import EventShock
+from .types import StateVector
 
 
-@dataclass
-class ShockApplication:
-    """Compiled set of adjustments aligned with the simulation grid."""
-
+@dataclass(slots=True)
+class ShockSchedule:
+    times: np.ndarray
     drift: np.ndarray
-    volatility: np.ndarray
+    vol_multiplier: np.ndarray
     jump_intensity: np.ndarray
     jump_mean: np.ndarray
     jump_std: np.ndarray
-    metadata: list[dict[str, Any]] = field(default_factory=list)
-
-    def effective_sigma(self, base_sigma: float) -> np.ndarray:
-        return base_sigma * self.volatility
 
 
 class ShockScheduler:
-    """Project discrete EventShock objects onto the simulation grid."""
+    """Translate scenario windows into per-step overrides."""
 
-    def compile(
-        self,
+    def __init__(self, schedule: ShockSchedule):
+        self.schedule = schedule
+
+    @classmethod
+    def from_scenarios(
+        cls,
         scenarios: Sequence[EventShock],
-        time_grid: Sequence[datetime],
-    ) -> ShockApplication:
-        if len(time_grid) < 2:
-            raise ValueError("time_grid must contain at least two points")
-
-        n_steps = len(time_grid) - 1
+        state: StateVector,
+        times: np.ndarray,
+    ) -> "ShockScheduler":
+        n_steps = len(times) - 1
         drift = np.zeros(n_steps, dtype=float)
-        volatility = np.ones(n_steps, dtype=float)
+        vol = np.ones(n_steps, dtype=float)
         jump_intensity = np.zeros(n_steps, dtype=float)
         jump_mean = np.zeros(n_steps, dtype=float)
         jump_std = np.zeros(n_steps, dtype=float)
-        metadata: list[dict[str, Any]] = []
 
         for shock in scenarios:
-            if shock.window_end < time_grid[0] or shock.window_start > time_grid[-1]:
+            start_idx, end_idx = _window_to_index(shock, state.asof, times)
+            if start_idx >= end_idx:
                 continue
-            indices = self._indices_for(shock, time_grid)
-            if not indices.size:
-                continue
-            drift[indices] += shock.drift * shock.prior
-            volatility[indices] *= max(shock.volatility_scale, 0.0)
-            jump_intensity[indices] += max(shock.jump_intensity, 0.0) * shock.prior
-            jump_mean[indices] += shock.jump_mean * shock.prior
-            jump_std[indices] = np.maximum(jump_std[indices], shock.jump_std)
-            metadata.append(
-                {
-                    "label": shock.label,
-                    "variant": shock.variant,
-                    "prior": shock.prior,
-                    "indices": indices.tolist(),
-                }
+            override = shock.override
+            drift[start_idx:end_idx] += override.drift_bump
+            vol[start_idx:end_idx] *= override.vol_multiplier
+            jump_intensity[start_idx:end_idx] += override.jump_intensity
+            jump_mean[start_idx:end_idx] += override.jump_mean
+            jump_std[start_idx:end_idx] = np.maximum(
+                jump_std[start_idx:end_idx], override.jump_std
             )
 
-        return ShockApplication(
+        schedule = ShockSchedule(
+            times=np.asarray(times, dtype=float),
             drift=drift,
-            volatility=volatility,
+            vol_multiplier=vol,
             jump_intensity=jump_intensity,
             jump_mean=jump_mean,
             jump_std=jump_std,
-            metadata=metadata,
         )
+        return cls(schedule)
 
-    def _indices_for(self, shock: EventShock, time_grid: Sequence[datetime]) -> np.ndarray:
-        start = shock.window_start
-        end = shock.window_end
-        mask = []
-        for idx in range(len(time_grid) - 1):
-            left = time_grid[idx]
-            right = time_grid[idx + 1]
-            if right <= start or left >= end:
-                mask.append(False)
-            else:
-                mask.append(True)
-        return np.nonzero(mask)[0]
+    def overrides(self) -> ShockSchedule:
+        return self.schedule
 
 
-__all__ = ["ShockScheduler", "ShockApplication"]
+def _window_to_index(shock: EventShock, asof: datetime, times: np.ndarray) -> tuple[int, int]:
+    start = max(0.0, _days_between(asof, shock.window_start))
+    end = max(0.0, _days_between(asof, shock.window_end))
+    idx_start = int(np.searchsorted(times, start, side="left"))
+    idx_end = int(np.searchsorted(times, end, side="right"))
+    idx_start = min(idx_start, len(times) - 1)
+    idx_end = min(max(idx_end, idx_start + 1), len(times) - 1)
+    return idx_start, idx_end
+
+
+def _days_between(asof: datetime, ts: datetime) -> float:
+    delta = ts - asof
+    return delta.total_seconds() / 86400.0

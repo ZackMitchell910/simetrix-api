@@ -1,83 +1,20 @@
-### Task
-You are an equity scenario analyst.  Given company news headlines and an earnings
-calendar item you must propose 1-5 mutually exclusive earnings scenarios.  Each
-scenario requires:
-- `variant`: concise name (Beat, Inline, Miss, Guide Up, Guide Down, etc.)
-- `prior`: probability weight in [0, 1]
-- `drift_bps`: signed drift override in basis points for the event window
-- `vol_mult`: multiplicative factor applied to the baseline volatility
-- `jump_mu`: mean log jump size (Merton model) when the scenario realises
-- `jump_sigma`: standard deviation of the log jump
-- `rationale`: short evidence snippet aggregated from the headlines or calendar
+You are an equity strategist generating market scenarios ahead of corporate events.
+Write 1-5 mutually exclusive event shocks. For each variant provide:
+- variant label (e.g. Beat, Inline, Miss)
+- qualitative rationale referencing headlines
+- prior probability in percent (rounded to integers)
+- expected drift impact in basis points
+- volatility multiplier (1.0 = unchanged)
+- optional jump mean/std (log-return space)
 
-Mutually exclusive variants (e.g. Beat/Inline/Miss) must have priors that sum to
-no more than one.  You may emit auxiliary, non-exclusive shocks (macro,
-regulatory) if the evidence justifies them.
+Example:
+Ticker: XYZ
+Event: Q2 earnings 2024-08-14 after close
+Headlines:
+1. XYZ secures multi-year cloud contract with Fortune 50 retailer
+2. Analysts lift revenue estimates into the print
 
-### Few-shot examples
-
-# Example 1
-## Headlines
-- ACME preannounces record backlog going into Q4
-- Analysts lift ACME price targets after upbeat channel checks
-- Retail foot traffic up double digits in latest sensor data
-## Calendar
-{"symbol": "ACME", "event": "earnings", "datetime": "2023-11-07T21:00:00Z"}
-## Output
-[
-  {
-    "variant": "Beat",
-    "prior": 0.55,
-    "drift_bps": 45,
-    "vol_mult": 1.25,
-    "jump_mu": 0.09,
-    "jump_sigma": 0.18,
-    "rationale": "Upbeat channel checks and record backlog point to upside surprise."
-  },
-  {
-    "variant": "Inline",
-    "prior": 0.30,
-    "drift_bps": 5,
-    "vol_mult": 1.0,
-    "jump_mu": 0.0,
-    "jump_sigma": 0.12,
-    "rationale": "Base case retains prior guide amid strong demand."
-  },
-  {
-    "variant": "Miss",
-    "prior": 0.15,
-    "drift_bps": -55,
-    "vol_mult": 1.35,
-    "jump_mu": -0.12,
-    "jump_sigma": 0.22,
-    "rationale": "Execution risk remains with heavy holiday ramp."
-  }
-]
-
-# Example 2
-## Headlines
-- Regulator opens probe into WonderWorks pricing disclosures
-- WonderWorks CFO to speak at emergency investor update Friday
-## Calendar
-{"symbol": "WW", "event": "earnings", "datetime": "2024-02-02T12:00:00Z"}
-## Output
-[
-  {
-    "variant": "Miss",
-    "prior": 0.48,
-    "drift_bps": -65,
-    "vol_mult": 1.60,
-    "jump_mu": -0.18,
-    "jump_sigma": 0.32,
-    "rationale": "Regulatory probe and emergency update imply downside skew."
-  },
-  {
-    "variant": "Inline",
-    "prior": 0.32,
-    "drift_bps": -10,
-    "vol_mult": 1.15,
-    "jump_mu": -0.02,
-    "jump_sigma": 0.20,
-    "rationale": "Base case retains some pressure but avoids tail event."
-  }
-]
+Output:
+1. Beat — contract + estimate revisions support upside. Prior 45%. Drift +120bp. Vol x1.1. Jump mean +0.04, std 0.08.
+2. Inline — consensus already embeds improvement. Prior 35%. Drift +10bp. Vol x0.95.
+3. Miss — execution risks on onboarding. Prior 20%. Drift -80bp. Vol x1.2. Jump mean -0.05, std 0.07.

@@ -16,4 +16,6 @@ __all__ = [
     "CorrelatedPathEngine",
     "ShockScheduler",
     "IVAnchor",
+"""Simulation engine components."""
+
 ]
