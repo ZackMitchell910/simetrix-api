@@ -279,6 +279,62 @@ async def _fetch_news_articles(symbol: str, since: datetime, provider: str, limi
     raise HTTPException(status_code=400, detail=f"Unsupported news provider '{provider}'.")
 
 
+async def fetch_recent_news(symbol: str, days: int = 7, *, limit: int = 100) -> list[dict[str, Any]]:
+    """Load recent news rows for a symbol from the feature store."""
+
+    app_symbol = _to_app_symbol(symbol)
+    if not app_symbol or not callable(feature_store_connect):
+        return []
+
+    horizon = max(1, int(days))
+    since = datetime.now(timezone.utc) - timedelta(days=horizon)
+
+    def _load() -> list[dict[str, Any]]:
+        try:
+            con = feature_store_connect()
+        except Exception:
+            return []
+
+        try:
+            rows = con.execute(
+                """
+                SELECT ts, source, title, url, summary, sentiment
+                FROM news_articles
+                WHERE symbol = ? AND ts >= ?
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                [app_symbol, since, int(limit)],
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        payload: list[dict[str, Any]] = []
+        for ts, source, title, url, summary, sentiment in rows:
+            ts_dt = _as_utc_datetime(ts) or since
+            payload.append(
+                {
+                    "symbol": app_symbol,
+                    "ts": ts_dt,
+                    "source": (source or ""),
+                    "title": (title or ""),
+                    "url": (url or ""),
+                    "summary": (summary or ""),
+                    "sentiment": (float(sentiment) if sentiment is not None else None),
+                }
+            )
+        return payload
+
+    rows = await asyncio.to_thread(_load)
+    rows.sort(key=lambda row: row.get("ts") or since, reverse=True)
+    return rows
+
+
 async def ingest_news(
     symbol: str,
     *,
@@ -525,122 +581,76 @@ async def score_news(
         raise HTTPException(status_code=500, detail=f"failed to update news sentiment: {exc}") from exc
 
 
-async def fetch_recent_news(symbol: str, days: int = 7, *, limit: int = 50) -> list[dict[str, Any]]:
-    """Return recent news rows for *symbol* from the feature store (best effort)."""
+async def fetch_social(symbol: str, handles: Iterable[str] | None = None) -> dict[str, Any]:
+    """Lightweight deterministic social sentiment generator for X handles."""
 
-    fs_connect = feature_store_connect
-    if not callable(fs_connect):
-        return []
+    symbol_norm = _to_app_symbol(symbol)
+    handles_list = [h.strip().lstrip("@") for h in (handles or []) if isinstance(h, str) and h.strip()]
+    handles_norm = [h.lower() for h in handles_list]
 
-    symbol_norm = (symbol or "").strip().upper()
-    if not symbol_norm:
-        return []
+    key_bits = [symbol_norm.upper()]
+    key_bits.extend(handles_norm)
+    key = "|".join(key_bits) or symbol_norm.upper()
+    digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).digest()
 
-    window_days = int(max(1, days))
-    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("fetch_recent_news: fs_connect failed: %s", exc)
-        return []
+    base = int.from_bytes(digest[:4], "big") / float(0xFFFFFFFF)
+    sentiment = float(np.clip(base * 2.0 - 1.0, -1.0, 1.0))
 
-    try:
-        rows = con.execute(
-            """
-            SELECT ts, source, title, url, summary, sentiment
-            FROM news_articles
-            WHERE symbol = ? AND ts >= ?
-            ORDER BY ts DESC
-            LIMIT ?
-            """,
-            [symbol_norm, cutoff, int(max(1, limit))],
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("fetch_recent_news: query failed for %s: %s", symbol_norm, exc)
-        rows = []
-    finally:
-        try:
-            con.close()
-        except Exception:
-            pass
-
-    items: list[dict[str, Any]] = []
-    for ts, source, title, url_item, summary, sentiment in rows:
-        ts_norm = _as_utc_datetime(ts)
-        items.append(
+    phrases = [
+        "seeing momentum build",
+        "vol remains elevated",
+        "watching macro catalysts",
+        "desk chatter mixed",
+        "options flow leaning bullish",
+    ]
+    samples: list[dict[str, Any]] = []
+    for idx, handle in enumerate(handles_norm[:5]):
+        start = 4 + idx * 4
+        chunk = digest[start:start + 4]
+        if len(chunk) < 4:
+            chunk = (chunk + digest[:4])[:4]
+        val = int.from_bytes(chunk, "big") / float(0xFFFFFFFF)
+        tone = "bullish" if val > 0.55 else ("bearish" if val < 0.45 else "neutral")
+        samples.append(
             {
-                "ts": ts_norm.isoformat() if ts_norm else None,
-                "source": (source or "").strip() if isinstance(source, str) else None,
-                "title": (title or "").strip() if isinstance(title, str) else None,
-                "url": (url_item or "").strip() if isinstance(url_item, str) else None,
-                "summary": (summary or "").strip() if isinstance(summary, str) else None,
-                "sentiment": float(sentiment) if sentiment is not None else None,
+                "handle": handle,
+                "tone": tone,
+                "score": float(np.clip((val - 0.5) * 2.0, -1.0, 1.0)),
+                "text": f"@{handle} {phrases[idx % len(phrases)]}",
             }
         )
-    return items
 
-
-async def fetch_social(symbol: str, handles: Sequence[str] | None = None) -> dict[str, Any]:
-    """Lightweight social sentiment proxy seeded by handles (deterministic, offline friendly)."""
-
-    handles_in = [
-        h.strip()
-        for h in (handles or [])
-        if isinstance(h, str) and h.strip()
-    ]
-    symbol_norm = (symbol or "").strip().upper()
-    seed_basis = symbol_norm or "MARKET"
-
-    def _score(token: str) -> float:
-        digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).digest()
-        raw = int.from_bytes(digest[:2], "big") / 65535.0
-        return float((raw - 0.5) * 0.4)
-
-    samples: list[dict[str, Any]] = []
-    universe = handles_in or [seed_basis]
-    for handle in universe:
-        score = _score(f"{seed_basis}|{handle}".lower())
-        samples.append({"handle": handle, "score": score})
-
-    avg = float(np.mean([s["score"] for s in samples])) if samples else 0.0
     return {
-        "symbol": seed_basis,
-        "handles": handles_in,
-        "avg_sentiment": avg,
-        "samples": samples[:5],
-        "status": "applied" if samples else "empty",
-    }
-
-
-async def load_option_surface(symbol: str, asof: datetime | None = None) -> dict[str, Any]:
-    """Approximate an option IV surface using realized volatility as a fallback."""
-
-    symbol_norm = (symbol or "").strip().upper()
-    asof_dt = _as_utc_datetime(asof) or datetime.now(timezone.utc)
-    closes = await fetch_cached_hist_prices(symbol_norm, 365)
-    arr = np.asarray(
-        [float(c) for c in closes if isinstance(c, (int, float)) and math.isfinite(float(c))],
-        dtype=float,
-    )
-
-    result: dict[str, Any] = {
         "symbol": symbol_norm,
-        "asof": asof_dt.isoformat(),
-        "spot": float(arr[-1]) if arr.size else None,
-        "surface": [],
-        "source": "realized_vol",
+        "handles": handles_norm,
+        "sentiment": sentiment,
+        "sample": samples,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    if arr.size < 10:
-        result["status"] = "insufficient_history"
-        return result
 
+async def load_option_surface(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Approximate an implied volatility surface using recent realized volatility."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "surface": [],
+            "source": "realized_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
     rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
     horizons = [7, 14, 21, 30, 45, 60, 90, 120, 180]
-    nodes: list[dict[str, Any]] = []
-    for days in horizons:
-        window = min(rets.size, max(5, days))
-        if window < 5:
+    surface: list[dict[str, Any]] = []
+    for window in horizons:
+        if rets.size < max(5, window):
             continue
         window_rets = rets[-window:]
         sigma_daily = float(np.std(window_rets, ddof=1))
@@ -697,6 +707,75 @@ async def load_futures_curve(symbol: str, asof: datetime | None = None) -> dict[
     result["annualized_carry"] = mu_ann
     result["status"] = "ok" if forwards else "empty"
     return result
+        surface.append({"tenor_days": int(window), "iv": sigma_ann})
+
+    if not surface:
+        sigma_daily = float(np.std(rets, ddof=1)) if rets.size >= 5 else 0.0
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0)) if sigma_daily > 0 else 0.2
+        surface.append({"tenor_days": 30, "iv": sigma_ann})
+
+    ivs = np.array([row["iv"] for row in surface], dtype=float)
+    if ivs.size >= 3:
+        kernel_size = min(5, ivs.size)
+        kernel = np.ones(kernel_size, dtype=float) / float(kernel_size)
+        smooth = np.convolve(ivs, kernel, mode="same")
+        for entry, val in zip(surface, smooth):
+            entry["iv"] = float(np.clip(val, 1e-4, 3.0))
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "surface": surface,
+        "source": "realized_proxy",
+    }
+
+
+async def load_futures_curve(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Estimate a futures curve using recent drift as a carry proxy."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "curve": [],
+            "source": "drift_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    if rets.size == 0:
+        mu_daily = 0.0
+    else:
+        lookback = min(60, rets.size)
+        mu_daily = float(np.mean(rets[-lookback:]))
+    mu_ann = float(np.clip(mu_daily * 252.0, -5.0, 5.0))
+
+    horizons = [7, 30, 60, 90, 180, 365]
+    curve: list[dict[str, Any]] = []
+    spot = float(arr[-1])
+    for tenor in horizons:
+        decay = math.exp(-tenor / 365.0)
+        annualized = float(mu_ann * decay)
+        forward = float(spot * math.exp(annualized * tenor / 252.0))
+        curve.append(
+            {
+                "tenor_days": int(tenor),
+                "annualized_carry": annualized,
+                "forward_price": forward,
+            }
+        )
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "curve": curve,
+        "source": "drift_proxy",
+    }
 
 
 async def _fetch_earnings_polygon(symbol: str, lookback_days: int, limit: int = 16) -> list[tuple]:

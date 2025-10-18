@@ -53,6 +53,7 @@ class SimRequest(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("social_handles", "handles", "x_handles"),
     )
+    x_handles: List[str] = Field(default_factory=list, alias="handles")
     seed: Optional[int] = None
 
     @property
@@ -61,6 +62,10 @@ class SimRequest(BaseModel):
 
     def lookback_days(self) -> int:
         return 180 if self.mode == "quick" else 3650
+
+    @property
+    def handles(self) -> List[str]:
+        return list(self.x_handles)
 
     def bars_per_day(self) -> int:
         if self.timespan == "day":

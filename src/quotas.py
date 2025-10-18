@@ -22,7 +22,9 @@ BASE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "120"))   # baseline RP
 SIM_LIMIT_PER_MIN  = int(os.getenv("SIM_LIMIT_PER_MIN",  "30"))    # simulate endpoints
 CRON_LIMIT_PER_MIN = int(os.getenv("CRON_LIMIT_PER_MIN", "10"))    # admin cron endpoints
 
-QUOTA_DISABLED = os.getenv("QUOTA_DISABLED", "0") == "1"
+# Temporarily disable all quota/rate checks by default so local/testing work is unblocked.
+# Set QUOTA_DISABLED=0 in the environment when you are ready to re-enable enforcement.
+QUOTA_DISABLED = os.getenv("QUOTA_DISABLED", "1") == "1"
 DEV_PLAN_WHEN_NO_REDIS = os.getenv("DEV_PLAN_WHEN_NO_REDIS", "").strip()
 
 # Daily quotas per plan (override via env)

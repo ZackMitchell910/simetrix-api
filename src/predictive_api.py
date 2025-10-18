@@ -2927,6 +2927,7 @@ class SimRequest(BaseModel):
         default_factory=list,
         validation_alias=AliasChoices("social_handles", "handles", "x_handles"),
     )
+    x_handles: list[str] = Field(default_factory=list, alias="handles")
 
     seed: Optional[int] = None
 
@@ -2936,6 +2937,10 @@ class SimRequest(BaseModel):
 
     def lookback_days(self) -> int:
         return 180 if self.mode == "quick" else 3650
+
+    @property
+    def handles(self) -> list[str]:
+        return list(self.x_handles)
 
     def bars_per_day(self) -> int:
         return 1 if self.timespan == "day" else (24 if self.timespan == "hour" else 390)
@@ -3874,15 +3879,45 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     macr = _safe_macro_dict()
                     macro_diag = {"status": "error", "error": str(exc)}
 
+            try:
+                macr = await get_macro_features()
+                if isinstance(macr, dict):
+                    diag_macro.update(macr)
+            except Exception as exc:
+                logger.debug("sim_context: macro fetch failed: %s", exc)
+
+            now_utc = datetime.now(timezone.utc)
+            days_since = diag_earnings.get("days_since_earn")
+            earnings_sched: dict[str, Any] = {"status": "missing"}
+            if isinstance(days_since, (int, float)):
+                last_report = now_utc.date() - timedelta(days=int(days_since))
+                earnings_sched = {
+                    "status": "loaded",
+                    "last_report_at": datetime.combine(last_report, datetime.min.time(), tzinfo=timezone.utc).isoformat(),
+                    "days_since": int(days_since),
+                }
+            days_to_next = diag_earnings.get("days_to_next")
+            if isinstance(days_to_next, (int, float)):
+                next_report = now_utc.date() + timedelta(days=int(days_to_next))
+                earnings_sched["next_report_at"] = datetime.combine(next_report, datetime.min.time(), tzinfo=timezone.utc).isoformat()
+                earnings_sched["days_to_next"] = int(days_to_next)
+            scheduler_diag["earnings"] = earnings_sched
+            scheduler_diag["macro"] = {
+                "status": "loaded" if any(v is not None for v in diag_macro.values()) else "missing",
+                "last_refresh_at": now_utc.isoformat(),
+            }
+
+            sim_bias_diag: dict[str, Any] | None = None
+            if USE_SIM_BIAS:
                 mu_ann_pre = float(mu_ann)
                 sigma_ann_pre = float(sigma_ann)
-                sent_avg = float(sent.get("avg_sent_7d") or 0.0)
-                earn_surprise = float(earn.get("surprise_last") or 0.0)
+                sent_avg = float(diag_sentiment.get("avg_sent_7d") or 0.0)
+                earn_surprise = float(diag_earnings.get("surprise_last") or 0.0)
                 mu_bias = float(np.clip(sent_avg * 0.15 + earn_surprise * 0.05, -0.15, 0.15))
                 mu_ann = float(np.clip(mu_ann + mu_bias, -mu_cap, mu_cap))
 
                 sigma_ann_post = sigma_ann
-                if float(sent.get("last24h") or 0.0) > 0.20:
+                if float(diag_sentiment.get("last24h") or 0.0) > 0.20:
                     sigma_ann_post = float(np.clip(sigma_ann_post * 0.97, 1e-4, SIGMA_CAP))
                 sigma_ann = sigma_ann_post
 
@@ -3972,68 +4007,168 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             conf = (2.0 * float(ensemble_prob) - 1.0)
             mu_adj = float(mu_adj + (0.30 * conf * sigma_adj))
 
-            scheduler_options_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
-            scheduler_futures_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+            mu_diag_pre = float(mu_adj)
+            sigma_diag_pre = float(sigma_adj)
+
+            news_context: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+            social_context: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+            options_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+            futures_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+
+            if getattr(req, "include_news", False):
+                handles = list(getattr(req, "x_handles", []) or [])
+                scheduler_diag["news"] = {"status": "loading", "handles": handles}
+                news_task = asyncio.create_task(ingestion_fetch_recent_news(req.symbol, days=7))
+                social_task = asyncio.create_task(ingestion_fetch_social(req.symbol, handles))
+
+                news_error: str | None = None
+                social_error: str | None = None
+                try:
+                    news_rows = await news_task
+                except Exception as exc:
+                    logger.debug("news enrichment fetch failed for %s: %s", req.symbol, exc)
+                    news_rows = []
+                    news_error = str(exc)
+                try:
+                    social_data = await social_task
+                except Exception as exc:
+                    logger.debug("social sentiment fetch failed for %s: %s", req.symbol, exc)
+                    social_data = {"sentiment": 0.0, "handles": handles, "sample": []}
+                    social_error = str(exc)
+
+                sentiments = [float(row.get("sentiment") or 0.0) for row in news_rows if row.get("sentiment") is not None]
+                news_sent_avg = float(np.mean(sentiments)) if sentiments else 0.0
+                diag_sentiment["news_articles"] = len(news_rows)
+                diag_sentiment["news_sentiment_avg"] = news_sent_avg
+
+                social_sent = float(social_data.get("sentiment") or 0.0)
+                diag_sentiment["social_sentiment"] = social_sent
+
+                sentiment_signal = float(np.clip(0.6 * news_sent_avg + 0.4 * social_sent, -1.0, 1.0))
+                mu_adj = float(np.clip(mu_adj + sentiment_signal * sigma_adj * 0.25, -3.0, 3.0))
+                sigma_adj = float(np.clip(sigma_adj * (1.0 + 0.08 * abs(news_sent_avg)), 1e-4, 1.8))
+
+                last_ts = None
+                if news_rows:
+                    last_ts = max((row.get("ts") for row in news_rows if isinstance(row.get("ts"), datetime)), default=None)
+
+                def _iso(dt: datetime | None) -> str | None:
+                    if isinstance(dt, datetime):
+                        return dt.astimezone(timezone.utc).isoformat()
+                    return None
+
+                news_status = "enriched"
+                if news_error:
+                    news_status = "error"
+                elif not news_rows:
+                    news_status = "no_data"
+
+                news_context = {
+                    "status": news_status,
+                    "articles": len(news_rows),
+                    "average_sentiment": news_sent_avg,
+                    "last_refreshed": _iso(last_ts),
+                }
+                if news_error:
+                    news_context["error"] = news_error
+
+                social_status = "sampled"
+                if social_error:
+                    social_status = "error"
+                social_context = {
+                    "status": social_status,
+                    "handles": social_data.get("handles", handles),
+                    "sentiment": social_sent,
+                }
+                if social_error:
+                    social_context["error"] = social_error
+
+                scheduler_diag["news"] = {
+                    "status": news_status,
+                    "articles": len(news_rows),
+                    "last_refreshed": _iso(last_ts) or datetime.now(timezone.utc).isoformat(),
+                    "handles": social_data.get("handles", handles),
+                }
+                if news_error:
+                    scheduler_diag["news"]["error"] = news_error
+                if social_error:
+                    scheduler_diag["news"]["social_error"] = social_error
+            else:
+                scheduler_diag["news"] = {"status": "skipped", "reason": "flag_off"}
 
             if getattr(req, "include_options", False):
-                scheduler_options_diag = {
-                    "status": "applied",
-                    "horizon_days": int(req.horizon_days),
-                }
+                option_error: str | None = None
                 try:
-                    option_surface = await ingestion_load_option_surface(req.symbol, datetime.utcnow())
-                    scheduler_options_diag["source"] = option_surface.get("source")
-                    scheduler_options_diag["asof"] = option_surface.get("asof")
-                    surface_nodes = option_surface.get("surface") or []
-                    scheduler_options_diag["nodes"] = len(surface_nodes)
-                    iv_target = _integrated_iv(option_surface, int(req.horizon_days))
-                    if iv_target and math.isfinite(iv_target):
-                        sigma_before = sigma_adj
-                        sigma_adj = float(np.clip(max(sigma_adj, float(iv_target)), 1e-4, 2.0))
-                        scheduler_options_diag["target_iv"] = float(iv_target)
-                        scheduler_options_diag["sigma_delta"] = float(sigma_adj - sigma_before)
-                    else:
-                        scheduler_options_diag["status"] = "noop"
-                        scheduler_options_diag["reason"] = "no_surface_points"
+                    option_surface = await ingestion_load_option_surface(req.symbol, datetime.now(timezone.utc))
                 except Exception as exc:
-                    scheduler_options_diag = {"status": "error", "error": str(exc)}
+                    logger.debug("option surface load failed for %s: %s", req.symbol, exc)
+                    option_surface = {"surface": [], "source": "error"}
+                    option_error = str(exc)
+
+                surface_points = option_surface.get("surface") or []
+                sigma_target: float | None = None
+                if surface_points:
+                    tenors = np.array([float(pt.get("tenor_days", 0.0)) for pt in surface_points], dtype=float)
+                    ivs = np.array([float(pt.get("iv", 0.0)) for pt in surface_points], dtype=float)
+                    mask = np.isfinite(tenors) & np.isfinite(ivs)
+                    tenors = tenors[mask]
+                    ivs = ivs[mask]
+                    if tenors.size and ivs.size:
+                        order = np.argsort(tenors)
+                        tenors = tenors[order]
+                        ivs = ivs[order]
+                        horizon = float(max(1, int(req.horizon_days)))
+                        sigma_target = float(np.interp(horizon, tenors, ivs, left=ivs[0], right=ivs[-1]))
+                        sigma_adj = float(np.clip(sigma_target, 1e-4, 2.5))
+
+                options_diag = {
+                    "status": "applied" if sigma_target is not None else ("error" if option_error else "no_data"),
+                    "source": option_surface.get("source"),
+                    "as_of": option_surface.get("as_of"),
+                    "points": len(surface_points),
+                    "sigma_target": sigma_target,
+                }
+                if option_error:
+                    options_diag["error"] = option_error
 
             if getattr(req, "include_futures", False):
-                scheduler_futures_diag = {
-                    "status": "applied",
-                    "horizon_days": int(req.horizon_days),
-                }
+                futures_error: str | None = None
                 try:
-                    futures_curve = await ingestion_load_futures_curve(req.symbol, datetime.utcnow())
-                    scheduler_futures_diag["source"] = futures_curve.get("source")
-                    scheduler_futures_diag["asof"] = futures_curve.get("asof")
-                    curve_nodes = futures_curve.get("forwards") or []
-                    scheduler_futures_diag["nodes"] = len(curve_nodes)
-                    if curve_nodes:
-                        best = min(
-                            curve_nodes,
-                            key=lambda f: abs(int(f.get("days") or 0) - int(req.horizon_days)),
-                        )
-                        days = int(best.get("days") or 0)
-                        price = float(best.get("price") or 0.0)
-                        scheduler_futures_diag["anchor_days"] = days
-                        scheduler_futures_diag["anchor_price"] = price
-                        if price > 0 and S0 > 0 and days > 0:
-                            mu_before = mu_adj
-                            mu_target = float(math.log(price / S0) * (252.0 / float(days)))
-                            mu_adj = float(np.clip(0.5 * mu_adj + 0.5 * mu_target, -3.0, 3.0))
-                            scheduler_futures_diag["target_mu"] = mu_target
-                            scheduler_futures_diag["mu_delta"] = float(mu_adj - mu_before)
-                        else:
-                            scheduler_futures_diag["status"] = "noop"
-                            scheduler_futures_diag["reason"] = "invalid_forward"
-                    else:
-                        scheduler_futures_diag["status"] = "noop"
-                        scheduler_futures_diag["reason"] = "empty_curve"
+                    futures_curve = await ingestion_load_futures_curve(req.symbol, datetime.now(timezone.utc))
                 except Exception as exc:
-                    scheduler_futures_diag = {"status": "error", "error": str(exc)}
+                    logger.debug("futures curve load failed for %s: %s", req.symbol, exc)
+                    futures_curve = {"curve": [], "source": "error"}
+                    futures_error = str(exc)
+
+                curve_points = futures_curve.get("curve") or []
+                mu_target: float | None = None
+                if curve_points:
+                    tenors = np.array([float(pt.get("tenor_days", 0.0)) for pt in curve_points], dtype=float)
+                    carries = np.array([float(pt.get("annualized_carry", 0.0)) for pt in curve_points], dtype=float)
+                    mask = np.isfinite(tenors) & np.isfinite(carries)
+                    tenors = tenors[mask]
+                    carries = carries[mask]
+                    if tenors.size and carries.size:
+                        order = np.argsort(tenors)
+                        tenors = tenors[order]
+                        carries = carries[order]
+                        horizon = float(max(1, int(req.horizon_days)))
+                        mu_target = float(np.interp(horizon, tenors, carries, left=carries[0], right=carries[-1]))
+                        mu_adj = float(np.clip(mu_target, -3.0, 3.0))
+
+                futures_diag = {
+                    "status": "applied" if mu_target is not None else ("error" if futures_error else "no_data"),
+                    "source": futures_curve.get("source"),
+                    "as_of": futures_curve.get("as_of"),
+                    "points": len(curve_points),
+                    "mu_target": mu_target,
+                }
+                if futures_error:
+                    futures_diag["error"] = futures_error
 
             mu_adj = float(np.clip(mu_adj, -3.0, 3.0))
+            mu_diag_post_enrichment = float(mu_adj)
+            sigma_diag_post_enrichment = float(sigma_adj)
 
             # Final small calibration
             sigma_scale = _calibration_sigma_scale(req.symbol, int(req.horizon_days))
@@ -4204,6 +4339,35 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             await _update_run_state(redis, run_id, rs, progress=82.0, detail="Computing risk metrics")
 
             # ---------- Artifact ----------
+            diagnostics_payload: dict[str, Any] = {
+                "mu": {
+                    "pre": float(mu_diag_pre),
+                    "post": float(mu_diag_final),
+                    "post_enrichment": float(mu_diag_post_enrichment),
+                },
+                "sigma": {
+                    "pre": float(sigma_diag_pre),
+                    "post": float(sigma_diag_final),
+                    "post_enrichment": float(sigma_diag_post_enrichment),
+                },
+                "sentiment": {
+                    **diag_sentiment,
+                    "news": news_context,
+                    "social": social_context,
+                },
+                "earnings": diag_earnings,
+                "macro": diag_macro,
+                "scheduler": scheduler_diag,
+                "regime": {
+                    "name": reg.get("name", "unknown"),
+                    "score": float(reg.get("score", 0.0)),
+                },
+                "options": options_diag,
+                "futures": futures_diag,
+            }
+            if sim_bias_diag:
+                diagnostics_payload["sim_bias"] = sim_bias_diag
+
             artifact = {
                 "symbol": req.symbol,
                 "horizon_days": int(req.horizon_days),
@@ -4267,6 +4431,7 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     "sigma_annualized": float(sigma_adj),
                     "stat_window_bars": int(stat_bars),
                 },
+                "diagnostics": diagnostics_payload,
             }
 
             diagnostics_payload = {
