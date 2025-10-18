@@ -1,110 +1,53 @@
-"""Shared primitives for feature adapters."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, MutableMapping, Optional, Sequence
+from datetime import datetime, timedelta
+from typing import Any, Mapping, Sequence
+
+__all__ = ["AdapterFrame", "coerce_window"]
 
 
-@dataclass(slots=True)
-class FeedRecord:
+@dataclass
+class AdapterFrame:
+    """Typed response returned by feed adapters.
+
+    ``payload`` is intentionally free-form: adapters may return a sequence of
+    records or a mapping containing pre-aggregated signals.  Downstream callers
+    should rely on ``confidence`` to determine how aggressively to use the
+    frame.
+    """
+
     symbol: str
     asof: datetime
     source: str
     confidence: float
-    payload: Dict[str, Any] = field(default_factory=dict)
-    tags: tuple[str, ...] = ()
+    payload: Sequence[Mapping[str, Any]] | Mapping[str, Any]
+    metadata: Mapping[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def __post_init__(self) -> None:
+        self.symbol = self.symbol.upper()
+        self.source = str(self.source or "").strip() or "unknown"
+        self.confidence = float(max(0.0, min(1.0, self.confidence)))
+        if not isinstance(self.payload, Mapping) and not isinstance(self.payload, Sequence):
+            raise TypeError("payload must be a mapping or sequence")
+
+    def to_dict(self) -> dict[str, Any]:
         return {
             "symbol": self.symbol,
             "asof": self.asof.isoformat(),
             "source": self.source,
-            "confidence": float(self.confidence),
-            "payload": dict(self.payload),
-            "tags": list(self.tags),
+            "confidence": self.confidence,
+            "payload": self.payload,
+            "metadata": dict(self.metadata),
         }
 
 
-class FeedFrame(Sequence[FeedRecord]):
-    """In-memory container with helper aggregations."""
-
-    def __init__(self, rows: Iterable[FeedRecord] | None = None) -> None:
-        self._rows: List[FeedRecord] = list(rows or [])
-
-    def __len__(self) -> int:
-        return len(self._rows)
-
-    def __getitem__(self, item: int) -> FeedRecord:
-        return self._rows[item]
-
-    def __iter__(self) -> Iterator[FeedRecord]:
-        return iter(self._rows)
-
-    def append(self, record: FeedRecord) -> None:
-        self._rows.append(record)
-
-    def extend(self, records: Iterable[FeedRecord]) -> None:
-        for record in records:
-            self.append(record)
-
-    def weighted_mean(self, key: str, *, default: float = 0.0, weight_key: str = "confidence") -> float:
-        total = 0.0
-        weight = 0.0
-        for row in self._rows:
-            value = row.payload.get(key)
-            if value is None:
-                continue
-            try:
-                value_f = float(value)
-            except (TypeError, ValueError):
-                continue
-            w = getattr(row, weight_key, None)
-            try:
-                w_f = float(w) if w is not None else 1.0
-            except (TypeError, ValueError):
-                w_f = 1.0
-            total += value_f * w_f
-            weight += w_f
-        if weight <= 0:
-            return default
-        return total / weight
-
-    def latest(self) -> Optional[FeedRecord]:
-        if not self._rows:
-            return None
-        return max(self._rows, key=lambda r: r.asof)
-
-    @classmethod
-    def from_dicts(cls, rows: Iterable[Mapping[str, Any]]) -> "FeedFrame":
-        parsed: List[FeedRecord] = []
-        for row in rows:
-            asof_value = row.get("asof")
-            if isinstance(asof_value, str):
-                asof = datetime.fromisoformat(asof_value)
-            elif isinstance(asof_value, datetime):
-                asof = asof_value
-            else:  # pragma: no cover - defensive
-                continue
-            parsed.append(
-                FeedRecord(
-                    symbol=str(row.get("symbol", "")),
-                    asof=asof,
-                    source=str(row.get("source", "unknown")),
-                    confidence=float(row.get("confidence", 0.0)),
-                    payload=dict(row.get("payload", {})),
-                    tags=tuple(row.get("tags", ())),
-                )
-            )
-        return cls(parsed)
-
-    def to_pandas(self):  # pragma: no cover - optional dependency
-        try:
-            import pandas as pd
-        except Exception as exc:  # pragma: no cover - import may fail on slim env
-            raise RuntimeError("pandas is required to materialize FeedFrame") from exc
-        return pd.DataFrame([row.to_dict() for row in self._rows])
-
-
-__all__ = ["FeedFrame", "FeedRecord"]
+def coerce_window(window: Any, *, default_days: int = 3) -> timedelta:
+    if isinstance(window, timedelta):
+        return window
+    if isinstance(window, (int, float)):
+        return timedelta(days=float(window))
+    if window is None:
+        return timedelta(days=default_days)
+    raise TypeError(f"Unsupported window type: {type(window)!r}")

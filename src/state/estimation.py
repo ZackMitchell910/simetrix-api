@@ -1,85 +1,87 @@
-"""Dynamic factor fusion utilities."""
-
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any, Mapping
+from dataclasses import dataclass, field
+from typing import Any, Mapping, Sequence
 
-from src.adapters.base import FeedFrame
+from src.scenarios.schema import EventShock
 from src.state.contracts import StateVector
 
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+__all__ = ["DynamicFactorInputs", "apply_dynamic_factors"]
 
 
-def fuse_state(
-    prior: StateVector,
-    *,
-    news: FeedFrame | None = None,
-    sentiment_scores: Mapping[str, Any] | None = None,
-    options_surface: FeedFrame | None = None,
-    futures_curve: FeedFrame | None = None,
-    macro_context: Mapping[str, Any] | None = None,
-    social: FeedFrame | None = None,
-) -> tuple[StateVector, dict[str, Any]]:
-    """Fuse heterogeneous signals into an updated state vector."""
+@dataclass(slots=True)
+class DynamicFactorInputs:
+    drift_prior: float | None = None
+    drift_confidence: float = 0.0
+    vol_prior: float | None = None
+    vol_confidence: float = 0.0
+    jump_intensity: float | None = None
+    jump_mean: float | None = None
+    jump_vol: float | None = None
+    news_bias: float = 0.0
+    sentiment_bias: float = 0.0
+    macro: Mapping[str, Any] = field(default_factory=dict)
+    sentiment: Mapping[str, Any] = field(default_factory=dict)
+    cross: Mapping[str, Any] = field(default_factory=dict)
+    events: Sequence[EventShock] = field(default_factory=list)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
-    mu_pre = float(prior.drift_annual)
-    sigma_pre = float(prior.vol_annual)
 
-    mu_signal = 0.0
-    if sentiment_scores:
-        mu_signal += 0.25 * float(sentiment_scores.get("last24h", 0.0))
-        mu_signal += 0.15 * float(sentiment_scores.get("last7d", 0.0))
-    if news:
-        mu_signal += 0.05 * news.weighted_mean("sentiment_score", default=0.0)
-    if social:
-        mu_signal += 0.10 * social.weighted_mean("last24h", default=0.0)
-    if macro_context:
-        mu_signal -= 0.0005 * float(macro_context.get("rates_delta_bp", 0.0))
-        mu_signal += 0.0008 * float(macro_context.get("credit_spread_bp", 0.0))
-    if futures_curve:
-        forward = futures_curve.weighted_mean("annualized_forward", default=mu_pre)
-        mu_signal += 0.5 * (forward - mu_pre)
+def _kalman_blend(prior: float, signal: float, confidence: float) -> float:
+    weight = max(0.0, min(1.0, float(confidence)))
+    return float(prior * (1.0 - weight) + signal * weight)
 
-    sigma_signal = 0.0
-    if options_surface:
-        implied_vol = options_surface.weighted_mean("implied_vol", default=sigma_pre)
-        sigma_signal += 0.6 * (implied_vol - sigma_pre)
-        sigma_signal += 0.1 * options_surface.weighted_mean("skew", default=0.0)
-    if news:
-        sigma_signal += 0.15 * abs(news.weighted_mean("sentiment_score", default=0.0))
-    if social:
-        sigma_signal += 0.10 * abs(social.weighted_mean("last24h", default=0.0))
 
-    mu_post = _clamp(mu_pre + mu_signal, -1.8, 1.8)
-    sigma_post = _clamp(sigma_pre + sigma_signal, 0.01, 5.0)
+def _bounded(value: float, lower: float, upper: float) -> float:
+    return float(max(lower, min(upper, value)))
 
-    jump_intensity = _clamp(prior.jump_intensity + max(0.0, sigma_signal) * 0.2, 0.0, 5.0)
-    jump_mean = prior.jump_mean + 0.1 * mu_signal
-    jump_vol = _clamp(prior.jump_vol + 0.05 * abs(sigma_signal), 0.0, 3.0)
 
-    fused = replace(
-        prior,
-        drift_annual=mu_post,
-        vol_annual=sigma_post,
+def apply_dynamic_factors(prior: StateVector, inputs: DynamicFactorInputs) -> StateVector:
+    """Fuse exogenous signals into a new :class:`StateVector`.
+
+    The function intentionally implements a lightweight Kalman-style update so
+    that downstream code has sane defaults even without the heavy statistical
+    stack in place.  News and sentiment enter as small tilts on the drift,
+    options-implied volatility flows through ``vol_prior`` and macro/credit
+    spreads flow via the ``macro`` and ``cross`` payloads.
+    """
+
+    drift = prior.drift_annual
+    if inputs.drift_prior is not None:
+        drift = _kalman_blend(drift, float(inputs.drift_prior), inputs.drift_confidence)
+    drift += 0.05 * float(inputs.news_bias) + 0.03 * float(inputs.sentiment_bias)
+    drift = _bounded(drift, -1.5, 1.5)
+
+    vol = prior.vol_annual
+    if inputs.vol_prior is not None:
+        vol = _kalman_blend(vol, float(inputs.vol_prior), inputs.vol_confidence)
+    vol = _bounded(vol, 1e-4, 5.0)
+
+    jump_intensity = inputs.jump_intensity if inputs.jump_intensity is not None else prior.jump_intensity
+    jump_mean = inputs.jump_mean if inputs.jump_mean is not None else prior.jump_mean
+    jump_vol = inputs.jump_vol if inputs.jump_vol is not None else prior.jump_vol
+    jump_intensity = _bounded(float(jump_intensity), 0.0, 5.0)
+    jump_vol = _bounded(float(jump_vol), 0.0, 5.0)
+
+    macro = {**dict(prior.macro), **dict(inputs.macro)}
+    sentiment = {**dict(prior.sentiment), **dict(inputs.sentiment)}
+    cross = {**dict(prior.cross), **dict(inputs.cross)}
+    provenance = {**dict(prior.provenance), **dict(inputs.provenance)}
+
+    events = list(inputs.events or prior.events)
+
+    return StateVector(
+        t=prior.t,
+        spot=prior.spot,
+        drift_annual=drift,
+        vol_annual=vol,
         jump_intensity=jump_intensity,
         jump_mean=jump_mean,
         jump_vol=jump_vol,
+        regime=prior.regime,
+        macro=macro,
+        sentiment=sentiment,
+        events=events,
+        cross=cross,
+        provenance=provenance,
     )
-
-    diagnostics = {
-        "mu_pre": mu_pre,
-        "mu_post": mu_post,
-        "sigma_pre": sigma_pre,
-        "sigma_post": sigma_post,
-        "mu_signal": mu_signal,
-        "sigma_signal": sigma_signal,
-        "jump_intensity": jump_intensity,
-    }
-
-    return fused, diagnostics
-
-
-__all__ = ["fuse_state"]

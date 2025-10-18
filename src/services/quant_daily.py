@@ -6,7 +6,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Iterable, Mapping, Optional
 
 import numpy as np
 from fastapi import HTTPException
@@ -45,11 +45,6 @@ class MinimalSummary:
         }
 
 
-def _cache_key(symbol: str, horizon_days: int, day_iso: Optional[str] = None) -> str:
-    as_of = day_iso or datetime.now(timezone.utc).date().isoformat()
-    return f"quant:daily:{as_of}:summary:{symbol}:{horizon_days}"
-
-
 def _to_number(value: Any) -> Optional[float]:
     try:
         num = float(value)
@@ -60,77 +55,102 @@ def _to_number(value: Any) -> Optional[float]:
     return None
 
 
-async def ensure_daily_pick_contract(
+def _normalize_prob(value: Any) -> Optional[float]:
+    num = _to_number(value)
+    if num is None:
+        return None
+    if num > 1.0:
+        # Accept percentage-style inputs (e.g., 62.5) and normalise to 0-1.
+        num = num / 100.0
+    return float(np.clip(num, 0.0, 1.0))
+
+
+def _normalize_horizon(value: Any, fallback: Optional[int]) -> Optional[int]:
+    try:
+        if value is None:
+            raise ValueError("missing")
+        hz = int(value)
+        if hz <= 0:
+            raise ValueError("non-positive horizon")
+        return hz
+    except Exception:
+        if fallback is None:
+            return None
+        return max(1, int(fallback))
+
+
+def _default_blurb(symbol: str, horizon: Optional[int], prob: Optional[float], median: Optional[float], regime: str) -> str:
+    horizon_str = f"{int(horizon)}d" if isinstance(horizon, int) else "multi-day"
+    prob_str = f"≈{prob:.0%}" if isinstance(prob, (int, float)) else "mixed odds"
+    med_str = f"median ≈ {median:.1f}%" if isinstance(median, (int, float)) else "median path uncertain"
+    regime = regime or "neutral"
+    return f"{symbol}: {horizon_str} outlook {prob_str}, {med_str}. Regime {regime}."
+
+
+def normalize_pick_document(
     doc: Mapping[str, Any] | None,
-    horizon_days: int,
     *,
-    symbol: str | None = None,
-    allow_refresh: bool = True,
-) -> Dict[str, Any]:
-    """Ensure the daily pick document exposes the frontend contract."""
+    fallback_horizon: Optional[int] = None,
+    required_keys: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Return a copy of *doc* with the daily-card fields coerced and defaults filled.
 
-    info: Dict[str, Any] = dict(doc or {})
-    sym = (symbol or info.get("symbol") or "").strip().upper()
-    if sym:
-        info["symbol"] = sym
+    The frontend relies on ``prob_up_end``, ``median_return_pct``, ``horizon_days`` and
+    ``blurb`` being present. This helper enforces those invariants so that stale cache
+    entries or external payloads do not break the DailyQuant card UI.
+    """
 
-    horizon_val = _to_number(info.get("horizon_days"))
-    hz = int(horizon_val) if horizon_val is not None else int(horizon_days or 30)
-    info["horizon_days"] = hz
+    if not isinstance(doc, Mapping):
+        return {}
 
-    prob = _to_number(info.get("prob_up_end"))
-    if prob is None:
-        prob = _to_number(info.get("prob_up_30d"))
+    data = {k: v for k, v in doc.items()}
+    symbol = str(data.get("symbol") or "").upper().strip()
+    if not symbol:
+        return {}
 
-    median_pct = _to_number(info.get("median_return_pct"))
-    base_price = _to_number(info.get("base_price"))
-    predicted_price = _to_number(info.get("predicted_price"))
-    bullish_price = _to_number(info.get("bullish_price", info.get("p95")))
+    prob = _normalize_prob(data.get("prob_up_end") or data.get("prob_up_30d"))
+    if prob is not None:
+        data["prob_up_end"] = prob
 
-    refresh_payload: Dict[str, Any] | None = None
-    if allow_refresh and sym and (prob is None or median_pct is None or base_price is None or bullish_price is None):
-        try:
-            refresh_payload = await fetch_minimal_summary(sym, hz)
-        except HTTPException:
-            refresh_payload = None
-        except Exception:
-            refresh_payload = None
+    median_pct = _to_number(data.get("median_return_pct"))
+    if median_pct is None:
+        base = _to_number(data.get("base_price"))
+        spot = _to_number(data.get("spot")) or _to_number(data.get("spot0"))
+        if spot not in (None, 0):
+            try:
+                median_pct = float(((base or spot) / spot - 1.0) * 100.0)
+            except Exception:
+                median_pct = None
+    if median_pct is not None:
+        data["median_return_pct"] = float(median_pct)
 
-    if refresh_payload:
-        base_price = base_price if base_price is not None else _to_number(refresh_payload.get("base_price"))
-        predicted_price = (
-            predicted_price if predicted_price is not None else _to_number(refresh_payload.get("predicted_price"))
-        )
-        bullish_price = bullish_price if bullish_price is not None else _to_number(refresh_payload.get("bullish_price"))
-        if prob is None:
-            prob = _to_number(refresh_payload.get("prob_up_30d"))
+    horizon = _normalize_horizon(data.get("horizon_days"), fallback_horizon)
+    if horizon is not None:
+        data["horizon_days"] = horizon
 
-    info["prob_up_end"] = float(prob if prob is not None else 0.5)
-    info["median_return_pct"] = float(median_pct if median_pct is not None else 0.0)
+    regime = str(data.get("regime") or "neutral").strip() or "neutral"
+    if not data.get("blurb"):
+        data["blurb"] = _default_blurb(symbol, horizon, prob, median_pct, regime)
 
-    if base_price is not None:
-        info["base_price"] = float(base_price)
-    if predicted_price is not None:
-        info["predicted_price"] = float(predicted_price)
-    elif base_price is not None:
-        info["predicted_price"] = float(base_price)
-    if bullish_price is not None:
-        info["bullish_price"] = float(bullish_price)
+    required = set(required_keys or ("prob_up_end", "median_return_pct", "horizon_days", "blurb"))
+    missing = [key for key in required if key not in data]
+    for key in missing:
+        if key == "prob_up_end" and prob is None:
+            data[key] = 0.5
+        elif key == "median_return_pct" and median_pct is None:
+            data[key] = 0.0
+        elif key == "horizon_days" and horizon is None:
+            data[key] = fallback_horizon or 30
+        elif key == "blurb":
+            data[key] = _default_blurb(symbol, data.get("horizon_days"), data.get("prob_up_end"), data.get("median_return_pct"), regime)
 
-    regime = str(info.get("regime") or "neutral")
-    info["regime"] = regime
+    data["symbol"] = symbol
+    return data
 
-    blurb = str(info.get("blurb") or "").strip()
-    if not blurb and sym:
-        prob_pct = info["prob_up_end"] * 100.0
-        med = info["median_return_pct"]
-        blurb = (
-            f"{sym}: {hz}d MC P(up)≈{prob_pct:.1f}%, "
-            f"median ≈ {med:.1f}% • regime {regime}."
-        )
-    info["blurb"] = blurb
 
-    return info
+def _cache_key(symbol: str, horizon_days: int, day_iso: Optional[str] = None) -> str:
+    as_of = day_iso or datetime.now(timezone.utc).date().isoformat()
+    return f"quant:daily:{as_of}:summary:{symbol}:{horizon_days}"
 
 
 async def fetch_minimal_summary(symbol: str, horizon_days: int) -> Dict[str, Any]:

@@ -1,183 +1,107 @@
-"""Async feature store facade with Redis + SQLite caching."""
-
 from __future__ import annotations
 
 import asyncio
-import json
-import os
-import sqlite3
+import inspect
+import pickle
 import time
-from pathlib import Path
-from typing import Any, Awaitable, Callable
+from collections import defaultdict
+from typing import Any, Awaitable, Callable, Mapping
 
 from redis.asyncio import Redis
 
 from src.core import REDIS
+from src.observability import log_json
 
-
-def _default_sqlite_path() -> Path:
-    root = os.getenv("PT_DATA_ROOT")
-    if root:
-        base = Path(root).expanduser().resolve()
-    else:
-        base = Path(__file__).resolve().parents[2] / "data"
-    base.mkdir(parents=True, exist_ok=True)
-    return (base / "feature_store.sqlite").resolve()
+CacheLoader = Callable[[], Awaitable[Any] | Any]
 
 
 class FeatureStore:
-    """Hybrid caching layer used by adapters and model fusion."""
+    """Thin async cache wrapper backed by Redis with an in-process fallback."""
 
-    def __init__(
-        self,
-        *,
-        redis: Redis | None = None,
-        sqlite_path: str | os.PathLike[str] | None = None,
-        namespace: str = "feature_store",
-        default_ttl: int = 6 * 3600,
-    ) -> None:
-        self.redis = redis or REDIS
-        self.sqlite_path = Path(sqlite_path or _default_sqlite_path())
-        self.namespace = namespace
-        self.default_ttl = int(default_ttl)
-        self._ensure_sqlite()
-
-    # -- SQLite helpers -----------------------------------------------------------------
-
-    def _ensure_sqlite(self) -> None:
-        self.sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cache (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    expires_at REAL
-                );
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS cache_meta (
-                    key TEXT PRIMARY KEY,
-                    cold_latency_ms REAL
-                );
-                """
-            )
-            conn.commit()
-
-    def _sqlite_get(self, key: str) -> tuple[Any | None, float | None]:
-        now = time.time()
-        with sqlite3.connect(self.sqlite_path) as conn:
-            row = conn.execute("SELECT value, expires_at FROM cache WHERE key=?", (key,)).fetchone()
-            if not row:
-                return None, None
-            value_raw, expires_at = row
-            if expires_at is not None and expires_at < now:
-                conn.execute("DELETE FROM cache WHERE key=?", (key,))
-                conn.commit()
-                return None, None
-            meta_row = conn.execute("SELECT cold_latency_ms FROM cache_meta WHERE key=?", (key,)).fetchone()
-            latency = meta_row[0] if meta_row else None
-            try:
-                return json.loads(value_raw), latency
-            except Exception:
-                return None, latency
-
-    def _sqlite_set(self, key: str, value: Any, ttl: int | None) -> None:
-        expires = time.time() + float(ttl or self.default_ttl)
-        payload = json.dumps(value, ensure_ascii=False)
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                "INSERT OR REPLACE INTO cache(key, value, expires_at) VALUES(?,?,?)",
-                (key, payload, expires),
-            )
-            conn.commit()
-
-    def _sqlite_store_latency(self, key: str, latency_ms: float) -> None:
-        with sqlite3.connect(self.sqlite_path) as conn:
-            conn.execute(
-                "INSERT INTO cache_meta(key, cold_latency_ms) VALUES(?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET cold_latency_ms=excluded.cold_latency_ms",
-                (key, float(latency_ms)),
-            )
-            conn.commit()
-
-    # -- Core API -----------------------------------------------------------------------
-
-    async def get(self, key: str) -> tuple[Any | None, dict[str, Any]]:
-        namespaced = f"{self.namespace}:{key}"
-        diag: dict[str, Any] = {"cache": {"hit": False, "layer": "miss"}}
-        start = time.perf_counter()
-
-        if self.redis:
-            try:
-                raw = await self.redis.get(namespaced)
-            except Exception:
-                raw = None
-            if raw is not None:
-                try:
-                    value = json.loads(raw)
-                except Exception:
-                    value = None
-                latency_ms = (time.perf_counter() - start) * 1000
-                diag_payload = {"hit": True, "layer": "redis", "latency_ms": latency_ms}
-                _, cold_latency = await asyncio.to_thread(self._sqlite_get, namespaced)
-                if cold_latency is not None and cold_latency > 0:
-                    reduction = max(0.0, 1.0 - (latency_ms / max(cold_latency, 1e-9))) * 100.0
-                    diag_payload["savings_pct"] = round(reduction, 2)
-                diag["cache"].update(diag_payload)
-                return value, diag
-
-        value_sql, cold_latency = await asyncio.to_thread(self._sqlite_get, namespaced)
-        latency_ms = (time.perf_counter() - start) * 1000
-        if value_sql is not None:
-            diag["cache"].update(
-                {
-                    "hit": True,
-                    "layer": "sqlite",
-                    "latency_ms": latency_ms,
-                }
-            )
-            if cold_latency is not None and cold_latency > 0:
-                reduction = max(0.0, 1.0 - (latency_ms / max(cold_latency, 1e-9))) * 100.0
-                diag["cache"]["savings_pct"] = round(reduction, 2)
-            return value_sql, diag
-
-        diag["cache"]["latency_ms"] = latency_ms
-        return None, diag
-
-    async def set(self, key: str, value: Any, ttl: int | None = None) -> None:
-        namespaced = f"{self.namespace}:{key}"
-        payload = json.dumps(value, ensure_ascii=False)
-        ttl_use = int(ttl or self.default_ttl)
-        if self.redis:
-            try:
-                await self.redis.setex(namespaced, ttl_use, payload)
-            except Exception:
-                pass
-        await asyncio.to_thread(self._sqlite_set, namespaced, value, ttl_use)
+    def __init__(self, redis: Redis | None = None) -> None:
+        self._redis = redis or REDIS
+        self._local: dict[str, tuple[float, Any]] = {}
+        self._locks: defaultdict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._lock = asyncio.Lock()
 
     async def get_or_load(
         self,
+        namespace: str,
         key: str,
-        loader: Callable[[], Awaitable[Any] | Any],
+        loader: CacheLoader,
         *,
-        ttl: int | None = None,
-    ) -> tuple[Any, dict[str, Any]]:
-        cached, diag = await self.get(key)
-        if cached is not None:
-            return cached, diag
-
+        ttl: int = 900,
+        diagnostics: Mapping[str, Any] | None = None,
+    ) -> Any:
+        composite = f"feature:{namespace}:{key}"
         start = time.perf_counter()
-        result = loader()
-        if asyncio.iscoroutine(result) or isinstance(result, Awaitable):
-            result = await result  # type: ignore[assignment]
-        latency_ms = (time.perf_counter() - start) * 1000
-        diag["cache"].update({"hit": False, "latency_ms": latency_ms})
-        await self.set(key, result, ttl=ttl)
-        await asyncio.to_thread(self._sqlite_store_latency, f"{self.namespace}:{key}", latency_ms)
-        return result, diag
+        cached = await self._read(composite)
+        cold = cached is None
+
+        if cold:
+            lock = await self._lock_for(composite)
+            async with lock:
+                cached = await self._read(composite)
+                if cached is None:
+                    result = loader()
+                    if inspect.isawaitable(result):
+                        result = await result  # type: ignore[assignment]
+                    await self._write(composite, result, ttl)
+                    cached = result
+
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        log_json(
+            "info",
+            msg="feature_store_cache",
+            namespace=namespace,
+            key=key,
+            hit=not cold,
+            duration_ms=round(elapsed_ms, 3),
+            backend="redis" if self._redis else "memory",
+            diagnostics=diagnostics or {},
+        )
+        return cached
+
+    async def _lock_for(self, key: str) -> asyncio.Lock:
+        async with self._lock:
+            return self._locks[key]
+
+    async def _read(self, composite: str) -> Any:
+        now = time.monotonic()
+
+        if self._redis:
+            try:
+                raw = await self._redis.get(composite)
+            except Exception:
+                raw = None
+            if raw:
+                try:
+                    return pickle.loads(raw)
+                except Exception:
+                    pass
+
+        expiry, payload = self._local.get(composite, (0.0, None))
+        if expiry and expiry > now:
+            return payload
+        if composite in self._local:
+            self._local.pop(composite, None)
+        return None
+
+    async def _write(self, composite: str, value: Any, ttl: int) -> None:
+        expires_at = time.monotonic() + float(max(1, ttl))
+        self._local[composite] = (expires_at, value)
+
+        if not self._redis:
+            return
+        try:
+            payload = pickle.dumps(value)
+            await self._redis.setex(composite, ttl, payload)
+        except Exception:
+            # Redis write failures should not break callers; they simply fall back
+            # to the in-process cache.
+            pass
 
 
-__all__ = ["FeatureStore"]
+FEATURE_STORE = FeatureStore()
+
+__all__ = ["FeatureStore", "FEATURE_STORE"]

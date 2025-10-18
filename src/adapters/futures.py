@@ -1,65 +1,41 @@
-"""Futures curve adapter."""
-
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Iterable, Mapping
+from typing import Mapping
 
-from src.adapters.base import FeedFrame, FeedRecord
-from src.services.feature_store import FeatureStore
-
-
-def _normalize_rows(rows: Iterable[Mapping[str, Any]]) -> FeedFrame:
-    parsed = []
-    for row in rows:
-        asof_raw = row.get("asof")
-        if isinstance(asof_raw, str):
-            asof = datetime.fromisoformat(asof_raw)
-        elif isinstance(asof_raw, datetime):
-            asof = asof_raw
-        else:  # pragma: no cover
-            continue
-        parsed.append(
-            FeedRecord(
-                symbol=str(row.get("symbol", "")),
-                asof=asof,
-                source=str(row.get("source", "futures")),
-                confidence=float(row.get("confidence", 0.0)),
-                payload=dict(row.get("payload", {})),
-                tags=tuple(row.get("tags", ())),
-            )
-        )
-    return FeedFrame(parsed)
-
-
-async def fetch(
-    symbol: str,
-    asof: datetime,
-    window: int,
-    *,
-    store: FeatureStore | None = None,
-) -> FeedFrame:
-    """Fetch drift priors from futures basis."""
-
-    symbol_upper = symbol.upper().strip()
-    rows: list[Mapping[str, Any]] = []
-    if store is not None:
-        key = f"futures:{symbol_upper}:{asof.date().isoformat()}:{window}"
-        cached, _ = await store.get(key)
-        if isinstance(cached, list):
-            rows.extend(cached)
-    if not rows:
-        rows.append(
-            {
-                "symbol": symbol_upper,
-                "asof": (asof - timedelta(hours=4)).isoformat(),
-                "source": "futures",
-                "confidence": 0.1,
-                "payload": {"annualized_forward": 0.0},
-                "tags": ("synthetic",),
-            }
-        )
-    return _normalize_rows(rows)
-
+from src.adapters.base import AdapterFrame, coerce_window
+from src.services.feature_store import FEATURE_STORE
 
 __all__ = ["fetch"]
+
+_TTL_SECONDS = 45 * 60
+
+
+async def fetch(symbol: str, asof: datetime, window: timedelta | int | None = None) -> AdapterFrame:
+    window_td = coerce_window(window, default_days=14)
+    cache_key = f"{symbol.upper()}:{int(window_td.total_seconds())}"
+
+    async def _loader() -> Mapping[str, object]:
+        return {
+            "source": "futures",
+            "data": [],
+            "confidence": 0.0,
+            "metadata": {"window_seconds": int(window_td.total_seconds())},
+        }
+
+    payload = await FEATURE_STORE.get_or_load(
+        "futures",
+        cache_key,
+        _loader,
+        ttl=_TTL_SECONDS,
+        diagnostics={"symbol": symbol.upper(), "window_seconds": int(window_td.total_seconds())},
+    )
+
+    return AdapterFrame(
+        symbol=symbol,
+        asof=asof,
+        source=str(payload.get("source", "futures")),
+        confidence=float(payload.get("confidence", 0.0)),
+        payload=payload.get("data") or [],
+        metadata={**(payload.get("metadata") or {}), "window_seconds": int(window_td.total_seconds())},
+    )
