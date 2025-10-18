@@ -10,6 +10,7 @@ from fastapi import HTTPException
 
 from src.core import REDIS
 from src.services import ingestion as ingestion_service
+from src.services.feature_store import feature_store_cache
 
 try:
     from src.feature_store import connect as feature_store_connect
@@ -34,56 +35,83 @@ def _as_utc_datetime(value: datetime | date | None) -> datetime | None:
 
 async def get_sentiment_features(symbol: str, days: int = 7) -> dict[str, Any]:
     base = {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
-    fs_connect = feature_store_connect
-    if not callable(fs_connect):
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
         return base
-    symbol = (symbol or "").strip().upper()
-    if not symbol:
-        return base
+
     window_days = int(max(1, days))
     cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_sentiment_features: fs_connect failed: %s", exc)
-        return base
-    try:
-        rows = con.execute(
-            """
-            SELECT ts, sentiment
-            FROM news_articles
-            WHERE symbol = ? AND ts >= ?
-            ORDER BY ts DESC
-            """,
-            [symbol, cutoff],
-        ).fetchall()
-    except Exception as exc:
-        logger.debug("get_sentiment_features: query failed for %s: %s", symbol, exc)
-        rows = []
-    finally:
+
+    async def loader() -> dict[str, Any]:
+        fs_connect = feature_store_connect
+        if not callable(fs_connect):
+            return dict(base)
         try:
-            con.close()
-        except Exception:
-            pass
-    if not rows:
+            con = fs_connect()
+        except Exception as exc:
+            logger.debug("get_sentiment_features: fs_connect failed: %s", exc)
+            return dict(base)
+        try:
+            rows = con.execute(
+                """
+                SELECT ts, sentiment
+                FROM news_articles
+                WHERE symbol = ? AND ts >= ?
+                ORDER BY ts DESC
+                """,
+                [symbol_norm, cutoff],
+            ).fetchall()
+        except Exception as exc:
+            logger.debug("get_sentiment_features: query failed for %s: %s", symbol_norm, exc)
+            rows = []
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        if not rows:
+            return dict(base)
+
+        now = datetime.now(timezone.utc)
+        vals = []
+        last24_vals = []
+        for ts, sentiment in rows:
+            val = float(sentiment or 0.0)
+            vals.append(val)
+            ts_dt = _as_utc_datetime(ts)
+            if ts_dt is None:
+                continue
+            if (now - ts_dt).total_seconds() <= 86400:
+                last24_vals.append(val)
+
+        return {
+            "avg_sent_7d": float(np.mean(vals)) if vals else 0.0,
+            "last24h": float(np.mean(last24_vals)) if last24_vals else 0.0,
+            "n_news": int(len(vals)),
+        }
+
+    try:
+        cached = await feature_store_cache.fetch(
+            key=f"sentiment:{symbol_norm}:{window_days}",
+            loader=loader,
+            ttl=900,
+            namespace="sentiment",
+        )
+    except Exception as exc:
+        logger.debug("get_sentiment_features: cache fetch failed for %s: %s", symbol_norm, exc)
         return base
 
-    now = datetime.now(timezone.utc)
-    vals = []
-    last24_vals = []
-    for ts, sentiment in rows:
-        val = float(sentiment or 0.0)
-        vals.append(val)
-        ts_dt = _as_utc_datetime(ts)
-        if ts_dt is None:
-            continue
-        if (now - ts_dt).total_seconds() <= 86400:
-            last24_vals.append(val)
+    if not isinstance(cached, dict):
+        return base
 
-    base["avg_sent_7d"] = float(np.mean(vals)) if vals else 0.0
-    base["last24h"] = float(np.mean(last24_vals)) if last24_vals else 0.0
-    base["n_news"] = len(vals)
-    return base
+    result = dict(base)
+    result.update({
+        "avg_sent_7d": float(cached.get("avg_sent_7d", 0.0)),
+        "last24h": float(cached.get("last24h", 0.0)),
+        "n_news": int(cached.get("n_news", 0)),
+    })
+    return result
 
 
 async def get_earnings_features(symbol: str) -> dict[str, Any]:
@@ -99,42 +127,66 @@ async def get_earnings_features(symbol: str) -> dict[str, Any]:
     symbol = (symbol or "").strip().upper()
     if not symbol:
         return out
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_earnings_features: fs_connect failed: %s", exc)
-        return out
-    try:
-        last = con.execute(
-            """
-            SELECT report_date, surprise, guidance_delta
-            FROM earnings
-            WHERE symbol = ?
-            ORDER BY report_date DESC
-            LIMIT 1
-            """,
-            [symbol],
-        ).fetchone()
-    except Exception as exc:
-        logger.debug("get_earnings_features: query failed for %s: %s", symbol, exc)
-        last = None
-    finally:
+    async def loader() -> dict[str, Any]:
+        fs_connect = feature_store_connect
+        if not callable(fs_connect):
+            return dict(out)
         try:
-            con.close()
-        except Exception:
-            pass
+            con = fs_connect()
+        except Exception as exc:
+            logger.debug("get_earnings_features: fs_connect failed: %s", exc)
+            return dict(out)
+        try:
+            last = con.execute(
+                """
+                SELECT report_date, surprise, guidance_delta
+                FROM earnings
+                WHERE symbol = ?
+                ORDER BY report_date DESC
+                LIMIT 1
+                """,
+                [symbol],
+            ).fetchone()
+        except Exception as exc:
+            logger.debug("get_earnings_features: query failed for %s: %s", symbol, exc)
+            last = None
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
 
-    if last:
+        if not last:
+            return dict(out)
+
         report_date, surprise, guidance_delta = last
+        payload = dict(out)
         if surprise is not None:
-            out["surprise_last"] = float(surprise)
+            payload["surprise_last"] = float(surprise)
         if guidance_delta is not None:
-            out["guidance_delta"] = float(guidance_delta)
+            payload["guidance_delta"] = float(guidance_delta)
         rd = report_date
         if isinstance(rd, datetime):
             rd = rd.date()
         if isinstance(rd, date):
-            out["days_since_earn"] = (datetime.now(timezone.utc).date() - rd).days
+            payload["days_since_earn"] = (datetime.now(timezone.utc).date() - rd).days
+        return payload
+
+    try:
+        cached = await feature_store_cache.fetch(
+            key=f"earnings:{symbol}",
+            loader=loader,
+            ttl=6 * 3600,
+            namespace="earnings",
+        )
+    except Exception as exc:
+        logger.debug("get_earnings_features: cache fetch failed for %s: %s", symbol, exc)
+        return out
+
+    if isinstance(cached, dict):
+        result = dict(out)
+        result.update(cached)
+        return result
     return out
 
 
@@ -143,35 +195,58 @@ async def get_macro_features() -> dict[str, Any]:
     fs_connect = feature_store_connect
     if not callable(fs_connect):
         return base
-    try:
-        con = fs_connect()
-    except Exception as exc:
-        logger.debug("get_macro_features: fs_connect failed: %s", exc)
-        return base
-    try:
-        row = con.execute(
-            """
-            SELECT rff, cpi_yoy, u_rate
-            FROM macro_daily
-            ORDER BY as_of DESC
-            LIMIT 1
-            """
-        ).fetchone()
-    except Exception as exc:
-        logger.debug("get_macro_features: query failed: %s", exc)
-        row = None
-    finally:
+    async def loader() -> dict[str, Any]:
+        fs_connect = feature_store_connect
+        if not callable(fs_connect):
+            return dict(base)
         try:
-            con.close()
-        except Exception:
-            pass
-    if not row:
+            con = fs_connect()
+        except Exception as exc:
+            logger.debug("get_macro_features: fs_connect failed: %s", exc)
+            return dict(base)
+        try:
+            row = con.execute(
+                """
+                SELECT rff, cpi_yoy, u_rate
+                FROM macro_daily
+                ORDER BY as_of DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        except Exception as exc:
+            logger.debug("get_macro_features: query failed: %s", exc)
+            row = None
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        if not row:
+            return dict(base)
+
+        return {
+            "rff": float(row[0]) if row[0] is not None else None,
+            "cpi_yoy": float(row[1]) if row[1] is not None else None,
+            "u_rate": float(row[2]) if row[2] is not None else None,
+        }
+
+    try:
+        cached = await feature_store_cache.fetch(
+            key="macro:latest",
+            loader=loader,
+            ttl=3 * 3600,
+            namespace="macro",
+        )
+    except Exception as exc:
+        logger.debug("get_macro_features: cache fetch failed: %s", exc)
         return base
-    return {
-        "rff": float(row[0]) if row[0] is not None else None,
-        "cpi_yoy": float(row[1]) if row[1] is not None else None,
-        "u_rate": float(row[2]) if row[2] is not None else None,
-    }
+
+    if isinstance(cached, dict):
+        result = dict(base)
+        result.update(cached)
+        return result
+    return base
 
 
 def detect_regime(px: np.ndarray) -> dict[str, Any]:

@@ -52,6 +52,7 @@ from src.infra.backups import create_duckdb_backup
 from src.sim_validation import rollforward_validation
 from src.services import auth as auth_service
 from src.services.quant_daily import fetch_minimal_summary
+from src.services.feature_store import feature_store_cache
 from src.services.labeling import (
     label_outcomes as service_label_outcomes,
     labeler_pass as service_labeler_pass,
@@ -78,6 +79,7 @@ from src.services.quant_scheduler import (
     daily_quant_scheduler as service_daily_quant_scheduler,
 )
 from src.services.quant_context import detect_regime as service_detect_regime
+from src.state.estimation import fuse_dynamic_factors
 from src.services import quant_adapters
 from src.services.ingestion import fetch_cached_hist_prices as ingestion_fetch_cached_hist_prices
 from src.services.training import (
@@ -3736,69 +3738,55 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             await _update_run_state(redis, run_id, rs, progress=32.0, detail="Estimating drift and volatility")
 
-            fusion_diag: dict | None = None
-            if USE_SIM_BIAS:
-                def _safe_sent_dict() -> dict:
-                    return {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
+            def _safe_sent_dict() -> dict:
+                return {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
 
-                def _safe_earn_dict() -> dict:
-                    return {"surprise_last": 0.0, "guidance_delta": 0.0, "days_since_earn": None, "days_to_next": None}
+            def _safe_earn_dict() -> dict:
+                return {"surprise_last": 0.0, "guidance_delta": 0.0, "days_since_earn": None, "days_to_next": None}
 
-                def _safe_macro_dict() -> dict:
-                    return {"rff": None, "cpi_yoy": None, "u_rate": None}
+            def _safe_macro_dict() -> dict:
+                return {"rff": None, "cpi_yoy": None, "u_rate": None}
 
-                try:
-                    sent = await get_sentiment_features(req.symbol)
-                except Exception as exc:
-                    logger.debug("sim_bias: sentiment fetch failed for %s: %s", req.symbol, exc)
-                    sent = _safe_sent_dict()
-                try:
-                    earn = await get_earnings_features(req.symbol)
-                except Exception as exc:
-                    logger.debug("sim_bias: earnings fetch failed for %s: %s", req.symbol, exc)
-                    earn = _safe_earn_dict()
-                try:
-                    macr = await get_macro_features()
-                except Exception as exc:
-                    logger.debug("sim_bias: macro fetch failed: %s", exc)
-                    macr = _safe_macro_dict()
+            try:
+                reg = _detect_regime(px_arr)
+            except Exception:
+                reg = {"name": "unknown", "score": 0.0}
 
-                mu_ann_pre = float(mu_ann)
-                sigma_ann_pre = float(sigma_ann)
-                sent_avg = float(sent.get("avg_sent_7d") or 0.0)
-                earn_surprise = float(earn.get("surprise_last") or 0.0)
-                mu_bias = float(np.clip(sent_avg * 0.15 + earn_surprise * 0.05, -0.15, 0.15))
-                mu_ann = float(np.clip(mu_ann + mu_bias, -mu_cap, mu_cap))
+            feature_store_cache.flush_diagnostics()
+            sent = _safe_sent_dict()
+            earn = _safe_earn_dict()
+            macr = _safe_macro_dict()
 
-                sigma_ann_post = sigma_ann
-                if float(sent.get("last24h") or 0.0) > 0.20:
-                    sigma_ann_post = float(np.clip(sigma_ann_post * 0.97, 1e-4, SIGMA_CAP))
-                sigma_ann = sigma_ann_post
+            try:
+                sent = await get_sentiment_features(req.symbol)
+            except Exception as exc:
+                logger.debug("sim_bias: sentiment fetch failed for %s: %s", req.symbol, exc)
+            try:
+                earn = await get_earnings_features(req.symbol)
+            except Exception as exc:
+                logger.debug("sim_bias: earnings fetch failed for %s: %s", req.symbol, exc)
+            try:
+                macr = await get_macro_features()
+            except Exception as exc:
+                logger.debug("sim_bias: macro fetch failed: %s", exc)
 
-                fusion_diag = {
-                    "use_sim_bias": True,
-                    "mu_ann_pre": mu_ann_pre,
-                    "mu_ann_post": float(mu_ann),
-                    "sigma_ann_pre": sigma_ann_pre,
-                    "sigma_ann_post": float(sigma_ann),
-                    "mu_bias": float(mu_bias),
-                    "sent": {
-                        "avg_sent_7d": sent_avg,
-                        "last24h": float(sent.get("last24h") or 0.0),
-                        "n_news": int(sent.get("n_news") or 0),
-                    },
-                    "earn": {
-                        "surprise_last": earn_surprise,
-                        "guidance_delta": float(earn.get("guidance_delta") or 0.0),
-                        "days_since_earn": earn.get("days_since_earn"),
-                        "days_to_next": earn.get("days_to_next"),
-                    },
-                    "macro": {
-                        "rff": (float(macr.get("rff")) if macr.get("rff") is not None else None),
-                        "cpi_yoy": (float(macr.get("cpi_yoy")) if macr.get("cpi_yoy") is not None else None),
-                        "u_rate": (float(macr.get("u_rate")) if macr.get("u_rate") is not None else None),
-                    },
-                }
+            cache_stats = feature_store_cache.flush_diagnostics()
+            mu_ann, sigma_ann, _state_vector, fusion_diag = fuse_dynamic_factors(
+                t=datetime.now(timezone.utc),
+                spot=float(S0),
+                mu_pre=float(mu_ann),
+                sigma_pre=float(sigma_ann),
+                regime=str(reg.get("name", "neutral")),
+                macro=macr,
+                sentiment=sent,
+                earnings=earn,
+                options_iv=float(iv30) if iv30 else None,
+                futures_curve=None,
+                events=[],
+                cache_diags=cache_stats,
+                bounds=(-mu_cap, mu_cap, 1e-4, SIGMA_CAP),
+                apply_bias=USE_SIM_BIAS,
+            )
 
             await _update_run_state(redis, run_id, rs, progress=42.0, detail="Blending context signals")
 
@@ -3814,10 +3802,6 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                 warnings.append(f"Volatility capped at {int(SIGMA_CAP*100)}%/yr for stability (measured {sigma_ann_raw*100:.1f}%/yr)")
 
             # ---------- Regime-aware nudges (before sim) ----------
-            try:
-                reg = _detect_regime(px_arr)
-            except Exception:
-                reg = {"name": "unknown", "score": 0.0}
 
             mu_adj = mu_ann
             sigma_adj = sigma_ann
@@ -5869,6 +5853,68 @@ async def quant_daily_today(
             raise HTTPException(status_code=500, detail=f"compute failed for {s}: {exc}") from exc
 
     # --- Original dashboard snapshot branch -----------------------------
+    def _coerce_float(value: object) -> float | None:
+        try:
+            num = float(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return num if math.isfinite(num) else None
+
+    def _ensure_pick_fields(pick: dict[str, object], *, default_horizon: int) -> dict[str, object]:
+        payload = dict(pick)
+        symbol_val = str(payload.get("symbol") or "").upper()
+        if symbol_val:
+            payload["symbol"] = symbol_val
+        horizon_val = payload.get("horizon_days")
+        try:
+            horizon_int = int(horizon_val)
+        except (TypeError, ValueError):
+            horizon_int = int(default_horizon)
+        if horizon_int <= 0:
+            horizon_int = int(default_horizon)
+        payload["horizon_days"] = horizon_int
+
+        prob = _coerce_float(payload.get("prob_up_end"))
+        if prob is None:
+            for key in ("prob_up_30d", "prob_up", "prob_up_end_raw"):
+                prob = _coerce_float(payload.get(key))
+                if prob is not None:
+                    break
+        if prob is not None:
+            payload["prob_up_end"] = max(0.0, min(prob, 1.0))
+
+        med = _coerce_float(payload.get("median_return_pct"))
+        if med is None:
+            base_price = _coerce_float(payload.get("base_price"))
+            spot_price = _coerce_float(payload.get("spot0") or payload.get("spot"))
+            if base_price is not None and spot_price:
+                try:
+                    med = float((base_price / spot_price - 1.0) * 100.0)
+                except ZeroDivisionError:
+                    med = None
+        if med is not None:
+            payload["median_return_pct"] = med
+
+        if not payload.get("blurb") and symbol_val:
+            prob_pct = f"{(prob or 0.0) * 100:.0f}%" if prob is not None else "--"
+            med_str = f"{med:.1f}%" if med is not None else "--"
+            payload["blurb"] = (
+                f"{symbol_val}: {horizon_int}d Monte Carlo outlook ~{prob_pct} up probability; median move ≈ {med_str}."
+            )
+        return payload
+
+    def _sanitize_entry(value: object, default_horizon: int) -> object:
+        if isinstance(value, dict):
+            return _ensure_pick_fields(value, default_horizon=default_horizon)
+        if isinstance(value, list):
+            return [
+                _ensure_pick_fields(item, default_horizon=default_horizon)
+                if isinstance(item, dict)
+                else item
+                for item in value
+            ]
+        return value
+
     out: dict[str, object] = {"as_of": d}
     if REDIS:
         try:
@@ -5898,6 +5944,17 @@ async def quant_daily_today(
 
     if not out.get("equity") or not out.get("crypto"):
         out = await _run_daily_quant()
+
+    horizon_default = int(settings.daily_quant_horizon_days)
+    for key in ("equity", "crypto"):
+        item = out.get(key)
+        if isinstance(item, dict) and isinstance(item.get("horizon_days"), (int, float)):
+            horizon_default = int(item["horizon_days"])
+            break
+
+    for key in ("equity", "crypto", "equity_top", "crypto_top", "equity_finalists", "crypto_finalists"):
+        if key in out:
+            out[key] = _sanitize_entry(out[key], default_horizon=horizon_default)
 
     return out
 
