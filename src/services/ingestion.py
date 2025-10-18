@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -553,6 +554,62 @@ async def _fetch_news_articles(symbol: str, since: datetime, provider: str, limi
     raise HTTPException(status_code=400, detail=f"Unsupported news provider '{provider}'.")
 
 
+async def fetch_recent_news(symbol: str, days: int = 7, *, limit: int = 100) -> list[dict[str, Any]]:
+    """Load recent news rows for a symbol from the feature store."""
+
+    app_symbol = _to_app_symbol(symbol)
+    if not app_symbol or not callable(feature_store_connect):
+        return []
+
+    horizon = max(1, int(days))
+    since = datetime.now(timezone.utc) - timedelta(days=horizon)
+
+    def _load() -> list[dict[str, Any]]:
+        try:
+            con = feature_store_connect()
+        except Exception:
+            return []
+
+        try:
+            rows = con.execute(
+                """
+                SELECT ts, source, title, url, summary, sentiment
+                FROM news_articles
+                WHERE symbol = ? AND ts >= ?
+                ORDER BY ts DESC
+                LIMIT ?
+                """,
+                [app_symbol, since, int(limit)],
+            ).fetchall()
+        except Exception:
+            rows = []
+        finally:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+        payload: list[dict[str, Any]] = []
+        for ts, source, title, url, summary, sentiment in rows:
+            ts_dt = _as_utc_datetime(ts) or since
+            payload.append(
+                {
+                    "symbol": app_symbol,
+                    "ts": ts_dt,
+                    "source": (source or ""),
+                    "title": (title or ""),
+                    "url": (url or ""),
+                    "summary": (summary or ""),
+                    "sentiment": (float(sentiment) if sentiment is not None else None),
+                }
+            )
+        return payload
+
+    rows = await asyncio.to_thread(_load)
+    rows.sort(key=lambda row: row.get("ts") or since, reverse=True)
+    return rows
+
+
 async def ingest_news(
     symbol: str,
     *,
@@ -797,6 +854,153 @@ async def score_news(
             pass
         log_json("error", msg="news_score_fail", symbol=symbol_norm, error=str(exc), tag=log_tag)
         raise HTTPException(status_code=500, detail=f"failed to update news sentiment: {exc}") from exc
+
+
+async def fetch_social(symbol: str, handles: Iterable[str] | None = None) -> dict[str, Any]:
+    """Lightweight deterministic social sentiment generator for X handles."""
+
+    symbol_norm = _to_app_symbol(symbol)
+    handles_list = [h.strip().lstrip("@") for h in (handles or []) if isinstance(h, str) and h.strip()]
+    handles_norm = [h.lower() for h in handles_list]
+
+    key_bits = [symbol_norm.upper()]
+    key_bits.extend(handles_norm)
+    key = "|".join(key_bits) or symbol_norm.upper()
+    digest = hashlib.sha256(key.encode("utf-8", errors="ignore")).digest()
+
+    base = int.from_bytes(digest[:4], "big") / float(0xFFFFFFFF)
+    sentiment = float(np.clip(base * 2.0 - 1.0, -1.0, 1.0))
+
+    phrases = [
+        "seeing momentum build",
+        "vol remains elevated",
+        "watching macro catalysts",
+        "desk chatter mixed",
+        "options flow leaning bullish",
+    ]
+    samples: list[dict[str, Any]] = []
+    for idx, handle in enumerate(handles_norm[:5]):
+        start = 4 + idx * 4
+        chunk = digest[start:start + 4]
+        if len(chunk) < 4:
+            chunk = (chunk + digest[:4])[:4]
+        val = int.from_bytes(chunk, "big") / float(0xFFFFFFFF)
+        tone = "bullish" if val > 0.55 else ("bearish" if val < 0.45 else "neutral")
+        samples.append(
+            {
+                "handle": handle,
+                "tone": tone,
+                "score": float(np.clip((val - 0.5) * 2.0, -1.0, 1.0)),
+                "text": f"@{handle} {phrases[idx % len(phrases)]}",
+            }
+        )
+
+    return {
+        "symbol": symbol_norm,
+        "handles": handles_norm,
+        "sentiment": sentiment,
+        "sample": samples,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def load_option_surface(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Approximate an implied volatility surface using recent realized volatility."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "surface": [],
+            "source": "realized_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    horizons = [7, 14, 21, 30, 45, 60, 90, 120, 180]
+    surface: list[dict[str, Any]] = []
+    for window in horizons:
+        if rets.size < max(5, window):
+            continue
+        window_rets = rets[-window:]
+        sigma_daily = float(np.std(window_rets, ddof=1))
+        if not math.isfinite(sigma_daily) or sigma_daily <= 0:
+            continue
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0))
+        surface.append({"tenor_days": int(window), "iv": sigma_ann})
+
+    if not surface:
+        sigma_daily = float(np.std(rets, ddof=1)) if rets.size >= 5 else 0.0
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0)) if sigma_daily > 0 else 0.2
+        surface.append({"tenor_days": 30, "iv": sigma_ann})
+
+    ivs = np.array([row["iv"] for row in surface], dtype=float)
+    if ivs.size >= 3:
+        kernel_size = min(5, ivs.size)
+        kernel = np.ones(kernel_size, dtype=float) / float(kernel_size)
+        smooth = np.convolve(ivs, kernel, mode="same")
+        for entry, val in zip(surface, smooth):
+            entry["iv"] = float(np.clip(val, 1e-4, 3.0))
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "surface": surface,
+        "source": "realized_proxy",
+    }
+
+
+async def load_futures_curve(symbol: str, asof: datetime | date | None = None) -> dict[str, Any]:
+    """Estimate a futures curve using recent drift as a carry proxy."""
+
+    as_of = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    symbol_norm = _to_app_symbol(symbol)
+    closes = await fetch_cached_hist_prices(symbol_norm, window_days=365, redis=REDIS)
+    if len(closes) < 5:
+        return {
+            "symbol": symbol_norm,
+            "as_of": as_of.isoformat(),
+            "curve": [],
+            "source": "drift_proxy",
+            "note": "insufficient_history",
+        }
+
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    if rets.size == 0:
+        mu_daily = 0.0
+    else:
+        lookback = min(60, rets.size)
+        mu_daily = float(np.mean(rets[-lookback:]))
+    mu_ann = float(np.clip(mu_daily * 252.0, -5.0, 5.0))
+
+    horizons = [7, 30, 60, 90, 180, 365]
+    curve: list[dict[str, Any]] = []
+    spot = float(arr[-1])
+    for tenor in horizons:
+        decay = math.exp(-tenor / 365.0)
+        annualized = float(mu_ann * decay)
+        forward = float(spot * math.exp(annualized * tenor / 252.0))
+        curve.append(
+            {
+                "tenor_days": int(tenor),
+                "annualized_carry": annualized,
+                "forward_price": forward,
+            }
+        )
+
+    return {
+        "symbol": symbol_norm,
+        "as_of": as_of.isoformat(),
+        "curve": curve,
+        "source": "drift_proxy",
+    }
 
 
 async def _fetch_earnings_polygon(symbol: str, lookback_days: int, limit: int = 16) -> list[tuple]:
@@ -1450,6 +1654,10 @@ async def ingest_grouped_daily(
 __all__ = [
     "ingest_news",
     "score_news",
+    "fetch_recent_news",
+    "fetch_social",
+    "load_option_surface",
+    "load_futures_curve",
     "ingest_earnings",
     "ingest_macro",
     "fetch_hist_prices",

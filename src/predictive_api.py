@@ -83,8 +83,8 @@ from src.services.ingestion import (
     fetch_cached_hist_prices as ingestion_fetch_cached_hist_prices,
     fetch_recent_news as ingestion_fetch_recent_news,
     fetch_social as ingestion_fetch_social,
-    load_futures_curve as ingestion_load_futures_curve,
     load_option_surface as ingestion_load_option_surface,
+    load_futures_curve as ingestion_load_futures_curve,
 )
 from src.services.training import (
     _feat_from_prices as training_feat_from_prices,
@@ -3058,6 +3058,10 @@ class SimRequest(BaseModel):
     def lookback_days(self) -> int:
         return 180 if self.mode == "quick" else 3650
 
+    @property
+    def handles(self) -> list[str]:
+        return list(self.x_handles)
+
     def bars_per_day(self) -> int:
         return 1 if self.timespan == "day" else (24 if self.timespan == "hour" else 390)
 
@@ -4147,6 +4151,8 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             # Final small calibration
             sigma_scale = _calibration_sigma_scale(req.symbol, int(req.horizon_days))
             sigma_adj = float(np.clip(sigma_adj * sigma_scale, 1e-4, 2.0))
+            mu_diag_final = float(mu_adj)
+            sigma_diag_final = float(sigma_adj)
 
             # ---------- Seed (stable per-day) ----------
             import zlib
@@ -4311,6 +4317,35 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             await _update_run_state(redis, run_id, rs, progress=82.0, detail="Computing risk metrics")
 
             # ---------- Artifact ----------
+            diagnostics_payload: dict[str, Any] = {
+                "mu": {
+                    "pre": float(mu_diag_pre),
+                    "post": float(mu_diag_final),
+                    "post_enrichment": float(mu_diag_post_enrichment),
+                },
+                "sigma": {
+                    "pre": float(sigma_diag_pre),
+                    "post": float(sigma_diag_final),
+                    "post_enrichment": float(sigma_diag_post_enrichment),
+                },
+                "sentiment": {
+                    **diag_sentiment,
+                    "news": news_context,
+                    "social": social_context,
+                },
+                "earnings": diag_earnings,
+                "macro": diag_macro,
+                "scheduler": scheduler_diag,
+                "regime": {
+                    "name": reg.get("name", "unknown"),
+                    "score": float(reg.get("score", 0.0)),
+                },
+                "options": options_diag,
+                "futures": futures_diag,
+            }
+            if sim_bias_diag:
+                diagnostics_payload["sim_bias"] = sim_bias_diag
+
             artifact = {
                 "symbol": req.symbol,
                 "horizon_days": int(req.horizon_days),
@@ -4374,6 +4409,7 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     "sigma_annualized": float(sigma_adj),
                     "stat_window_bars": int(stat_bars),
                 },
+                "diagnostics": diagnostics_payload,
             }
 
             artifact["diagnostics"] = diagnostics
