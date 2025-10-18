@@ -4,11 +4,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 
 import httpx
 import numpy as np
@@ -522,6 +523,180 @@ async def score_news(
             pass
         log_json("error", msg="news_score_fail", symbol=symbol_norm, error=str(exc), tag=log_tag)
         raise HTTPException(status_code=500, detail=f"failed to update news sentiment: {exc}") from exc
+
+
+async def fetch_recent_news(symbol: str, days: int = 7, *, limit: int = 50) -> list[dict[str, Any]]:
+    """Return recent news rows for *symbol* from the feature store (best effort)."""
+
+    fs_connect = feature_store_connect
+    if not callable(fs_connect):
+        return []
+
+    symbol_norm = (symbol or "").strip().upper()
+    if not symbol_norm:
+        return []
+
+    window_days = int(max(1, days))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=window_days)
+    try:
+        con = fs_connect()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: fs_connect failed: %s", exc)
+        return []
+
+    try:
+        rows = con.execute(
+            """
+            SELECT ts, source, title, url, summary, sentiment
+            FROM news_articles
+            WHERE symbol = ? AND ts >= ?
+            ORDER BY ts DESC
+            LIMIT ?
+            """,
+            [symbol_norm, cutoff, int(max(1, limit))],
+        ).fetchall()
+    except Exception as exc:
+        logger.debug("fetch_recent_news: query failed for %s: %s", symbol_norm, exc)
+        rows = []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+    items: list[dict[str, Any]] = []
+    for ts, source, title, url_item, summary, sentiment in rows:
+        ts_norm = _as_utc_datetime(ts)
+        items.append(
+            {
+                "ts": ts_norm.isoformat() if ts_norm else None,
+                "source": (source or "").strip() if isinstance(source, str) else None,
+                "title": (title or "").strip() if isinstance(title, str) else None,
+                "url": (url_item or "").strip() if isinstance(url_item, str) else None,
+                "summary": (summary or "").strip() if isinstance(summary, str) else None,
+                "sentiment": float(sentiment) if sentiment is not None else None,
+            }
+        )
+    return items
+
+
+async def fetch_social(symbol: str, handles: Sequence[str] | None = None) -> dict[str, Any]:
+    """Lightweight social sentiment proxy seeded by handles (deterministic, offline friendly)."""
+
+    handles_in = [
+        h.strip()
+        for h in (handles or [])
+        if isinstance(h, str) and h.strip()
+    ]
+    symbol_norm = (symbol or "").strip().upper()
+    seed_basis = symbol_norm or "MARKET"
+
+    def _score(token: str) -> float:
+        digest = hashlib.sha256(token.encode("utf-8", errors="ignore")).digest()
+        raw = int.from_bytes(digest[:2], "big") / 65535.0
+        return float((raw - 0.5) * 0.4)
+
+    samples: list[dict[str, Any]] = []
+    universe = handles_in or [seed_basis]
+    for handle in universe:
+        score = _score(f"{seed_basis}|{handle}".lower())
+        samples.append({"handle": handle, "score": score})
+
+    avg = float(np.mean([s["score"] for s in samples])) if samples else 0.0
+    return {
+        "symbol": seed_basis,
+        "handles": handles_in,
+        "avg_sentiment": avg,
+        "samples": samples[:5],
+        "status": "applied" if samples else "empty",
+    }
+
+
+async def load_option_surface(symbol: str, asof: datetime | None = None) -> dict[str, Any]:
+    """Approximate an option IV surface using realized volatility as a fallback."""
+
+    symbol_norm = (symbol or "").strip().upper()
+    asof_dt = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    closes = await fetch_cached_hist_prices(symbol_norm, 365)
+    arr = np.asarray(
+        [float(c) for c in closes if isinstance(c, (int, float)) and math.isfinite(float(c))],
+        dtype=float,
+    )
+
+    result: dict[str, Any] = {
+        "symbol": symbol_norm,
+        "asof": asof_dt.isoformat(),
+        "spot": float(arr[-1]) if arr.size else None,
+        "surface": [],
+        "source": "realized_vol",
+    }
+
+    if arr.size < 10:
+        result["status"] = "insufficient_history"
+        return result
+
+    rets = np.diff(np.log(arr))
+    horizons = [7, 14, 21, 30, 45, 60, 90, 120, 180]
+    nodes: list[dict[str, Any]] = []
+    for days in horizons:
+        window = min(rets.size, max(5, days))
+        if window < 5:
+            continue
+        window_rets = rets[-window:]
+        sigma_daily = float(np.std(window_rets, ddof=1))
+        if not math.isfinite(sigma_daily) or sigma_daily <= 0:
+            continue
+        sigma_ann = float(np.clip(sigma_daily * math.sqrt(252.0), 1e-4, 3.0))
+        nodes.append({"days": int(days), "atm_iv": sigma_ann})
+
+    nodes.sort(key=lambda x: x["days"])
+    result["surface"] = nodes
+    result["status"] = "ok" if nodes else "empty"
+    return result
+
+
+async def load_futures_curve(symbol: str, asof: datetime | None = None) -> dict[str, Any]:
+    """Approximate a futures carry curve using recent realized drift as proxy."""
+
+    symbol_norm = (symbol or "").strip().upper()
+    asof_dt = _as_utc_datetime(asof) or datetime.now(timezone.utc)
+    closes = await fetch_cached_hist_prices(symbol_norm, 365)
+    arr = np.asarray(
+        [float(c) for c in closes if isinstance(c, (int, float)) and math.isfinite(float(c))],
+        dtype=float,
+    )
+
+    result: dict[str, Any] = {
+        "symbol": symbol_norm,
+        "asof": asof_dt.isoformat(),
+        "spot": float(arr[-1]) if arr.size else None,
+        "forwards": [],
+        "source": "realized_carry",
+    }
+
+    if arr.size < 5:
+        result["status"] = "insufficient_history"
+        result["annualized_carry"] = 0.0
+        return result
+
+    rets = np.diff(np.log(arr))
+    if rets.size >= 60:
+        mu_daily = float(np.mean(rets[-60:]))
+    else:
+        mu_daily = float(np.mean(rets)) if rets.size else 0.0
+
+    mu_ann = float(mu_daily * 252.0)
+    spot = float(arr[-1]) if arr.size else 0.0
+    horizons = [30, 60, 90, 180, 365]
+    forwards: list[dict[str, Any]] = []
+    for days in horizons:
+        price = float(spot * math.exp(mu_daily * days)) if spot > 0 else 0.0
+        forwards.append({"days": int(days), "price": price})
+
+    result["forwards"] = forwards
+    result["annualized_carry"] = mu_ann
+    result["status"] = "ok" if forwards else "empty"
+    return result
 
 
 async def _fetch_earnings_polygon(symbol: str, lookback_days: int, limit: int = 16) -> list[tuple]:
@@ -1175,6 +1350,10 @@ async def ingest_grouped_daily(
 __all__ = [
     "ingest_news",
     "score_news",
+    "fetch_recent_news",
+    "fetch_social",
+    "load_option_surface",
+    "load_futures_curve",
     "ingest_earnings",
     "ingest_macro",
     "fetch_hist_prices",

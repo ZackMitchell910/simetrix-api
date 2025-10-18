@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import numpy as np
 from fastapi import HTTPException
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, AliasChoices
 from redis.asyncio import Redis
 
 from src.core import (
@@ -49,6 +49,10 @@ class SimRequest(BaseModel):
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
+    social_handles: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("social_handles", "handles", "x_handles"),
+    )
     seed: Optional[int] = None
 
     @property

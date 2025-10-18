@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm, SecurityScopes
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, Field, ConfigDict, model_validator, AliasChoices
 from redis.asyncio import Redis
 from secrets import token_urlsafe
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -79,7 +79,13 @@ from src.services.quant_scheduler import (
 )
 from src.services.quant_context import detect_regime as service_detect_regime
 from src.services import quant_adapters
-from src.services.ingestion import fetch_cached_hist_prices as ingestion_fetch_cached_hist_prices
+from src.services.ingestion import (
+    fetch_cached_hist_prices as ingestion_fetch_cached_hist_prices,
+    fetch_recent_news as ingestion_fetch_recent_news,
+    fetch_social as ingestion_fetch_social,
+    load_option_surface as ingestion_load_option_surface,
+    load_futures_curve as ingestion_load_futures_curve,
+)
 from src.services.training import (
     _feat_from_prices as training_feat_from_prices,
     OnlineLearnRequest,
@@ -2917,6 +2923,10 @@ class SimRequest(BaseModel):
     include_news: bool = False
     include_options: bool = False
     include_futures: bool = False
+    social_handles: List[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("social_handles", "handles", "x_handles"),
+    )
 
     seed: Optional[int] = None
 
@@ -3639,6 +3649,48 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
     try:
         logger.info(f"Starting simulation for run_id={run_id}, symbol={req.symbol}")
+
+        def _integrated_iv(surface: Mapping[str, Any] | None, horizon_days: int) -> float | None:
+            if not isinstance(surface, Mapping):
+                return None
+            nodes = surface.get("surface")
+            if not isinstance(nodes, Iterable):
+                return None
+            cleaned: list[tuple[int, float]] = []
+            for node in nodes:
+                if not isinstance(node, Mapping):
+                    continue
+                try:
+                    days = int(node.get("days") or 0)
+                    iv = float(node.get("atm_iv") or 0.0)
+                except Exception:
+                    continue
+                if days <= 0 or not math.isfinite(iv) or iv <= 0:
+                    continue
+                cleaned.append((days, iv))
+            if not cleaned:
+                return None
+            cleaned.sort(key=lambda x: x[0])
+            horizon = max(1, int(horizon_days))
+            prev_day = 0
+            var_accum = 0.0
+            last_iv = cleaned[0][1]
+            for day, iv in cleaned:
+                day = min(day, horizon)
+                if day <= prev_day:
+                    last_iv = iv
+                    continue
+                span = day - prev_day
+                var_accum += span * float(iv) ** 2
+                prev_day = day
+                last_iv = iv
+                if day >= horizon:
+                    break
+            if prev_day < horizon:
+                var_accum += (horizon - prev_day) * float(last_iv) ** 2
+            if var_accum <= 0:
+                return None
+            return float(math.sqrt(var_accum / float(horizon)))
         try:
             rs = await _ensure_run(run_id)
         except Exception as e:
@@ -3736,32 +3788,91 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
 
             await _update_run_state(redis, run_id, rs, progress=32.0, detail="Estimating drift and volatility")
 
-            fusion_diag: dict | None = None
-            if USE_SIM_BIAS:
-                def _safe_sent_dict() -> dict:
+            mu_diag: dict[str, Any] = {"pre": float(mu_ann), "post": None}
+            sigma_diag: dict[str, Any] = {"pre": float(sigma_ann), "post": None}
+            news_articles: list[dict[str, Any]] = []
+
+            if USE_SIM_BIAS and getattr(req, "include_news", False):
+                scheduler_news_diag: dict[str, Any] = {
+                    "status": "applied",
+                    "handles": list(getattr(req, "social_handles", []) or []),
+                }
+                try:
+                    news_articles = await ingestion_fetch_recent_news(req.symbol, days=7)
+                    scheduler_news_diag["articles"] = len(news_articles)
+                    if news_articles:
+                        scheduler_news_diag["latest"] = news_articles[0].get("ts")
+                except Exception as exc:
+                    scheduler_news_diag = {
+                        "status": "error",
+                        "error": str(exc),
+                        "handles": list(getattr(req, "social_handles", []) or []),
+                    }
+                    news_articles = []
+
+                def _safe_sent_dict() -> dict[str, Any]:
                     return {"avg_sent_7d": 0.0, "last24h": 0.0, "n_news": 0}
 
-                def _safe_earn_dict() -> dict:
+                def _safe_earn_dict() -> dict[str, Any]:
                     return {"surprise_last": 0.0, "guidance_delta": 0.0, "days_since_earn": None, "days_to_next": None}
 
-                def _safe_macro_dict() -> dict:
+                def _safe_macro_dict() -> dict[str, Any]:
                     return {"rff": None, "cpi_yoy": None, "u_rate": None}
 
                 try:
                     sent = await get_sentiment_features(req.symbol)
+                    sentiment_diag: dict[str, Any] = {
+                        "status": "applied",
+                        "avg_7d": float(sent.get("avg_sent_7d") or 0.0),
+                        "last24h": float(sent.get("last24h") or 0.0),
+                        "count": int(sent.get("n_news") or 0),
+                    }
                 except Exception as exc:
                     logger.debug("sim_bias: sentiment fetch failed for %s: %s", req.symbol, exc)
                     sent = _safe_sent_dict()
+                    sentiment_diag = {
+                        "status": "error",
+                        "error": str(exc),
+                        "avg_7d": 0.0,
+                        "last24h": 0.0,
+                        "count": 0,
+                    }
+
+                try:
+                    social_diag = await ingestion_fetch_social(req.symbol, getattr(req, "social_handles", None))
+                except Exception as exc:
+                    social_diag = {
+                        "status": "error",
+                        "error": str(exc),
+                        "handles": list(getattr(req, "social_handles", []) or []),
+                    }
+
                 try:
                     earn = await get_earnings_features(req.symbol)
+                    earnings_diag: dict[str, Any] = {
+                        "status": "applied",
+                        "surprise_last": float(earn.get("surprise_last") or 0.0),
+                        "guidance_delta": float(earn.get("guidance_delta") or 0.0),
+                        "days_since_earn": earn.get("days_since_earn"),
+                        "days_to_next": earn.get("days_to_next"),
+                    }
                 except Exception as exc:
                     logger.debug("sim_bias: earnings fetch failed for %s: %s", req.symbol, exc)
                     earn = _safe_earn_dict()
+                    earnings_diag = {"status": "error", "error": str(exc)}
+
                 try:
                     macr = await get_macro_features()
+                    macro_diag: dict[str, Any] = {
+                        "status": "applied",
+                        "rff": (float(macr.get("rff")) if macr.get("rff") is not None else None),
+                        "cpi_yoy": (float(macr.get("cpi_yoy")) if macr.get("cpi_yoy") is not None else None),
+                        "u_rate": (float(macr.get("u_rate")) if macr.get("u_rate") is not None else None),
+                    }
                 except Exception as exc:
                     logger.debug("sim_bias: macro fetch failed: %s", exc)
                     macr = _safe_macro_dict()
+                    macro_diag = {"status": "error", "error": str(exc)}
 
                 mu_ann_pre = float(mu_ann)
                 sigma_ann_pre = float(sigma_ann)
@@ -3775,29 +3886,33 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                     sigma_ann_post = float(np.clip(sigma_ann_post * 0.97, 1e-4, SIGMA_CAP))
                 sigma_ann = sigma_ann_post
 
-                fusion_diag = {
-                    "use_sim_bias": True,
-                    "mu_ann_pre": mu_ann_pre,
-                    "mu_ann_post": float(mu_ann),
-                    "sigma_ann_pre": sigma_ann_pre,
-                    "sigma_ann_post": float(sigma_ann),
-                    "mu_bias": float(mu_bias),
-                    "sent": {
-                        "avg_sent_7d": sent_avg,
-                        "last24h": float(sent.get("last24h") or 0.0),
-                        "n_news": int(sent.get("n_news") or 0),
+                mu_delta = float(mu_ann - mu_ann_pre)
+                sigma_delta = float(sigma_ann - sigma_ann_pre)
+                sentiment_diag.setdefault("news_sample", news_articles[:3])
+                sentiment_diag["mu_delta"] = mu_delta
+                sentiment_diag["sigma_delta"] = sigma_delta
+                sentiment_diag["social"] = social_diag
+            else:
+                reason = "include_news flag off" if not getattr(req, "include_news", False) else "sim_bias disabled"
+                sentiment_diag = {
+                    "status": "skipped",
+                    "reason": reason,
+                    "avg_7d": 0.0,
+                    "last24h": 0.0,
+                    "count": 0,
+                    "news_sample": [],
+                    "social": {
+                        "status": "skipped",
+                        "reason": reason,
+                        "handles": list(getattr(req, "social_handles", []) or []),
                     },
-                    "earn": {
-                        "surprise_last": earn_surprise,
-                        "guidance_delta": float(earn.get("guidance_delta") or 0.0),
-                        "days_since_earn": earn.get("days_since_earn"),
-                        "days_to_next": earn.get("days_to_next"),
-                    },
-                    "macro": {
-                        "rff": (float(macr.get("rff")) if macr.get("rff") is not None else None),
-                        "cpi_yoy": (float(macr.get("cpi_yoy")) if macr.get("cpi_yoy") is not None else None),
-                        "u_rate": (float(macr.get("u_rate")) if macr.get("u_rate") is not None else None),
-                    },
+                }
+                earnings_diag = {"status": "skipped", "reason": reason}
+                macro_diag = {"status": "skipped", "reason": reason}
+                scheduler_news_diag = {
+                    "status": "skipped",
+                    "reason": reason,
+                    "handles": list(getattr(req, "social_handles", []) or []),
                 }
 
             await _update_run_state(redis, run_id, rs, progress=42.0, detail="Blending context signals")
@@ -3857,18 +3972,74 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
             conf = (2.0 * float(ensemble_prob) - 1.0)
             mu_adj = float(mu_adj + (0.30 * conf * sigma_adj))
 
-            # ---------- Optional sentiment/options/futures tweaks ----------
-            sentiment = 0.0
-            if getattr(req, "include_options", False):
-                sigma_adj = float(np.clip(sigma_adj * 1.05, 1e-4, 1.5))
-            if getattr(req, "include_futures", False):
-                mu_adj += 0.001
+            scheduler_options_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
+            scheduler_futures_diag: dict[str, Any] = {"status": "skipped", "reason": "flag_off"}
 
-            mu_adj = float(np.clip(mu_adj + sentiment, -3.0, 3.0))
+            if getattr(req, "include_options", False):
+                scheduler_options_diag = {
+                    "status": "applied",
+                    "horizon_days": int(req.horizon_days),
+                }
+                try:
+                    option_surface = await ingestion_load_option_surface(req.symbol, datetime.utcnow())
+                    scheduler_options_diag["source"] = option_surface.get("source")
+                    scheduler_options_diag["asof"] = option_surface.get("asof")
+                    surface_nodes = option_surface.get("surface") or []
+                    scheduler_options_diag["nodes"] = len(surface_nodes)
+                    iv_target = _integrated_iv(option_surface, int(req.horizon_days))
+                    if iv_target and math.isfinite(iv_target):
+                        sigma_before = sigma_adj
+                        sigma_adj = float(np.clip(max(sigma_adj, float(iv_target)), 1e-4, 2.0))
+                        scheduler_options_diag["target_iv"] = float(iv_target)
+                        scheduler_options_diag["sigma_delta"] = float(sigma_adj - sigma_before)
+                    else:
+                        scheduler_options_diag["status"] = "noop"
+                        scheduler_options_diag["reason"] = "no_surface_points"
+                except Exception as exc:
+                    scheduler_options_diag = {"status": "error", "error": str(exc)}
+
+            if getattr(req, "include_futures", False):
+                scheduler_futures_diag = {
+                    "status": "applied",
+                    "horizon_days": int(req.horizon_days),
+                }
+                try:
+                    futures_curve = await ingestion_load_futures_curve(req.symbol, datetime.utcnow())
+                    scheduler_futures_diag["source"] = futures_curve.get("source")
+                    scheduler_futures_diag["asof"] = futures_curve.get("asof")
+                    curve_nodes = futures_curve.get("forwards") or []
+                    scheduler_futures_diag["nodes"] = len(curve_nodes)
+                    if curve_nodes:
+                        best = min(
+                            curve_nodes,
+                            key=lambda f: abs(int(f.get("days") or 0) - int(req.horizon_days)),
+                        )
+                        days = int(best.get("days") or 0)
+                        price = float(best.get("price") or 0.0)
+                        scheduler_futures_diag["anchor_days"] = days
+                        scheduler_futures_diag["anchor_price"] = price
+                        if price > 0 and S0 > 0 and days > 0:
+                            mu_before = mu_adj
+                            mu_target = float(math.log(price / S0) * (252.0 / float(days)))
+                            mu_adj = float(np.clip(0.5 * mu_adj + 0.5 * mu_target, -3.0, 3.0))
+                            scheduler_futures_diag["target_mu"] = mu_target
+                            scheduler_futures_diag["mu_delta"] = float(mu_adj - mu_before)
+                        else:
+                            scheduler_futures_diag["status"] = "noop"
+                            scheduler_futures_diag["reason"] = "invalid_forward"
+                    else:
+                        scheduler_futures_diag["status"] = "noop"
+                        scheduler_futures_diag["reason"] = "empty_curve"
+                except Exception as exc:
+                    scheduler_futures_diag = {"status": "error", "error": str(exc)}
+
+            mu_adj = float(np.clip(mu_adj, -3.0, 3.0))
 
             # Final small calibration
             sigma_scale = _calibration_sigma_scale(req.symbol, int(req.horizon_days))
             sigma_adj = float(np.clip(sigma_adj * sigma_scale, 1e-4, 2.0))
+            mu_diag["post"] = float(mu_adj)
+            sigma_diag["post"] = float(sigma_adj)
 
             # ---------- Seed (stable per-day) ----------
             import zlib
@@ -4098,8 +4269,23 @@ async def run_simulation(run_id: str, req: "SimRequest", redis: Redis):
                 },
             }
 
-            if fusion_diag:
-                artifact.setdefault("diagnostics", {}).update(fusion_diag)
+            diagnostics_payload = {
+                "mu": mu_diag,
+                "sigma": sigma_diag,
+                "sentiment": sentiment_diag,
+                "earnings": earnings_diag,
+                "macro": macro_diag,
+                "scheduler": {
+                    "news": scheduler_news_diag,
+                    "options": scheduler_options_diag,
+                    "futures": scheduler_futures_diag,
+                },
+                "regime": {
+                    "name": reg.get("name", "unknown"),
+                    "score": float(reg.get("score", 0.0)),
+                },
+            }
+            artifact["diagnostics"] = diagnostics_payload
 
             await _update_run_state(redis, run_id, rs, progress=90.0, detail="Persisting results")
 
