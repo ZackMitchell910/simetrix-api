@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
@@ -13,7 +14,9 @@ from uuid import uuid4
 import numpy as np
 from redis.asyncio import Redis
 
+from src.adapters.base import FeedFrame, FeedRecord
 from src.core import REDIS, settings
+from src.scenarios.schema import EventShock
 from src.services.context import get_macro_features
 from src.services.labeling import to_polygon_ticker
 from src.services.simulation import RunState, SimRequest, run_simulation
@@ -23,6 +26,8 @@ from src.services.quant_context import (
     safe_earnings as default_safe_earnings,
     safe_sentiments as default_safe_sentiments,
 )
+from src.state.contracts import StateVector
+from src.state.estimation import fuse_state
 
 try:  # pragma: no cover - optional dependency during bootstrap/tests
     from src.feature_store import connect as fs_connect, get_latest_mc_metric as fs_get_latest_mc_metric  # type: ignore
@@ -129,6 +134,88 @@ async def run_mc_for(
         "base_price": base_price,
         "predicted_price": predicted_price,
     }
+
+    symbol_upper = symbol.strip().upper()
+    horizon_for_state = int(summary.get("horizon_days") or horizon_days)
+    model_info = artifact.get("model_info") or {}
+    art_context = artifact.get("context") or {}
+    macro_ctx = dict(art_context.get("macro") or {})
+    sentiment_ctx = dict(art_context.get("sentiment") or {})
+    events = []
+    for event in art_context.get("events", []):
+        try:
+            events.append(EventShock.from_dict(event))
+        except Exception:
+            continue
+
+    mu_prior = float(model_info.get("mu_ann") or 0.0)
+    if not mu_prior and median_return_pct is not None and horizon_for_state > 0:
+        try:
+            mu_prior = math.log1p(float(median_return_pct) / 100.0) * (252.0 / max(horizon_for_state, 1))
+        except Exception:
+            mu_prior = 0.0
+
+    sigma_prior = float(model_info.get("sigma_ann") or 0.0)
+    if sigma_prior <= 0.0:
+        try:
+            base_val = float(summary.get("base_price") or 0.0)
+            bull_val = float(summary.get("bullish_price") or 0.0)
+            if base_val > 0 and bull_val > 0 and horizon_for_state > 0:
+                pct95 = bull_val / base_val - 1.0
+                sigma_prior = abs(pct95) * math.sqrt(252.0 / max(horizon_for_state, 1)) / 1.65
+        except Exception:
+            sigma_prior = 0.0
+    sigma_prior = float(max(0.05, min(5.0, sigma_prior if sigma_prior else 0.35)))
+
+    jump_params = artifact.get("jump_params") or {}
+    state_prior = StateVector(
+        t=datetime.now(timezone.utc),
+        spot=float(artifact.get("spot") or summary.get("base_price") or 0.0),
+        drift_annual=mu_prior,
+        vol_annual=sigma_prior,
+        jump_intensity=float(jump_params.get("lambda", 0.0)),
+        jump_mean=float(jump_params.get("mu", 0.0)),
+        jump_vol=float(jump_params.get("sigma", 0.0)),
+        regime=str(summary.get("regime") or art_context.get("regime") or "neutral"),
+        macro=macro_ctx,
+        sentiment=sentiment_ctx,
+        events=events,
+        cross=dict(art_context.get("cross") or {}),
+        provenance={
+            "run_id": run_id,
+            "source": "quant_mc",
+            "artifact_version": artifact.get("version"),
+        },
+    )
+
+    social_frame: FeedFrame | None = None
+    if sentiment_ctx:
+        social_frame = FeedFrame(
+            [
+                FeedRecord(
+                    symbol=symbol_upper,
+                    asof=datetime.now(timezone.utc),
+                    source="sentiment",
+                    confidence=0.5,
+                    payload={
+                        "last24h": sentiment_ctx.get("last24h", 0.0),
+                        "last7d": sentiment_ctx.get("last7d", 0.0),
+                    },
+                )
+            ]
+        )
+
+    fused_state, fusion_diag = fuse_state(
+        state_prior,
+        sentiment_scores=sentiment_ctx,
+        macro_context=macro_ctx,
+        social=social_frame,
+    )
+
+    summary.setdefault("diagnostics", {})
+    summary["diagnostics"]["context"] = fused_state.to_dict()
+    summary["diagnostics"]["fusion"] = fusion_diag
+
     try:
         term_prices = artifact.get("terminal_prices") or []
         if term_prices:

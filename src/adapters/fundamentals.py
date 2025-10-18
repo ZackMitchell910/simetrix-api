@@ -1,14 +1,13 @@
+"""Fundamental data adapter."""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Mapping
+from typing import Any, Iterable, Mapping
 
-from src.adapters.base import AdapterFrame, coerce_window
-from src.services.feature_store import FEATURE_STORE
+from src.adapters.base import FeedFrame, FeedRecord
+from src.services.feature_store import FeatureStore
 
-__all__ = ["fetch"]
-
-_TTL_SECONDS = 6 * 3600
 
 
 async def fetch(symbol: str, asof: datetime, window: timedelta | int | None = None) -> AdapterFrame:
